@@ -8,3 +8,9 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Personal vehicle data — NEVER commit. Lives in ~/code/pacifica-vehicle.
+docs/vehicle-assessment.md
+docs/vehicle-*.md
+docs/**/assessment*.md
+*.vehicle.json
