@@ -147,6 +147,7 @@ class Store:
                 "ALTER TABLE vehicles ADD COLUMN profile_id TEXT",
                 "ALTER TABLE vehicles ADD COLUMN powertrain TEXT",
                 "ALTER TABLE vehicles ADD COLUMN nickname TEXT",
+                "ALTER TABLE samples ADD COLUMN unit TEXT",
             ):
                 try:
                     conn.execute(statement)
