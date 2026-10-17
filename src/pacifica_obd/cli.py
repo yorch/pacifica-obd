@@ -922,6 +922,8 @@ def cmd_read_did(args: argparse.Namespace) -> None:
             record["module"] = rid
             record["bus"] = args.bus
             results.append(record)
+            if did == 0xF190 and record["status"] == "ok" and looks_like_vin(record.get("ascii")):
+                args.discovered_vin = record["ascii"]
             if _store(args):
                 _store(args).add_reading(
                     _session(args), _vin(args), args.bus, rid, record["did"],
@@ -975,6 +977,8 @@ def cmd_module_info(args: argparse.Namespace) -> None:
                     record["module"] = rid
                     record["bus"] = bus
                     results.append(record)
+                    if did == 0xF190 and record["status"] == "ok" and looks_like_vin(record.get("ascii")):
+                        args.discovered_vin = record["ascii"]
                     if _store(args):
                         _store(args).add_reading(
                             _session(args), _vin(args), bus, rid, record["did"],
