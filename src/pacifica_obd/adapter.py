@@ -87,6 +87,27 @@ def configure_bus(elm, bus: str, timeout_ms: int) -> int:
     return protocol
 
 
+def configure_flow_control(elm, header: str, data: str = "3000") -> None:
+    """Send ISO-TP flow control for a specific address pair (best effort).
+
+    Without this, multi-frame replies from non-standard pairs (most `-0x280`
+    modules and all CAN-IHS modules) never complete and look like "no response".
+    `header` is the address the flow-control frame is sent to (the responder).
+    """
+    for command in ("ATFCSM1", "ATFCSH" + header, "ATFCSD" + data, "ATFCSM1"):
+        try:
+            elm.cmd(command)
+        except Exception:  # noqa: BLE001 - flow control is best-effort
+            return
+
+
+def reset_flow_control(elm) -> None:
+    try:
+        elm.cmd("ATFCSM0")  # back to automatic flow control
+    except Exception:  # noqa: BLE001
+        pass
+
+
 class ElmAdapter:
     """Context-managed owner of the raw adapter with protocol restoration."""
 

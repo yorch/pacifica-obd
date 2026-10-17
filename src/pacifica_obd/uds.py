@@ -155,6 +155,42 @@ def probe_ids(elm, start: int, end: int, probe: str, wait: float):
         }
 
 
+def probe_ids_multi(elm, start: int, end: int, probes, wait: float):
+    """Probe each ID with several services (e.g. 1003 then 22F190).
+
+    Many modules reject `10 03` but answer `22 F190` (and vice versa), so trying
+    more than one service materially improves discovery.
+    """
+    if isinstance(probes, str):
+        probes = [probes]
+    known = set()
+    for probe in probes:
+        service = int(probe[:2], 16)
+        for rid in range(start, end + 1):
+            if rid in known:
+                continue
+            elm.cmd("ATSH %03X" % rid)
+            for command in ("ATFCSM1", "ATFCSH%03X" % rid, "ATFCSD3000"):
+                elm.cmd(command)  # best-effort flow control for non-standard pairs
+            header, uds = parse_uds_frame(elm.cmd(probe, wait=wait))
+            if header is None:
+                continue
+            if uds.startswith("%02X" % (service + 0x40)):
+                kind = "positive"
+            elif uds.startswith("7F"):
+                kind = "negative"
+            else:
+                kind = "other"
+            known.add(rid)
+            yield {
+                "request_id": "%03X" % rid,
+                "response_id": header,
+                "kind": kind,
+                "probe": probe,
+                "session_response": uds,
+            }
+
+
 # --------------------------------------------------------------------------- #
 # DTCs (UDS 0x19 0x02)
 # --------------------------------------------------------------------------- #

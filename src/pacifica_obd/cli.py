@@ -36,9 +36,11 @@ from pacifica_obd.adapter import (
     AdapterError,
     ElmAdapter,
     configure_bus,
+    configure_flow_control,
     current_protocol,
     find_port,
     must_ok,
+    reset_flow_control,
     restore_protocol,
 )
 from pacifica_obd.elm import Elm327, Elm327Error
@@ -73,6 +75,7 @@ from pacifica_obd.uds import (
     parse_dtcs as _parse_dtcs,
     parse_uds_frame as _parse_uds_frame,
     probe_ids as _probe_ids,
+    probe_ids_multi as _probe_ids_multi,
     read_did as _read_did,
     routine_control as _routine_control,
     security_access as _security_access,
@@ -329,20 +332,52 @@ def cmd_info(args: argparse.Namespace) -> None:
     conn.close()
 
 
+def _read_uds_vin(args: argparse.Namespace) -> str | None:
+    """Read the VIN over UDS F190 from the known module addresses (best effort).
+
+    Some vehicles — e.g. the Pacifica Hybrid — do not serve mode 09 02 at all,
+    but return the VIN from F190 on their powertrain/body modules.
+    """
+    timeout_ms = getattr(args, "timeout_ms", 100)
+    wait = max(0.25, timeout_ms / 1000 + 0.15)
+    try:
+        elm = open_elm(args)
+    except SystemExit:
+        return None
+    try:
+        for bus in ("can-c", "can-ihs"):
+            configure_bus(elm, bus, timeout_ms)
+            for _name, request, _response in module_addresses(bus):
+                rid = "%03X" % request
+                elm.cmd("ATSH " + rid)
+                expect = _enter_session(elm, rid, wait)
+                configure_flow_control(elm, expect or rid)
+                record = _read_did(elm, 0xF190, wait, expect_header=expect)
+                if record["status"] == "ok" and looks_like_vin(record.get("ascii")):
+                    return record["ascii"]
+    except (AdapterError, Elm327Error):
+        return None
+    finally:
+        elm.close()
+    return None
+
+
 def cmd_vin(args: argparse.Namespace) -> None:
     conn = connect(args)
     resp = conn.query(obd.commands.VIN)
     vin = None if resp.is_null() else resp.value
+    conn.close()
+    if not looks_like_vin(vin):
+        vin = _read_uds_vin(args) or vin  # fall back to UDS F190
     if vin and _store(args):
         _store(args).upsert_vehicle(vin)
         args.discovered_vin = vin
     if args.json:
         jdump({"vin": vin})
     elif vin is None:
-        console.print("[yellow]No VIN returned (vehicle off or unsupported).[/yellow]")
+        console.print("[yellow]No VIN returned (mode 09 02 unserved and no UDS F190 reply).[/yellow]")
     else:
         console.print(f"[bold green]VIN:[/bold green] {vin}")
-    conn.close()
 
 
 def cmd_dtc(args: argparse.Namespace) -> None:
@@ -410,7 +445,7 @@ def cmd_live(args: argparse.Namespace) -> None:
     conn = connect(args)
     rows = []
     for cmd in sorted(conn.supported_commands, key=lambda c: c.name):
-        if cmd.command.startswith(b"AT") or cmd.command.startswith("AT"):
+        if cmd_text(cmd).startswith("AT"):
             continue
         resp = conn.query(cmd)
         rows.append(
@@ -748,7 +783,7 @@ def cmd_modules(args: argparse.Namespace) -> None:
     try:
         configure_bus(elm, args.bus, args.timeout_ms)
 
-        for entry in _probe_ids(elm, start, end, args.session, wait):
+        for entry in _probe_ids_multi(elm, start, end, (args.session, "22F190"), wait):
             if args.identify:
                 elm.cmd("ATSH " + entry["request_id"])
                 _, vin_uds = _parse_uds_frame(elm.cmd("22F190", wait=wait))
@@ -824,7 +859,7 @@ def cmd_dtc_all(args: argparse.Namespace) -> None:
             if module:
                 targets = [{"request_id": module}]
             else:
-                targets = list(_probe_ids(elm, start, end, "1003", wait))
+                targets = list(_probe_ids_multi(elm, start, end, ("1003", "22F190"), wait))
 
             for target in targets:
                 rid = target["request_id"]
@@ -917,6 +952,7 @@ def cmd_read_did(args: argparse.Namespace) -> None:
         configure_bus(elm, args.bus, args.timeout_ms)
         elm.cmd("ATSH " + rid)
         expect = _enter_session(elm, rid, wait)  # correlate replies to this ECU
+        configure_flow_control(elm, expect or rid)
         for did in args.dids:
             record = _read_did(elm, did, wait, expect_header=expect)
             record["module"] = rid
@@ -967,11 +1003,12 @@ def cmd_module_info(args: argparse.Namespace) -> None:
             else:
                 request_ids = [
                     target["request_id"]
-                    for target in _probe_ids(elm, args.start, args.end, "1003", wait)
+                    for target in _probe_ids_multi(elm, args.start, args.end, ("1003", "22F190"), wait)
                 ]
             for rid in request_ids:
                 elm.cmd("ATSH " + rid)
                 expect = _enter_session(elm, rid, wait)
+                configure_flow_control(elm, expect or rid)
                 for did in _INFO_DIDS:
                     record = _read_did(elm, did, wait, expect_header=expect)
                     record["module"] = rid
@@ -1038,7 +1075,7 @@ def cmd_capture(args: argparse.Namespace) -> None:
         for bus in buses:
             diag(args).print(f"[dim]Capturing {bus} (STP {_BUS_PROTOCOL[bus]})…[/dim]")
             configure_bus(elm, bus, args.timeout_ms)
-            for target in _probe_ids(elm, args.start, args.end, "1003", wait):
+            for target in _probe_ids_multi(elm, args.start, args.end, ("1003", "22F190"), wait):
                 rid = target["request_id"]
                 elm.cmd("ATSH " + rid)
                 expect = _enter_session(elm, rid, wait)
@@ -1380,20 +1417,26 @@ def _require_confirm(args: argparse.Namespace, action: str) -> None:
         sys.exit(2)
 
 
-def _addr_and_session(elm, args, wait: float) -> tuple[str, str]:
-    """Configure the bus, address the module, and require an extended session.
+def _addr_and_session(elm, args, wait: float, require: bool = True) -> tuple[str, str | None]:
+    """Configure the bus, address the module, and (best effort) enter a session.
 
-    A write/service request must not be sent if addressing failed or the ECU did
-    not confirm an extended session (5003) — otherwise it could land on whatever
-    ECU was previously selected.
+    Reads pass ``require=False``: many modules reject ``10 03`` but answer reads
+    fine, and flow control to the responder is set so multi-frame replies (e.g.
+    the 20-byte VIN) complete. Writes keep ``require=True`` and refuse unless the
+    ECU confirmed an extended session (5003), so a write cannot land on whatever
+    ECU happened to be addressed before.
     """
     configure_bus(elm, args.bus, args.timeout_ms)
     rid = "%03X" % args.module
     must_ok(elm, "ATSH " + rid)
     header, uds = _parse_uds_frame(elm.cmd("1003", wait=wait))
-    if header is None or not uds.startswith("5003"):
+    if header and uds.startswith("5003"):
+        configure_flow_control(elm, header)
+        return rid, header
+    if require:
         raise AdapterError(f"module {rid} did not enter an extended session; refusing")
-    return rid, header
+    configure_flow_control(elm, rid)  # unknown responder; best-effort
+    return rid, None
 
 
 def cmd_security(args: argparse.Namespace) -> None:
@@ -1613,7 +1656,7 @@ def build_vehicle_dump(args: argparse.Namespace) -> dict:
             for bus in buses:
                 diag(args).print(f"[dim]Dumping {bus} (STP {_BUS_PROTOCOL[bus]})…[/dim]")
                 configure_bus(elm, bus, args.timeout_ms)
-                for target in _probe_ids(elm, args.start, args.end, "1003", wait):
+                for target in _probe_ids_multi(elm, args.start, args.end, ("1003", "22F190"), wait):
                     rid = target["request_id"]
                     elm.cmd("ATSH " + rid)
                     expect = _enter_session(elm, rid, wait)

@@ -82,6 +82,15 @@ docs/
 - **Powertrain detection:** if a hybrid-only module answers (HCP `0x7E2` or
   BPCM `0x7E7`), it is a Pacifica **PHEV** — `profiles.detect_powertrain()`
   uses this because the VIN cannot tell gas from hybrid.
+- **Flow control is mandatory for non-standard address pairs.** Before reading a
+  module, set ISO-TP flow control to the responder (`configure_flow_control()`:
+  `ATFCSM1` + `ATFCSH <resp>` + `ATFCSD 3000`). Without it, every `-0x280` and
+  CAN-IHS multi-frame reply (e.g. the 20-byte VIN) never completes and looks
+  like "no response" — on a real Pacifica Hybrid this hid 21 of 25 modules.
+- **`09 02` (mode-09 VIN) may be unserved.** Read the VIN via UDS `22 F190`
+  instead; the `vin` command falls back automatically.
+- **Probe more than one service in discovery** (`1003` and `22F190`): many
+  modules reject session control but answer reads.
 
 ## Persistence
 
