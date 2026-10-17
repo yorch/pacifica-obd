@@ -185,14 +185,11 @@ def connect(args: argparse.Namespace) -> obd.OBD:
 # --------------------------------------------------------------------------- #
 # raw-ELM (UDS) helpers
 # --------------------------------------------------------------------------- #
-def open_elm(args: argparse.Namespace) -> Elm327:
-    port = find_port(args.port)
-    if not port:
-        err_console.print("[bold red]No serial port found.[/bold red]")
-        sys.exit(2)
+def open_elm(args: argparse.Namespace) -> ElmAdapter:
+    """Open the adapter via the device layer (protocol snapshot/restore on close)."""
     try:
-        return Elm327(port, args.baud, timeout=args.timeout)
-    except (AdapterError, Elm327Error) as exc:
+        return ElmAdapter(port=args.port, baudrate=args.baud, timeout=args.timeout)
+    except AdapterError as exc:
         err_console.print(f"[red]{exc}[/red]")
         sys.exit(2)
 
@@ -667,7 +664,7 @@ def cmd_raw(args: argparse.Namespace) -> None:
         if args.header:
             elm.cmd("ATSH " + args.header)
         if args.protocol:
-            elm.cmd("ATSP" + args.protocol)
+            elm.cmd("ATTP" + args.protocol)  # try protocol (non-saving, no EEPROM write)
         if args.headers:
             elm.cmd("ATH1")
         if args.no_auto_format:
@@ -995,7 +992,7 @@ def cmd_capture(args: argparse.Namespace) -> None:
     previous = current_protocol(elm)
     store = _store(args)
     session = _session(args)
-    vin = None
+    vin = normalize_vin(getattr(args, "vin", None))  # an explicit --vin wins
     snapshot: dict = {"vin": None, "buses": buses, "modules": [], "dtcs": [], "readings": []}
     try:
         for bus in buses:
@@ -1036,6 +1033,10 @@ def cmd_capture(args: argparse.Namespace) -> None:
                             if store:
                                 store.upsert_vehicle(vin)
                                 store.backfill_vin(session, vin)
+                        elif module_vin != vin:
+                            err_console.print(
+                                f"[yellow]VIN mismatch: {rid} reports {module_vin}, keeping {vin}.[/yellow]"
+                            )
                     if did == 0xF187 and record["status"] == "ok":
                         part = record.get("ascii") or record.get("hex")
                     if store:
@@ -1065,7 +1066,7 @@ def cmd_capture(args: argparse.Namespace) -> None:
     if vin and store:
         store.upsert_vehicle(vin)
         args.discovered_vin = vin
-    snapshot["vin"] = vin or args.vin
+    snapshot["vin"] = vin
 
     if args.json:
         jdump(snapshot)
@@ -1223,7 +1224,9 @@ def cmd_monitor(args: argparse.Namespace) -> None:
             stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
             rows = []
             for rid in modules:
+                # re-enter the extended session each cycle so it never expires
                 elm.cmd("ATSH " + rid)
+                expects[rid] = _enter_session(elm, rid, wait)
                 for did in dids:
                     record = _read_did(elm, did, wait, expect_header=expects.get(rid))
                     value = record.get("hex")
@@ -1319,7 +1322,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_raw = sub.add_parser("raw", help="send raw AT/OBD/UDS commands to the adapter")
     p_raw.add_argument("commands", nargs="+", help="commands, e.g. ATI 22F190")
     p_raw.add_argument("--header", help="set CAN header first (ATSH), e.g. 7E0")
-    p_raw.add_argument("--protocol", help="pin protocol first (ATSP), e.g. 6 for CAN 11/500")
+    p_raw.add_argument("--protocol", help="try protocol first (ATTP, non-saving), e.g. 6 for CAN 11/500")
     p_raw.add_argument("--headers", action="store_true", help="show response headers (ATH1)")
     p_raw.add_argument("--no-auto-format", action="store_true", help="ATCAF0 (raw CAN, no ISO-TP)")
     p_raw.add_argument("--no-flow-control", action="store_true", help="ATCFC0")

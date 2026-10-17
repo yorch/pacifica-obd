@@ -104,7 +104,7 @@ class ElmAdapter:
     def open(self, baudrate: int = 115200, timeout: float = 2.0) -> None:
         try:
             self._elm = Elm327(self.port, baudrate, timeout=timeout)
-        except Elm327Error as exc:
+        except (Elm327Error, ValueError, OSError) as exc:
             raise AdapterError(str(exc)) from exc
         self._previous = current_protocol(self._elm)
 
@@ -121,10 +121,16 @@ class ElmAdapter:
         return configure_bus(self, bus, timeout_ms)
 
     def close(self) -> None:
-        if self._elm is not None:
-            restore_protocol(self._elm, self._previous)
-            self._elm.close()
-            self._elm = None
+        if self._elm is None:
+            return
+        elm = self._elm
+        try:
+            restore_protocol(elm, self._previous)
+        finally:
+            try:
+                elm.close()
+            finally:
+                self._elm = None
 
     def __enter__(self) -> "ElmAdapter":
         return self
