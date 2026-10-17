@@ -129,6 +129,7 @@ Start with A; move to B if multi-frame handling gets painful.
 | **P0** ✅ | Raw ELM327/STN transport + `pacifica-obd raw` | No (AT tested) |
 | **P1** ✅ | `modules` — scan CAN‑C/CAN‑IHS for responders (`10 03`, `22 F190`) | Needs car for data |
 | **P2** ✅ | `dtc-all` — read DTCs (UDS `0x19 02`) from every responder, decode + JSON | Needs car for data |
+| **P3** ✅ | `read-did` (UDS `0x22`) + `module-info` (F186–F191), reply-correlated | Needs car for data |
 | **P2** | `dtc-all` — read DTCs (0x19 02) from every responding module, JSON | Yes |
 | **P3** | `read-did <module> <did>` + module info (F187–F190) | Yes |
 | **P4** | Live manufacturer PIDs (periodic 0x22) from the database | Yes |
@@ -167,6 +168,10 @@ uv run pacifica-obd modules --bus can-ihs --identify --json
 
 # all-module DTCs (P2): discover, then read 0x19 02 from each responder
 uv run pacifica-obd dtc-all --bus both --json
+
+# module identification (P3): read DIDs (0x22), incl. VIN / part / software
+uv run pacifica-obd read-did --module 7E0 F190 F187 F189
+uv run pacifica-obd module-info --bus both
 ```
 
 `modules` pins the STN protocol preset (33 = HS 500K/11B, 53 = MS 125K/11B),

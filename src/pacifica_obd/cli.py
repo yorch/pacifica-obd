@@ -229,6 +229,13 @@ def _timeout_ms(text) -> int:
     return value
 
 
+def _did(text) -> int:
+    value = str(text).upper().removeprefix("0X")
+    if not re.fullmatch(r"[0-9A-Fa-f]{4}", value):
+        raise argparse.ArgumentTypeError(f"not a 4-hex DID: {text!r}")
+    return int(value, 16)
+
+
 # --------------------------------------------------------------------------- #
 # subcommands
 # --------------------------------------------------------------------------- #
@@ -726,8 +733,8 @@ def _messages_from_frames(frames: list[bytes]) -> list[str]:
             data = first[1:1 + length]
             if len(data) == length:
                 messages.append(data.hex().upper())
-        elif pci == 1:  # first frame: length must exceed single-frame capacity
-            if len(first) < 2:
+        elif pci == 1:  # first frame: always a full 8-byte classic-CAN frame
+            if len(first) != 8:
                 continue
             length = ((first[0] & 0x0F) << 8) | first[1]
             if not 8 <= length <= 0xFFF:
@@ -739,14 +746,14 @@ def _messages_from_frames(frames: list[bytes]) -> list[str]:
                 if not cf:
                     i += 1
                     continue
-                if len(cf) > 8:  # invalid classic-CAN frame -> abandon
-                    break
-                if (cf[0] >> 4) != 2 or (cf[0] & 0x0F) != expected:
-                    break  # missing / duplicated / reordered -> abandon message
+                if len(cf) > 8 or (cf[0] >> 4) != 2 or (cf[0] & 0x0F) != expected:
+                    break  # invalid / missing / duplicated / reordered -> abandon
+                if len(cf) < 8 and len(payload) + (len(cf) - 1) < length:
+                    break  # a non-final consecutive frame must be full
                 payload += cf[1:]
                 expected = (expected + 1) & 0x0F
                 i += 1
-            if length and len(payload) >= length:
+            if len(payload) >= length:
                 messages.append(bytes(payload[:length]).hex().upper())
         # stray consecutive/flow-control frames are ignored
     return messages
@@ -1038,6 +1045,191 @@ def cmd_dtc_all(args: argparse.Namespace) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# read data by identifier (UDS 0x22)
+# --------------------------------------------------------------------------- #
+_DID_NAMES = {
+    0xF186: "Active diagnostic session",
+    0xF187: "Spare part number",
+    0xF188: "ECU software number",
+    0xF189: "ECU software version",
+    0xF18A: "System supplier identifier",
+    0xF18C: "ECU serial number",
+    0xF190: "VIN",
+    0xF191: "ECU hardware number",
+}
+_INFO_DIDS = list(_DID_NAMES)
+
+
+def _read_did(elm: Elm327, did: int, wait: float, expect_header: str | None = None) -> dict:
+    request = "22%04X" % did
+    lines = elm.cmd(request, wait=wait)
+    header, uds = _parse_uds_frame(lines)
+    record = {
+        "did": "%04X" % did,
+        "name": _DID_NAMES.get(did),
+        "response_id": header,
+        "raw": uds,
+    }
+    if header is None:
+        record["status"] = "can_error" if any(
+            "CAN ERROR" in line.upper() or "BUFFER FULL" in line.upper() for line in lines
+        ) else "no_response"
+        record["raw_lines"] = lines
+        return record
+    if expect_header and header != expect_header:
+        record["status"] = "wrong_responder"  # a different ECU answered
+        return record
+    if uds.startswith("7F"):
+        if len(uds) >= 6 and uds[2:4] == "22":
+            record["status"] = "pending" if uds[4:6] == "78" else "negative"
+        else:
+            record["status"] = "malformed"
+        return record
+    prefix = "62%04X" % did
+    if not uds.startswith(prefix):
+        record["status"] = "unexpected"
+        return record
+    data_hex = uds[len(prefix):]
+    if not data_hex:
+        record["status"] = "malformed"
+        return record
+    record["status"] = "ok"
+    record["hex"] = data_hex
+    record["ascii"] = _ascii_payload(uds, prefix)
+    return record
+
+
+_DID_STATUS_TEXT = {
+    "no_response": "no response",
+    "can_error": "CAN error",
+    "negative": "negative response",
+    "pending": "pending (no final response)",
+    "unexpected": "unexpected response",
+    "wrong_responder": "wrong responder",
+    "malformed": "malformed data",
+}
+
+
+def _did_value(record: dict) -> str:
+    if record["status"] != "ok":
+        return _DID_STATUS_TEXT.get(record["status"], record["status"])
+    return record.get("hex", "")
+
+
+def _did_ascii(record: dict) -> str:
+    return (record.get("ascii") or "") if record["status"] == "ok" else ""
+
+
+def _enter_session(elm: Elm327, rid: str, wait: float) -> str | None:
+    """Send 0x10 0x03; return the ECU's response header and filter RX to it."""
+    lines = elm.cmd("1003", wait=wait)
+    header, _ = _parse_uds_frame(lines)
+    if header:
+        elm.cmd("ATCRA " + header)
+    return header
+
+
+def cmd_read_did(args: argparse.Namespace) -> None:
+    """Read Data Identifiers (UDS 0x22) from a single module."""
+    wait = max(0.25, args.timeout_ms / 1000 + 0.15)
+    elm = open_elm(args)
+    previous = current_protocol(elm)
+    rid = "%03X" % args.module
+    results: list[dict] = []
+    try:
+        configure_bus(elm, args.bus, args.timeout_ms)
+        elm.cmd("ATSH " + rid)
+        expect = _enter_session(elm, rid, wait)  # correlate replies to this ECU
+        for did in args.dids:
+            record = _read_did(elm, did, wait, expect_header=expect)
+            record["module"] = rid
+            record["bus"] = args.bus
+            results.append(record)
+    except Elm327Error as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        sys.exit(2)
+    finally:
+        restore_protocol(elm, previous)
+        elm.close()
+
+    if args.json:
+        jdump({"module": rid, "bus": args.bus, "dids": results})
+        return
+
+    table = Table(title=f"DIDs from module {rid} ({args.bus})")
+    table.add_column("DID")
+    table.add_column("Name")
+    table.add_column("Hex")
+    table.add_column("ASCII")
+    for record in results:
+        table.add_row(record["did"], record.get("name") or "", _did_value(record), _did_ascii(record))
+    console.print(table)
+
+
+def cmd_module_info(args: argparse.Namespace) -> None:
+    """Read a module's identification block (F186..F191) from one module or a scan."""
+    if args.end < args.start:
+        err_console.print("[red]--end must be >= --start.[/red]")
+        sys.exit(2)
+    wait = max(0.25, args.timeout_ms / 1000 + 0.15)
+    buses = ["can-c", "can-ihs"] if args.bus == "both" else [args.bus]
+    elm = open_elm(args)
+    previous = current_protocol(elm)
+    results: list[dict] = []
+    try:
+        for bus in buses:
+            configure_bus(elm, bus, args.timeout_ms)
+            if args.module is not None:
+                request_ids = ["%03X" % args.module]
+            else:
+                request_ids = [
+                    target["request_id"]
+                    for target in _probe_ids(elm, args.start, args.end, "1003", wait)
+                ]
+            for rid in request_ids:
+                elm.cmd("ATSH " + rid)
+                expect = _enter_session(elm, rid, wait)
+                for did in _INFO_DIDS:
+                    record = _read_did(elm, did, wait, expect_header=expect)
+                    record["module"] = rid
+                    record["bus"] = bus
+                    results.append(record)
+    except Elm327Error as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        sys.exit(2)
+    finally:
+        restore_protocol(elm, previous)
+        elm.close()
+
+    if args.json:
+        jdump({"buses": buses, "modules": results})
+        return
+
+    if not results:
+        console.print("[yellow]No modules responded.[/yellow]")
+        return
+    table = Table(title="Module identification")
+    table.add_column("Bus")
+    table.add_column("Module")
+    table.add_column("Item")
+    table.add_column("Hex")
+    table.add_column("ASCII")
+    last = None
+    for record in results:
+        key = (record["bus"], record["module"])
+        fresh = key != last
+        last = key
+        table.add_row(
+            record["bus"] if fresh else "",
+            record["module"] if fresh else "",
+            record.get("name") or record["did"],
+            _did_value(record),
+            _did_ascii(record),
+        )
+    console.print(table)
+
+
+# --------------------------------------------------------------------------- #
 # argparse plumbing
 # --------------------------------------------------------------------------- #
 def build_parser() -> argparse.ArgumentParser:
@@ -1114,6 +1306,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_dtc_all.add_argument("--timeout-ms", type=_timeout_ms, default=100,
                            help="per-request timeout in ms (STPTO, default 100)")
     p_dtc_all.set_defaults(func=cmd_dtc_all)
+
+    p_read_did = sub.add_parser("read-did", help="read Data Identifiers (UDS 0x22) from a module")
+    p_read_did.add_argument("dids", nargs="+", type=_did, help="DIDs, e.g. F190 F187")
+    p_read_did.add_argument("--module", type=_can_id, required=True, help="request ID, e.g. 7E0")
+    p_read_did.add_argument("--bus", choices=["can-c", "can-ihs"], default="can-c")
+    p_read_did.add_argument("--timeout-ms", type=_timeout_ms, default=100,
+                            help="per-request timeout in ms (STPTO, default 100)")
+    p_read_did.set_defaults(func=cmd_read_did)
+
+    p_module_info = sub.add_parser(
+        "module-info", help="read a module's identification block (F186..F191)"
+    )
+    p_module_info.add_argument("--module", type=_can_id, default=None,
+                               help="one request ID; omit to scan the range")
+    p_module_info.add_argument("--bus", choices=["can-c", "can-ihs", "both"], default="can-c")
+    p_module_info.add_argument("--start", type=_can_id, default=0x700, help="first request ID, hex")
+    p_module_info.add_argument("--end", type=_can_id, default=0x7FF, help="last request ID, hex")
+    p_module_info.add_argument("--timeout-ms", type=_timeout_ms, default=100,
+                               help="per-request timeout in ms (STPTO, default 100)")
+    p_module_info.set_defaults(func=cmd_module_info)
 
     # Allow --json after the subcommand too, without clobbering the global value.
     for sp in sub.choices.values():

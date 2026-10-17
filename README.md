@@ -40,6 +40,8 @@ uv run pacifica-obd modules        # discover UDS modules on CAN-C (read-only)
 uv run pacifica-obd modules --bus can-ihs --identify --json
 uv run pacifica-obd dtc-all        # read DTCs from every module on CAN-C
 uv run pacifica-obd dtc-all --bus both --json
+uv run pacifica-obd read-did --module 7E0 F190 F187   # read DIDs from one module
+uv run pacifica-obd module-info --bus both            # identification block per module
 ```
 
 Raw/UDS examples:
