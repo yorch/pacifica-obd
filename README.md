@@ -43,6 +43,7 @@ uv run pacifica-obd dtc-all --bus both --json
 uv run pacifica-obd read-did --module 7E0 F190 F187   # read DIDs from one module
 uv run pacifica-obd module-info --bus both            # identification block per module
 uv run pacifica-obd capture --bus both                # full snapshot, stored locally
+uv run pacifica-obd dump --out ~/code/pacifica-vehicle/captures  # json + xml + html report
 uv run pacifica-obd history                           # stored vehicles + sessions
 uv run pacifica-obd show --vin <VIN>                  # everything stored for a VIN
 ```

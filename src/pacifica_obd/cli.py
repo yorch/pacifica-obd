@@ -47,8 +47,10 @@ from pacifica_obd.profiles import (
     addresses as module_addresses,
     looks_like_vin,
     normalize_vin,
+    resolve as resolve_profile,
     year_from_vin,
 )
+from pacifica_obd.report import write_dump
 from pacifica_obd.seedkey import (
     SeedKeyError,
     find_secrets,
@@ -57,7 +59,7 @@ from pacifica_obd.seedkey import (
     parse_pairs,
     recover_secret,
 )
-from pacifica_obd.store import Store, logging_enabled
+from pacifica_obd.store import Store, data_dir, logging_enabled
 from pacifica_obd.uds import (
     BUS_PROTOCOL as _BUS_PROTOCOL,
     INFO_DIDS as _INFO_DIDS,
@@ -263,6 +265,13 @@ def _did(text) -> int:
     if not re.fullmatch(r"[0-9A-Fa-f]{4}", value):
         raise argparse.ArgumentTypeError(f"not a 4-hex DID: {text!r}")
     return int(value, 16)
+
+
+def _vin_arg(text) -> str:
+    value = normalize_vin(text)
+    if not looks_like_vin(value):
+        raise argparse.ArgumentTypeError(f"not a valid VIN: {text!r}")
+    return value
 
 
 # --------------------------------------------------------------------------- #
@@ -1493,6 +1502,214 @@ def cmd_routine(args: argparse.Namespace) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# full vehicle dump (multi-format)
+# --------------------------------------------------------------------------- #
+def _tool_version() -> str:
+    try:
+        from importlib.metadata import version
+
+        return version("pacifica-obd")
+    except Exception:  # noqa: BLE001
+        return "0.1.0"
+
+
+def _obd_value(conn, command):
+    response = conn.query(command)
+    return None if response.is_null() else response.value
+
+
+def _default_dump_dir() -> Path:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return data_dir() / "dumps" / stamp
+
+
+def build_vehicle_dump(args: argparse.Namespace) -> dict:
+    """Collect everything readable from the vehicle into one dict."""
+    dump: dict = {
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "tool": {"name": "pacifica-obd", "version": _tool_version()},
+        "adapter": {},
+        "vehicle": {},
+        "generic": {},
+        "modules": [],
+        "readings": [],
+        "totals": {},
+    }
+    vin = normalize_vin(getattr(args, "vin", None))
+
+    if not args.no_generic:
+        conn = connect(args)
+        try:
+            voltage = _obd_value(conn, obd.commands.ELM_VOLTAGE)
+            dump["adapter"] = {
+                "port": conn.port_name(),
+                "protocol": conn.protocol_name(),
+                "status": str(conn.status()),
+                "identity": _obd_value(conn, obd.commands.ELM_VERSION),
+                "voltage": None if voltage is None else str(voltage),
+            }
+            gvin = _obd_value(conn, obd.commands.VIN)
+            if isinstance(gvin, str) and looks_like_vin(gvin):
+                vin = vin or gvin
+
+            stored = _codes(conn, obd.commands.GET_DTC)
+            pending = (
+                _codes(conn, obd.commands.GET_CURRENT_DTC)
+                if hasattr(obd.commands, "GET_CURRENT_DTC") else []
+            )
+            permanent = (
+                _codes(conn, obd.commands.GET_PERMANENT_DTC)
+                if hasattr(obd.commands, "GET_PERMANENT_DTC") else []
+            )
+
+            readiness: dict = {}
+            status = conn.query(obd.commands.STATUS)
+            if not status.is_null():
+                st = status.value
+                available = [
+                    (name, value) for name, value in st.__dict__.items()
+                    if hasattr(value, "available") and hasattr(value, "complete") and value.available
+                ]
+                readiness = {
+                    "ignition_type": st.ignition_type,
+                    "mil": bool(st.MIL),
+                    "dtc_count": st.DTC_count,
+                    "ready": (not st.MIL) and st.DTC_count == 0
+                    and not [n for n, v in available if not v.complete],
+                    "monitors": [{"name": n, "complete": bool(v.complete)} for n, v in available],
+                }
+
+            live = {}
+            for name in DEFAULT_WATCH:
+                command = getattr(obd.commands, name, None)
+                if command is not None:
+                    live[name] = _obd_value(conn, command)
+
+            dump["generic"] = {
+                "dtcs": {"stored": stored, "pending": pending, "permanent": permanent},
+                "readiness": readiness,
+                "live": {k: (None if v is None else str(v)) for k, v in live.items()},
+                "supported_pids": len(
+                    [c for c in conn.supported_commands if not c.command.startswith(b"AT")]
+                ),
+            }
+        finally:
+            conn.close()
+        time.sleep(0.3)  # let the adapter settle before the UDS pass reopens it
+
+    if not args.no_uds:
+        buses = ["can-c", "can-ihs"] if args.bus == "both" else [args.bus]
+        wait = max(0.25, args.timeout_ms / 1000 + 0.15)
+        elm = open_elm(args)
+        try:
+            for bus in buses:
+                diag(args).print(f"[dim]Dumping {bus} (STP {_BUS_PROTOCOL[bus]})…[/dim]")
+                configure_bus(elm, bus, args.timeout_ms)
+                for target in _probe_ids(elm, args.start, args.end, "1003", wait):
+                    rid = target["request_id"]
+                    elm.cmd("ATSH " + rid)
+                    expect = _enter_session(elm, rid, wait)
+                    _, dtc_uds = _parse_uds_frame(elm.cmd("1902FF", wait=wait), prefer_header=expect)
+                    dtcs = (
+                        _parse_dtcs(dtc_uds)
+                        if dtc_uds and _classify_dtc_response(dtc_uds) == "ok" else []
+                    )
+                    identification = {}
+                    for did in _INFO_DIDS:
+                        record = _read_did(elm, did, wait, expect_header=expect)
+                        identification[record["did"]] = {
+                            "name": record.get("name"), "hex": record.get("hex"),
+                            "ascii": record.get("ascii"), "status": record["status"],
+                        }
+                        dump["readings"].append(
+                            {"bus": bus, "module": rid, "did": record["did"], "name": record.get("name"),
+                             "hex": record.get("hex"), "ascii": record.get("ascii"), "status": record["status"]}
+                        )
+                        if did == 0xF190 and record["status"] == "ok" and looks_like_vin(record.get("ascii")):
+                            vin = vin or record["ascii"]
+                    dump["modules"].append(
+                        {"bus": bus, "request_id": rid, "response_id": target.get("response_id"),
+                         "kind": target.get("kind"), "dtcs": dtcs, "identification": identification}
+                    )
+        finally:
+            elm.close()
+
+    year = year_from_vin(vin)
+    profile = resolve_profile(year=year) if vin else None
+    dump["vehicle"] = {
+        "vin": vin, "year": year,
+        "make": profile.make if profile else None,
+        "model": profile.model if profile else None,
+        "profile_id": profile.id if profile else None,
+        "powertrain": (None if not profile or profile.powertrain == "any" else profile.powertrain),
+    }
+    generic_dtcs = dump["generic"].get("dtcs", {})
+    dtc_total = sum(len(v) for v in generic_dtcs.values()) + sum(
+        len(m["dtcs"]) for m in dump["modules"]
+    )
+    dump["totals"] = {
+        "modules": len(dump["modules"]),
+        "dtcs": dtc_total,
+        "readings": len(dump["readings"]),
+    }
+    return dump
+
+
+def cmd_dump(args: argparse.Namespace) -> None:
+    """Dump everything readable and write it as JSON, XML and/or an HTML report."""
+    if args.end < args.start:
+        err_console.print("[red]--end must be >= --start.[/red]")
+        sys.exit(2)
+    formats = [f.strip().lower() for f in args.formats.split(",") if f.strip()]
+    dump = build_vehicle_dump(args)
+
+    if args.out:
+        out_dir = os.path.expanduser(args.out)
+    else:
+        out_dir = _default_dump_dir()
+        suffix = 1
+        while out_dir.exists():
+            out_dir = out_dir.with_name(out_dir.name + "-%d" % suffix)
+            suffix += 1
+    try:
+        paths = write_dump(dump, out_dir, formats)
+    except ValueError as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        sys.exit(2)
+
+    store = _store(args)
+    session = _session(args)
+    vehicle = dump["vehicle"]
+    if store:
+        vin = vehicle.get("vin")
+        if vin:
+            store.upsert_vehicle(
+                vin, make=vehicle.get("make"), model=vehicle.get("model"),
+                year=vehicle.get("year"), profile_id=vehicle.get("profile_id"),
+                powertrain=vehicle.get("powertrain"),
+            )
+            args.discovered_vin = vin
+        for module in dump["modules"]:
+            store.add_dtcs(session, vin, module["bus"], module["request_id"], module["dtcs"], None)
+            for did, value in module["identification"].items():
+                store.add_reading(session, vin, module["bus"], module["request_id"], did,
+                                  value.get("name"), value.get("hex"), value.get("ascii"),
+                                  value.get("status"), None, category="module-info")
+        for code in dump["generic"].get("dtcs", {}).get("stored", []):
+            store.add_dtcs(session, vin, "obd", "PCM", [code], None)
+
+    if args.json:
+        jdump({"formats": formats, "files": [str(path) for path in paths], "totals": dump["totals"]})
+        return
+    for path in paths:
+        console.print(f"[green]wrote[/green] {path}")
+    console.print(
+        f"[dim]{dump['totals']['modules']} module(s), {dump['totals']['dtcs']} DTC(s), "
+        f"{dump['totals']['readings']} reading(s)[/dim]"
+    )
+
+
+# --------------------------------------------------------------------------- #
 # argparse plumbing
 # --------------------------------------------------------------------------- #
 def build_parser() -> argparse.ArgumentParser:
@@ -1655,6 +1872,18 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Python file exposing algorithm(seed, secret) -> key")
     p_sk.add_argument("--width", type=_width, default=2, help="secret width in bytes, 1..4 (default 2)")
     p_sk.set_defaults(func=cmd_seedkey_brute)
+
+    p_dump = sub.add_parser("dump", help="dump everything readable to json/xml/html")
+    p_dump.add_argument("--bus", choices=["can-c", "can-ihs", "both"], default="both")
+    p_dump.add_argument("--start", type=_can_id, default=0x700, help="first request ID, hex")
+    p_dump.add_argument("--end", type=_can_id, default=0x7FF, help="last request ID, hex")
+    p_dump.add_argument("--timeout-ms", type=_timeout_ms, default=100)
+    p_dump.add_argument("--formats", default="json,xml,html", help="comma list: json,xml,html")
+    p_dump.add_argument("--out", metavar="DIR", help="output dir (default: data dir / dumps / <timestamp>)")
+    p_dump.add_argument("--no-generic", action="store_true", help="skip the generic OBD-II pass")
+    p_dump.add_argument("--no-uds", action="store_true", help="skip the UDS module pass")
+    p_dump.add_argument("--vin", type=_vin_arg, help="tag the dump with this VIN")
+    p_dump.set_defaults(func=cmd_dump)
 
     p_wd = sub.add_parser("write-did", help="write a DID, UDS 0x2E (guarded/experimental)")
     p_wd.add_argument("--module", type=_can_id, required=True)

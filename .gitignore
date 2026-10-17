@@ -14,3 +14,9 @@ docs/vehicle-assessment.md
 docs/vehicle-*.md
 docs/**/assessment*.md
 *.vehicle.json
+# vehicle dumps (real captures) — never commit
+vehicle.json
+vehicle.xml
+vehicle.html
+vehicle-dump.*
+dumps/
