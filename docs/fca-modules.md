@@ -20,7 +20,7 @@ profile design), [`chrysler-sgw.md`](chrysler-sgw.md) (Security Gateway).
 ## 0. Confidence legend
 
 Every non-obvious claim is tagged. This is carried through into the profile
-schema proposal in [§8.2](#82-profilespy--addresses-and-the-addressing-rule).
+schema proposal in [§8.2](#82-profilespy-real-addresses-plus-a-rule-engine).
 
 | Tag | Meaning |
 |---|---|
@@ -1137,7 +1137,7 @@ green; record everything locally (never commit VINs — see `.gitignore` and
    specific function is embedded in a large switch plus the `m_l2`/`m_lx`/`m_ly`/
    `m_lz`/`m_l0` variant tables and has **not** been extracted or tabulated. Until
    it is, seed→key is *reproducible in principle, unimplemented in practice*
-   ([§6.4](#64-is-it-reproducible-offline-yes--with-two-caveats)).
+   ([§6.4](#64-is-it-reproducible-offline-yes-with-two-caveats)).
 3. **The 2021 Atlantis architecture.** The van's MY2021 change is documented
    (Uconnect 5, TBM, "Atlantis replaces Powernet"), and AlfaOBD implements
    `F110` Atlantis identification — but this DB version still names the modules
