@@ -41,6 +41,50 @@ _COMMON_CAN_IHS = [
 # PHEV-only modules (HCP/EAC are hybrid, not on the gas vans).
 _PHEV_CAN_C = ["BPCM", "OBCM", "AHCP", "HCP", "EAC", "IDCM", "EBBM"]
 
+# Real request/response CAN IDs (AlfaOBD ECUUnits; docs/fca-modules.md §4).
+# Most modules use request - 0x280; only 0x7E0-0x7E7 use request + 8.
+MODULE_ADDRESSES: dict[str, list[tuple[str, int, int]]] = {
+    "can-c": [
+        ("PCM", 0x7E0, 0x7E8),
+        ("TCM", 0x7E1, 0x7E9),
+        ("SGW", 0x47E, 0x47F),
+        ("IPC", 0x742, 0x4C2),
+        ("ORC", 0x744, 0x4C4),
+        ("ABS", 0x747, 0x4C7),
+        ("EPS", 0x75A, 0x4DA),
+    ],
+    "can-ihs": [
+        ("HVAC", 0x783, 0x503),
+        ("DDM", 0x784, 0x504),
+        ("PSDML", 0x788, 0x508),
+    ],
+}
+_PHEV_ADDRESSES: dict[str, list[tuple[str, int, int]]] = {
+    "can-c": [("HCP", 0x7E2, 0x7EA), ("BPCM", 0x7E7, 0x7EF)],
+}
+
+
+def addresses(bus: str, powertrain: str | None = None) -> list[tuple[str, int, int]]:
+    """Known (module, request_id, response_id) rows for a bus."""
+    out = list(MODULE_ADDRESSES.get(bus, []))
+    if powertrain == "phev":
+        out += [row for row in _PHEV_ADDRESSES.get(bus, []) if row not in out]
+    return out
+
+
+def response_id(request_id: int) -> int:
+    """Response ID for a request: explicit table first, +8 on the OBD-II block,
+    else request - 0x280. Raises for broadcast/unknown/out-of-range IDs."""
+    for rows in (*MODULE_ADDRESSES.values(), *_PHEV_ADDRESSES.values()):
+        for _name, request, response in rows:
+            if request == request_id:
+                return response
+    if request_id == 0x7DF or not 0x280 <= request_id <= 0x7FF:
+        raise ValueError(f"no response mapping for request ID 0x{request_id:03X}")
+    if 0x7E0 <= request_id <= 0x7E7:
+        return request_id + 8
+    return request_id - 0x280
+
 
 @dataclass(frozen=True, eq=False)
 class VehicleProfile:

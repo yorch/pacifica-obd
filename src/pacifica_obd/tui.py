@@ -70,6 +70,7 @@ from pacifica_obd.cli import (
     configure_bus,
     current_protocol,
     find_port,
+    must_ok,
     restore_protocol,
 )
 from pacifica_obd.elm import Elm327, Elm327Error
@@ -282,20 +283,22 @@ def _prepare_bus(
     warn: Callable[[str], None] | None = None,
     timeout_ms: int = DEFAULT_TIMEOUT_MS,
 ) -> int:
-    """Pin the STN preset for `bus` and clear any leftover receive filter.
+    """Pin the STN preset for `bus`, aim requests at the PCM and clear filters.
 
     ``configure_bus`` (reused from the CLI) leaves the CAN receive address
     filter alone; a previous session read leaves it narrowed to one ECU, which
-    would silently hide every other module. Sending ``ATCRA`` with no argument
-    puts the adapter back in "receive everything" mode.
+    would silently hide every other module, so clear it here.
 
-    Rejections are reported through `warn` (the caller marshals them to the UI)
-    rather than ignored, because a stale filter silently changes the results.
+    The request header is required to be acknowledged: if a stale header from an
+    earlier raw command survived, mode 01/02 reads would go to another ECU and we
+    would present that module's data as the PCM's. The filter clear is only
+    warned about, because a surviving filter shows up as missing modules rather
+    than as someone else's data.
     """
     protocol = configure_bus(elm, bus, timeout_ms)
-    for command in ("ATCRA", "ATSH 7E0"):
-        if not _acknowledged(elm.cmd(command)):
-            _warn(warn, f"{command!r} was not acknowledged; results may be incomplete")
+    must_ok(elm, "ATSH 7E0")
+    if not _acknowledged(elm.cmd("ATCRA")):
+        _warn(warn, "'ATCRA' was not acknowledged; a stale ECU filter may hide modules")
     return protocol
 
 
@@ -477,6 +480,7 @@ _RAW_DANGEROUS_SERVICES = {
     "14": "UDS 0x14 clears stored DTCs",
     "27": "UDS 0x27 security access can unlock write routines",
     "28": "UDS 0x28 communication control can silence a module",
+    "2C": "UDS 0x2C dynamically defines a data identifier",
     "2E": "UDS 0x2E writes a data identifier",
     "2F": "UDS 0x2F writes an input/output control",
     "31": "UDS 0x31 starts a routine on the module",
@@ -491,17 +495,33 @@ _RAW_DANGEROUS_SERVICES = {
 _RAW_PERSISTENT_AT_PREFIXES = ("ATSP", "ATPP")
 
 
-def _raw_risk(command: str) -> str | None:
+def _raw_risk(command: str, framing_off: bool = False) -> str | None:
     """Explain why `command` is not a plain read, or None if it is safe.
 
     ELM/ST commands tolerate spaces (``AT SP 6``), so compare the space-free
-    form for those too, not just for hex service requests.
+    form for those too. With auto-formatting off (``ATCAF0``) the bytes the user
+    types are a raw CAN frame whose first byte is the ISO-TP PCI, so a write
+    service such as ``11`` (ECU reset) hides at offset 2 of what looks like a
+    harmless mode-02 read.
     """
     compact = command.upper().replace(" ", "")
     if re.fullmatch(r"[0-9A-F]+", compact) and len(compact) >= 2:
-        return _RAW_DANGEROUS_SERVICES.get(compact[:2])
+        services = [compact[0:2]]
+        if len(compact) >= 4 and compact[0] in "01":  # single frame / framed payload
+            services.append(compact[2:4])
+        if len(compact) >= 6 and compact[0] == "1":  # ISO-TP first frame: 2 length bytes
+            services.append(compact[4:6])
+        for service in services:
+            reason = _RAW_DANGEROUS_SERVICES.get(service)
+            if reason is not None:
+                return reason
+        if framing_off:
+            return "CAN auto-formatting is off, so these bytes are a raw CAN frame"
+        return None
     if compact.startswith(_RAW_PERSISTENT_AT_PREFIXES):
         return "these adapter commands write the protocol choice to EEPROM"
+    if compact.startswith("ATCAF0"):
+        return "this turns off CAN auto-formatting, so later hex commands become raw frames"
     return None
 
 
@@ -522,7 +542,7 @@ class PortPicker(ModalScreen[str | None]):
         with Vertical(id="dialog"):
             yield Label("Serial port", id="dialog-title")
             if not self._ports:
-                yield Label("(no candidate ports found — is the adapter plugged in?)", classes="hint")
+                yield Label("(no candidate ports; is the adapter plugged in?)", classes="hint")
             items = [ListItem(Label("(auto-detect)"), id="pick-auto")]
             for index, port in enumerate(self._ports):
                 suffix = "   ← current" if port == self._current else ""
@@ -677,6 +697,9 @@ class PacificaTui(App[None]):
         self._port: str | None = None
         self._prev: Snapshot = None
         self._version = ""
+        # True once a raw ATCAF0 has turned automatic CAN formatting off, which
+        # makes later hex commands raw frames (see _raw_risk).
+        self._raw_framing_off = False
         # Worker coordination.
         self._lock = threading.Lock()
         self._cancel = threading.Event()
@@ -744,7 +767,9 @@ class PacificaTui(App[None]):
         self._log_view = self.query_one("#log", RichLog)
         self._table = self.query_one("#table", DataTable)
         self._status_view = self.query_one("#status", Static)
-        self._write(Text("pacifica-obd TUI — press c to connect, then pick an action.", style="bold"))
+        self._write(
+            Text("pacifica-obd TUI — press c to connect, then pick an action.", style="bold")
+        )
         self._line(
             "Keys: c connect · p port · i info · m modules · d DTCs · n module info · "
             "r read DID · w watch · t readiness · f freeze · x raw · s stop",
@@ -819,7 +844,10 @@ class PacificaTui(App[None]):
             state, style = f"busy: {self._busy}", "bold yellow"
         else:
             state, style = "connected", "bold green"
-        bus = str(self.query_one("#bus", Select).value)
+        try:
+            bus = str(self.query_one("#bus", Select).value)
+        except Exception:  # noqa: BLE001 - the DOM is gone during teardown
+            return
         if bus not in _BUS_LABELS:  # defensive: the Select should never be blank
             bus = "can-c"
         if bus == "both":
@@ -840,20 +868,28 @@ class PacificaTui(App[None]):
         self._status_view.update(text)
 
     def _set_busy(self, label: str | None) -> None:
-        for widget in self.query(".action"):
+        try:
+            widgets = list(self.query(".action"))
+        except Exception:  # noqa: BLE001 - the DOM is gone during teardown
+            return
+        for widget in widgets:
             if isinstance(widget, Button):
                 widget.disabled = label is not None
         self._refresh_status()
 
     # -- adapter handle hand-off (always called on the UI thread) ----------
     def _forget_adapter(self) -> tuple[Elm327, Snapshot] | None:
-        """Detach the current handle and return it so the worker can close it."""
+        """Detach the current handle and return it so the worker can close it.
+
+        Deliberately does no rendering: a drawing failure here would lose the
+        handle (shutdown would no longer see it either), leaking an open port.
+        """
         old, previous = self._elm, self._prev
         self._elm = None
         self._port = None
         self._prev = None
         self._version = ""
-        self._refresh_status()
+        self._raw_framing_off = False
         return (old, previous) if old is not None else None
 
     def _adopt_adapter(self, elm: Elm327, port: str, previous: Snapshot, version: str) -> bool:
@@ -864,9 +900,24 @@ class PacificaTui(App[None]):
         self._port = port
         self._prev = previous
         self._version = version or "unknown adapter"
-        self._line(f"Connected to {port} ({self._version}).", "bold green")
-        self._refresh_status()
+        self._raw_framing_off = False
+        try:
+            self._line(f"Connected to {port} ({self._version}).", "bold green")
+            self._refresh_status()
+        except Exception:  # noqa: BLE001 - never lose an adopted handle to a render error
+            pass
         return True
+
+    def _post_quiet(self, callback: Callable[..., object], *args: object) -> None:
+        """Cosmetic UI update from a worker: never let it abort the caller.
+
+        Used for status/button repaints, which must not be able to interrupt a
+        cleanup path (closing the port) or leave the busy flag stuck.
+        """
+        try:
+            self._post(callback, *args)
+        except Exception:  # noqa: BLE001 - cosmetic only
+            pass
 
     # -- worker plumbing ---------------------------------------------------
     @contextmanager
@@ -892,17 +943,22 @@ class PacificaTui(App[None]):
                 f"Adapter busy ({self._busy or 'another operation'}) — try again shortly.",
             )
             raise _Refused("busy")
-        self._busy = label
-        self._cancel.clear()
-        self._post(self._set_busy, label)
         try:
-            yield self._elm
-        finally:
+            # Clear a stale Stop, then re-check under the lock: a shutdown that
+            # began while we were waiting must not be undone, or a polling worker
+            # would never see the cancellation it depends on.
+            self._cancel.clear()
+            if self._closed:
+                raise _Refused("app is shutting down")
+            self._busy = label
+            self._post_quiet(self._set_busy, label)
             try:
-                self._busy = None
-                self._post(self._set_busy, None)
+                yield self._elm
             finally:
-                self._lock.release()
+                self._busy = None
+                self._post_quiet(self._set_busy, None)
+        finally:
+            self._lock.release()
 
     def _guarded(self, label: str, body: Callable[[Elm327], None]) -> None:
         """Worker entry point: hold the adapter, run `body`, report failures."""
@@ -1007,9 +1063,12 @@ class PacificaTui(App[None]):
         try:
             with self._exclusive("Connect", require_adapter=False):
                 stale = self._post(self._forget_adapter)
+                self._post_quiet(self._refresh_status)
                 if isinstance(stale, tuple):
-                    self._post(self._line, "Closing the previous adapter handle…", "dim")
+                    # Release before rendering anything: a drawing failure here
+                    # must never skip the close.
                     _release_handle(*stale)
+                    self._post(self._line, "Closed the previous adapter handle.", "dim")
                 resolved = find_port(port)
                 if resolved is None:
                     self._post(
@@ -1036,6 +1095,7 @@ class PacificaTui(App[None]):
             # a single Disconnect press is enough when something is running.
             with self._exclusive("Disconnect", require_adapter=False, wait=2.0):
                 stale = self._post(self._forget_adapter)
+                self._post_quiet(self._refresh_status)
                 if not isinstance(stale, tuple):
                     self._post(self._line, "Not connected.", "dim")
                     return
@@ -1131,11 +1191,12 @@ class PacificaTui(App[None]):
         if parsed is None:
             self._log_err("Command must be printable ASCII, at most 64 characters.")
             return
-        risk = _raw_risk(parsed)
+        risk = _raw_risk(parsed, self._raw_framing_off)
         if risk is None:
-            self._start("Raw", partial(self._do_raw, parsed))
+            self._dispatch_raw(parsed)
             return
-        # Destructive request (DTC clear, reset, write, EEPROM): require a yes/no.
+        # Destructive request (DTC clear, reset, write, EEPROM, framing change):
+        # require an explicit yes/no first.
         if isinstance(self.screen, ConfirmDialog):
             return
         self.push_screen(
@@ -1152,7 +1213,15 @@ class PacificaTui(App[None]):
             self._line(f"Raw command {command} cancelled.", "yellow")
             return
         self._line(f"Confirmed; sending {command}.", "yellow")
+        self._dispatch_raw(command)
+
+    def _dispatch_raw(self, command: str) -> None:
+        """Send a raw command; the worker updates the framing flag from the reply."""
         self._start("Raw", partial(self._do_raw, command))
+
+    def _set_framing_off(self, framing_off: bool) -> None:
+        """Record whether the adapter is in raw-CAN mode (UI thread)."""
+        self._raw_framing_off = framing_off
 
     def action_watch(self) -> None:
         """Start/stop live PID polling."""
@@ -1413,7 +1482,9 @@ class PacificaTui(App[None]):
                     self._warn(f"'ATSH {rid}' was not acknowledged; skipping this module")
                     continue
                 learned = _enter_session(elm, rid, wait)
-                self._post(self._line, f"{rid}: {'in session' if learned else 'no response'}", "dim")
+                self._post(
+                    self._line, f"{rid}: {'in session' if learned else 'no response'}", "dim"
+                )
                 if probed_from and learned and learned != probed_from:
                     # The probe answered from `probed_from`; if the session
                     # answered from somewhere else, trust the earlier reply so a
@@ -1512,7 +1583,9 @@ class PacificaTui(App[None]):
         payload = _payload_after(elm.cmd("0102", wait=wait), "4102")
         dtc = _decode_obd_dtc(payload) if payload is not None and len(payload) >= 2 else None
         if dtc is None:
-            self._post(self._line, "No freeze-frame data stored (mode 01 PID 02 is empty).", "yellow")
+            self._post(
+                self._line, "No freeze-frame data stored (mode 01 PID 02 is empty).", "yellow"
+            )
             self._post(
                 self._line, "A snapshot is only captured when an emissions fault sets.", "dim"
             )
@@ -1541,6 +1614,19 @@ class PacificaTui(App[None]):
     def _do_raw(self, command: str, elm: Elm327) -> None:
         self._post(self._section, f"Raw command — {command}")
         lines = elm.cmd(command, wait=_probe_wait())
+        # Track raw-CAN framing from what the adapter actually did: only an
+        # acknowledged ATCAF1 restores auto-formatting, and a rejected or silent
+        # ATCAF0 is assumed to have taken effect (the safe assumption).
+        compact = command.upper().replace(" ", "")
+        if compact == "ATCAF0":
+            self._post(self._set_framing_off, True)
+        elif compact == "ATCAF1":
+            if _acknowledged(lines):
+                self._post(self._set_framing_off, False)
+            else:
+                self._post(
+                    self._line, "ATCAF1 was not acknowledged; still assuming raw framing.", "yellow"
+                )
         if not lines:
             self._post(self._line, "(no response)", "dim")
             return
@@ -1558,11 +1644,11 @@ class PacificaTui(App[None]):
         )
         try:
             _prepare_bus(elm, bus, self._warn)
-            while not self._cancel.is_set():
+            while not self._cancel.is_set() and not self._closed:
                 started = time.monotonic()
                 values: dict[str, tuple[str, str]] = {}
                 for pid in pids:
-                    if self._cancel.is_set():
+                    if self._cancel.is_set() or self._closed:
                         break
                     if pid == _VOLTAGE_KEY:
                         volts = _parse_voltage(elm.cmd("ATRV"))
@@ -1579,7 +1665,11 @@ class PacificaTui(App[None]):
                         values[pid] = ("err", unit)
                 self._post(self._watch_sample, values)
                 deadline = started + interval
-                while not self._cancel.is_set() and time.monotonic() < deadline:
+                while (
+                    not self._cancel.is_set()
+                    and not self._closed
+                    and time.monotonic() < deadline
+                ):
                     time.sleep(0.05)  # keep Stop responsive
         finally:
             self._post(self._watch_finished)

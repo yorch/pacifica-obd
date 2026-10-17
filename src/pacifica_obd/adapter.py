@@ -19,18 +19,18 @@ class AdapterError(RuntimeError):
     """Raised when the adapter is missing, rejected a command, or failed."""
 
 
+_USB_SERIAL_HINTS = ("usbserial", "usbmodem", "vlinker", "ftdi", "wchusbserial", "slab", "serial")
+
+
 def find_port(explicit: str | None = None) -> str | None:
-    """Return a serial port, preferring the USB-serial adapter."""
+    """Return the USB-serial adapter port, or None (never a random console port)."""
     if explicit:
         return explicit
-    ports = obd.scan_serial()
-    if not ports:
-        return None
-    for port in ports:
+    for port in obd.scan_serial():
         low = port.lower()
-        if "usbserial" in low or "vlinker" in low or "ftdi" in low:
+        if any(hint in low for hint in _USB_SERIAL_HINTS):
             return port
-    return ports[0]
+    return None
 
 
 def must_ok(elm, command: str) -> None:

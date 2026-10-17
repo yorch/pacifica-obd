@@ -1,0 +1,50 @@
+/* Site polish for the pacifica-obd docs.
+ *
+ * Everything here is expressed with Material's own CSS variables so it stays
+ * correct in both the light and the dark palette. Keep it small: the theme
+ * already does the heavy lifting.
+ */
+
+/* ---------------------------------------------------------------- landing --- */
+/* Soft panel around the intro on the home page. Uses theme colours only, so it
+   never becomes unreadable in either scheme. */
+.hero {
+  margin: 0 0 1.75rem;
+  padding: 1.5rem 1.5rem 0.25rem;
+  border: 1px solid var(--md-default-fg-color--lightest);
+  border-left: 0.25rem solid var(--md-primary-fg-color);
+  border-radius: 0.2rem;
+  background-color: var(--md-code-bg-color);
+}
+
+.hero > h1 {
+  margin-top: 0;
+}
+
+.hero > p {
+  max-width: 46rem;
+}
+
+/* Keep the button row on one tidy line on wide screens. */
+.hero .md-button {
+  margin: 0.25rem 0.25rem 0.75rem 0;
+}
+
+/* --------------------------------------------------------------- snippets --- */
+/* Slightly tighter, monospace-heavy command lines. */
+.md-typeset code {
+  font-feature-settings: "calt";
+}
+
+/* Tables in the reference pages can get wide; let them scroll instead of
+   squeezing columns on narrow screens. */
+.md-typeset table:not([class]) {
+  display: block;
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+/* Status-ish emphasis used on the home page cards. */
+.md-typeset .grid.cards > ul > li {
+  border-radius: 0.2rem;
+}

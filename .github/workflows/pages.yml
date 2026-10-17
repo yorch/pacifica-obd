@@ -1,0 +1,67 @@
+# Build the pacifica-obd documentation site with MkDocs Material and deploy it
+# to GitHub Pages. The Markdown in docs/ is the source of truth: this workflow
+# only builds it (into site/, an artifact — never a committed directory).
+name: Docs (GitHub Pages)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# `pages: write` + `id-token: write` are required by the Pages deployment and are
+# only consumed by the `deploy` job; `contents: read` is enough for the build.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow one concurrent deployment, and never cancel one that is already running:
+# a cancelled Pages deployment can leave the environment reporting a failure.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build site
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-docs.txt
+
+      - name: Install documentation dependencies
+        run: pip install -r requirements-docs.txt
+
+      # --strict turns any warning (broken link, missing nav target, bad anchor)
+      # into a build failure, so the published site cannot silently rot.
+      - name: Build the site
+        run: mkdocs build --strict
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v6
+
+      - name: Upload the built site
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v5

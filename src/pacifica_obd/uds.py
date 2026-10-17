@@ -311,6 +311,122 @@ def did_ascii(record: dict) -> str:
     return (record.get("ascii") or "") if record["status"] == "ok" else ""
 
 
+# --------------------------------------------------------------------------- #
+# write / control services (0x27 security, 0x2E write, 0x31 routine)
+# --------------------------------------------------------------------------- #
+def _result(header, uds, **extra) -> dict:
+    base = {"response_id": header, "raw": uds}
+    base.update(extra)
+    return base
+
+
+def security_access(elm, level: int, seedkey=None, wait: float = 0.5,
+                    expect_header: str | None = None) -> dict:
+    """UDS 0x27: request a seed (odd level) and, if a provider allows, send a key.
+
+    `seedkey` is an optional callable seed_int -> key_int. Without it (or if it
+    returns None) we stop after the seed and report ``no_key_provider``.
+    Responses are correlated to `expect_header` when given.
+    """
+    if level % 2 == 0 or not 0x01 <= level <= 0x7D:
+        raise ValueError("security level must be an odd value in 0x01..0x7D")
+    lines = elm.cmd("27%02X" % level, wait=wait)
+    header, uds = parse_uds_frame(lines, prefer_header=expect_header)
+    result = _result(header, uds, level=level, seed=None, unlocked=False, status="ok")
+    if header is None:
+        result["status"] = "no_response"
+        return result
+    if expect_header and header != expect_header:
+        result["status"] = "wrong_responder"
+        return result
+    if uds.startswith("7F"):
+        result["status"] = "negative"
+        return result
+    prefix = "67%02X" % level
+    if not uds.startswith(prefix):
+        result["status"] = "unexpected"
+        return result
+    seed_hex = uds[len(prefix):]
+    result["seed"] = seed_hex
+    if not seed_hex or len(seed_hex) % 2:
+        result["status"] = "malformed"
+        return result
+    if set(seed_hex) <= {"0"}:
+        result["status"] = "already_unlocked"
+        result["unlocked"] = True
+        return result
+    if seedkey is None:
+        result["status"] = "no_key_provider"
+        return result
+    key = seedkey(int(seed_hex, 16))
+    if key is None:
+        result["status"] = "no_key_provider"
+        return result
+    width = len(seed_hex)
+    if not isinstance(key, int) or key < 0 or key >= (1 << (4 * width)):
+        result["status"] = "key_overflow"
+        return result
+    key_hex = "%0*X" % (width, key)
+    header2, uds2 = parse_uds_frame(
+        elm.cmd("27%02X%s" % (level + 1, key_hex), wait=wait), prefer_header=expect_header
+    )
+    result["raw"] = uds2
+    result["response_id"] = header2
+    if header2 and uds2.startswith("67%02X" % (level + 1)):
+        result["status"] = "unlocked"
+        result["unlocked"] = True
+    else:
+        result["status"] = "rejected"
+    return result
+
+
+def write_did(elm, did: int, data_hex: str, wait: float = 0.5,
+              expect_header: str | None = None) -> dict:
+    """UDS 0x2E WriteDataByIdentifier."""
+    if not 0 <= did <= 0xFFFF:
+        raise ValueError("DID must be 0..0xFFFF")
+    data_hex = data_hex.upper()
+    if not data_hex or len(data_hex) % 2 or not re.fullmatch(r"[0-9A-F]+", data_hex):
+        raise ValueError("data must be non-empty even-length hex")
+    lines = elm.cmd("2E%04X%s" % (did, data_hex), wait=wait)
+    header, uds = parse_uds_frame(lines, prefer_header=expect_header)
+    prefix = "6E%04X" % did
+    result = _result(header, uds, did="%04X" % did, status="ok")
+    if header is None:
+        result["status"] = "no_response"
+    elif expect_header and header != expect_header:
+        result["status"] = "wrong_responder"
+    elif uds.startswith("7F"):
+        result["status"] = "negative"
+    elif uds != prefix:  # the acknowledgement is exactly 6E + DID
+        result["status"] = "unexpected"
+    return result
+
+
+def routine_control(elm, rid: int, sub: int = 0x01, data_hex: str = "", wait: float = 0.5,
+                    expect_header: str | None = None) -> dict:
+    """UDS 0x31 RoutineControl (sub: 1 start, 2 stop, 3 request results)."""
+    if not 0 <= rid <= 0xFFFF:
+        raise ValueError("routine id must be 0..0xFFFF")
+    if sub not in (1, 2, 3):
+        raise ValueError("routine subfunction must be 1, 2 or 3")
+    data_hex = (data_hex or "").upper()
+    if len(data_hex) % 2 or (data_hex and not re.fullmatch(r"[0-9A-F]+", data_hex)):
+        raise ValueError("routine data must be even-length hex")
+    lines = elm.cmd("31%02X%04X%s" % (sub, rid, data_hex), wait=wait)
+    header, uds = parse_uds_frame(lines, prefer_header=expect_header)
+    result = _result(header, uds, rid="%04X" % rid, sub=sub, status="ok")
+    if header is None:
+        result["status"] = "no_response"
+    elif expect_header and header != expect_header:
+        result["status"] = "wrong_responder"
+    elif uds.startswith("7F"):
+        result["status"] = "negative"
+    elif not uds.startswith("71%02X%04X" % (sub, rid)):
+        result["status"] = "unexpected"
+    return result
+
+
 # Back-compat aliases for the pre-refactor private names.
 _BUS_PROTOCOL = BUS_PROTOCOL
 _INFO_DIDS = INFO_DIDS

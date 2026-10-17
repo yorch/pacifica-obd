@@ -42,7 +42,13 @@ from pacifica_obd.adapter import (
     restore_protocol,
 )
 from pacifica_obd.elm import Elm327, Elm327Error
-from pacifica_obd.profiles import looks_like_vin, normalize_vin, year_from_vin
+from pacifica_obd.database import AlfaDatabase
+from pacifica_obd.profiles import (
+    addresses as module_addresses,
+    looks_like_vin,
+    normalize_vin,
+    year_from_vin,
+)
 from pacifica_obd.store import Store, logging_enabled
 from pacifica_obd.uds import (
     BUS_PROTOCOL as _BUS_PROTOCOL,
@@ -56,6 +62,9 @@ from pacifica_obd.uds import (
     parse_uds_frame as _parse_uds_frame,
     probe_ids as _probe_ids,
     read_did as _read_did,
+    routine_control as _routine_control,
+    security_access as _security_access,
+    write_did as _write_did,
 )
 
 console = Console()
@@ -696,10 +705,15 @@ def cmd_modules(args: argparse.Namespace) -> None:
         sys.exit(2)
 
     protocol = _BUS_PROTOCOL[args.bus]
+    service = int(args.session[:2], 16)
+    if service not in (0x10, 0x22, 0x19, 0x3E) and not getattr(args, "confirm", False):
+        err_console.print(
+            f"[red]Refusing to send service 0x{service:02X} to a range without --confirm.[/red]"
+        )
+        sys.exit(2)
     diag(args).print(f"[dim]Scanning {args.bus} (STP {protocol}) {start:03X}–{end:03X}…[/dim]")
 
     elm = open_elm(args)
-    previous = current_protocol(elm)
     wait = max(0.25, args.timeout_ms / 1000 + 0.15)
     found: list[dict] = []
     try:
@@ -723,7 +737,6 @@ def cmd_modules(args: argparse.Namespace) -> None:
         err_console.print(f"[red]{exc}[/red]")
         sys.exit(2)
     finally:
-        restore_protocol(elm, previous)
         elm.close()
 
     if _store(args):
@@ -771,7 +784,6 @@ def cmd_dtc_all(args: argparse.Namespace) -> None:
     wait = max(0.25, args.timeout_ms / 1000 + 0.15)
 
     elm = open_elm(args)
-    previous = current_protocol(elm)
 
     results: list[dict] = []
     try:
@@ -814,7 +826,6 @@ def cmd_dtc_all(args: argparse.Namespace) -> None:
         err_console.print(f"[red]{exc}[/red]")
         sys.exit(2)
     finally:
-        restore_protocol(elm, previous)
         elm.close()
 
     total = sum(len(record["dtcs"]) for record in results)
@@ -870,7 +881,6 @@ def cmd_read_did(args: argparse.Namespace) -> None:
     """Read Data Identifiers (UDS 0x22) from a single module."""
     wait = max(0.25, args.timeout_ms / 1000 + 0.15)
     elm = open_elm(args)
-    previous = current_protocol(elm)
     rid = "%03X" % args.module
     results: list[dict] = []
     try:
@@ -892,7 +902,6 @@ def cmd_read_did(args: argparse.Namespace) -> None:
         err_console.print(f"[red]{exc}[/red]")
         sys.exit(2)
     finally:
-        restore_protocol(elm, previous)
         elm.close()
 
     if args.json:
@@ -917,7 +926,6 @@ def cmd_module_info(args: argparse.Namespace) -> None:
     wait = max(0.25, args.timeout_ms / 1000 + 0.15)
     buses = ["can-c", "can-ihs"] if args.bus == "both" else [args.bus]
     elm = open_elm(args)
-    previous = current_protocol(elm)
     results: list[dict] = []
     try:
         for bus in buses:
@@ -947,7 +955,6 @@ def cmd_module_info(args: argparse.Namespace) -> None:
         err_console.print(f"[red]{exc}[/red]")
         sys.exit(2)
     finally:
-        restore_protocol(elm, previous)
         elm.close()
 
     if args.json:
@@ -989,7 +996,6 @@ def cmd_capture(args: argparse.Namespace) -> None:
     wait = max(0.25, args.timeout_ms / 1000 + 0.15)
     buses = ["can-c", "can-ihs"] if args.bus == "both" else [args.bus]
     elm = open_elm(args)
-    previous = current_protocol(elm)
     store = _store(args)
     session = _session(args)
     vin = normalize_vin(getattr(args, "vin", None))  # an explicit --vin wins
@@ -1060,7 +1066,6 @@ def cmd_capture(args: argparse.Namespace) -> None:
         err_console.print(f"[red]{exc}[/red]")
         sys.exit(2)
     finally:
-        restore_protocol(elm, previous)
         elm.close()
 
     if vin and store:
@@ -1203,7 +1208,6 @@ def cmd_monitor(args: argparse.Namespace) -> None:
     store = _store(args)
     session = _session(args)
     elm = open_elm(args)
-    previous = current_protocol(elm)
     try:
         configure_bus(elm, args.bus, args.timeout_ms)
         if args.module is not None:
@@ -1265,10 +1269,163 @@ def cmd_monitor(args: argparse.Namespace) -> None:
         err_console.print(f"[red]{exc}[/red]")
         sys.exit(2)
     finally:
-        restore_protocol(elm, previous)
         elm.close()
     if store:
         diag(args).print(f"[dim]Saved samples to {store.db_file}[/dim]")
+
+
+# --------------------------------------------------------------------------- #
+# module map + guarded write/configure (UDS 0x27 / 0x2E / 0x31)
+# --------------------------------------------------------------------------- #
+_WRITE_WARNING = (
+    "[bold red]WRITE OPERATION[/bold red] — this can change module configuration "
+    "and is not reversible by this tool. The Security Gateway (SGW) on 2018+ "
+    "vehicles will usually block it without a bypass. You accept the risk."
+)
+
+
+def cmd_module_map(args: argparse.Namespace) -> None:
+    """Show known module addresses (built-in profiles + optional AlfaOBD DB)."""
+    data: dict = {"profiles": {}, "alfaobd": None}
+    for bus in ("can-c", "can-ihs"):
+        data["profiles"][bus] = [
+            {"module": name, "request": "%03X" % request, "response": "%03X" % response}
+            for name, request, response in module_addresses(bus)
+        ]
+
+    db = AlfaDatabase(path=getattr(args, "alfa_db", None))
+    try:
+        if db.available:
+            data["alfaobd"] = {
+                "path": str(db.path),
+                "modules": [
+                    {
+                        "ecu": row["ecu"],
+                        "name": row["name"],
+                        "bus": row["bus"],
+                        "request": None if row["request"] is None else "%03X" % row["request"],
+                        "response": None if row["response"] is None else "%03X" % row["response"],
+                    }
+                    for row in db.pn_modules()
+                ],
+            }
+    finally:
+        db.close()
+
+    if args.json:
+        jdump(data)
+        return
+
+    for bus, rows in data["profiles"].items():
+        table = Table(title=f"Known modules on {bus}")
+        for column in ("Module", "Request", "Response"):
+            table.add_column(column)
+        for row in rows:
+            table.add_row(row["module"], row["request"], row["response"])
+        console.print(table)
+
+    if data["alfaobd"]:
+        table = Table(title=f"AlfaOBD PowerNet modules — {data['alfaobd']['path']}")
+        for column in ("ECU", "Name", "Bus", "Request", "Response"):
+            table.add_column(column)
+        for row in data["alfaobd"]["modules"]:
+            table.add_row(row["ecu"] or "", row["name"] or "", row["bus"] or "",
+                          row["request"] or "", row["response"] or "")
+        console.print(table)
+    else:
+        console.print(
+            "[dim]AlfaOBD DB not found; set PACIFICA_OBD_ALFAOBD_DB (or --alfa-db) "
+            "for the full ECU map.[/dim]"
+        )
+
+
+def _require_confirm(args: argparse.Namespace, action: str) -> None:
+    if not getattr(args, "confirm", False):
+        err_console.print(f"[red]Refusing to {action} without --confirm.[/red]")
+        sys.exit(2)
+
+
+def _addr_and_session(elm, args, wait: float) -> tuple[str, str]:
+    """Configure the bus, address the module, and require an extended session.
+
+    A write/service request must not be sent if addressing failed or the ECU did
+    not confirm an extended session (5003) — otherwise it could land on whatever
+    ECU was previously selected.
+    """
+    configure_bus(elm, args.bus, args.timeout_ms)
+    rid = "%03X" % args.module
+    must_ok(elm, "ATSH " + rid)
+    header, uds = _parse_uds_frame(elm.cmd("1003", wait=wait))
+    if header is None or not uds.startswith("5003"):
+        raise AdapterError(f"module {rid} did not enter an extended session; refusing")
+    return rid, header
+
+
+def cmd_security(args: argparse.Namespace) -> None:
+    """Request a UDS security seed (0x27) from a module (unlocking needs a provider)."""
+    wait = max(0.25, args.timeout_ms / 1000 + 0.15)
+    try:
+        with open_elm(args) as elm:
+            rid, resp = _addr_and_session(elm, args, wait)
+            result = _security_access(elm, args.level, seedkey=None, wait=wait, expect_header=resp)
+    except (AdapterError, Elm327Error, ValueError) as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        sys.exit(2)
+    result["module"] = rid
+    if args.json:
+        jdump(result)
+        return
+    console.print(f"[bold]Module {rid} · 0x27 level {args.level:02X}[/bold] -> {result['status']}")
+    if result.get("seed"):
+        console.print(f"seed: [yellow]{result['seed']}[/yellow]")
+        console.print("[dim]No seed→key provider is configured, so the ECU is left locked.[/dim]")
+
+
+def cmd_write_did(args: argparse.Namespace) -> None:
+    """Write a Data Identifier (UDS 0x2E). Guarded and experimental."""
+    _require_confirm(args, "write a DID")
+    data = args.data.upper()
+    if not data or len(data) % 2 or not re.fullmatch(r"[0-9A-Fa-f]+", data):
+        err_console.print("[red]--data must be non-empty, even-length hex.[/red]")
+        sys.exit(2)
+    wait = max(0.25, args.timeout_ms / 1000 + 0.15)
+    err_console.print(_WRITE_WARNING)
+    try:
+        with open_elm(args) as elm:
+            rid, resp = _addr_and_session(elm, args, wait)
+            result = _write_did(elm, args.did, data, wait=wait, expect_header=resp)
+    except (AdapterError, Elm327Error, ValueError) as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        sys.exit(2)
+    result["module"] = rid
+    if args.json:
+        jdump(result)
+    else:
+        console.print(f"[bold]Write DID {result['did']} on {rid}[/bold] -> {result['status']}")
+
+
+def cmd_routine(args: argparse.Namespace) -> None:
+    """Run a UDS routine (0x31, e.g. activations/calibrations). Guarded/experimental."""
+    _require_confirm(args, "run a routine")
+    data = (args.data or "").upper()
+    if data and (len(data) % 2 or not re.fullmatch(r"[0-9A-Fa-f]+", data)):
+        err_console.print("[red]--data must be even-length hex.[/red]")
+        sys.exit(2)
+    wait = max(0.25, args.timeout_ms / 1000 + 0.15)
+    err_console.print(_WRITE_WARNING)
+    try:
+        with open_elm(args) as elm:
+            rid, resp = _addr_and_session(elm, args, wait)
+            result = _routine_control(elm, args.rid, sub=args.sub, data_hex=data,
+                                      wait=wait, expect_header=resp)
+    except (AdapterError, Elm327Error, ValueError) as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        sys.exit(2)
+    result["module"] = rid
+    if args.json:
+        jdump(result)
+    else:
+        console.print(f"[bold]Routine {result['rid']} sub {args.sub} on {rid}[/bold] -> {result['status']}")
 
 
 # --------------------------------------------------------------------------- #
@@ -1278,6 +1435,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pacifica-obd",
         description="OBD-II toolkit for the 2021 Chrysler Pacifica via a vLinker FS adapter.",
+        allow_abbrev=False,
     )
     parser.add_argument("--port", help="serial device (default: auto-detect)")
     parser.add_argument("--baud", type=int, default=DEFAULT_BAUD, help="host baud (default 115200)")
@@ -1340,6 +1498,8 @@ def build_parser() -> argparse.ArgumentParser:
                            help="also read VIN/part number (22F190 / 22F187)")
     p_modules.add_argument("--timeout-ms", type=_timeout_ms, default=100,
                            help="per-request timeout in ms (STPTO, default 100)")
+    p_modules.add_argument("--confirm", action="store_true",
+                           help="required to probe with a non-read service (e.g. --session 14)")
     p_modules.add_argument("--vin", help="attach stored data to this VIN")
     p_modules.set_defaults(func=cmd_modules)
 
@@ -1410,6 +1570,36 @@ def build_parser() -> argparse.ArgumentParser:
                            help="per-request timeout in ms (STPTO, default 100)")
     p_monitor.add_argument("--vin", help="attach stored samples to this VIN")
     p_monitor.set_defaults(func=cmd_monitor)
+
+    p_map = sub.add_parser("module-map", help="show known module addresses (read-only)")
+    p_map.add_argument("--alfa-db", metavar="PATH", help="path to the AlfaOBD SQLite DB (optional)")
+    p_map.set_defaults(func=cmd_module_map)
+
+    p_sec = sub.add_parser("security", help="request a UDS 0x27 security seed from a module")
+    p_sec.add_argument("--module", type=_can_id, required=True, help="request ID, e.g. 7E0")
+    p_sec.add_argument("--level", type=int, default=1, help="security level (odd), default 1")
+    p_sec.add_argument("--bus", choices=["can-c", "can-ihs"], default="can-c")
+    p_sec.add_argument("--timeout-ms", type=_timeout_ms, default=100)
+    p_sec.set_defaults(func=cmd_security)
+
+    p_wd = sub.add_parser("write-did", help="write a DID, UDS 0x2E (guarded/experimental)")
+    p_wd.add_argument("--module", type=_can_id, required=True)
+    p_wd.add_argument("--did", type=_did, required=True)
+    p_wd.add_argument("--data", required=True, help="hex payload, e.g. 01")
+    p_wd.add_argument("--confirm", action="store_true", help="required acknowledgement")
+    p_wd.add_argument("--bus", choices=["can-c", "can-ihs"], default="can-c")
+    p_wd.add_argument("--timeout-ms", type=_timeout_ms, default=100)
+    p_wd.set_defaults(func=cmd_write_did)
+
+    p_rt = sub.add_parser("routine", help="run a UDS routine, 0x31 (guarded/experimental)")
+    p_rt.add_argument("--module", type=_can_id, required=True)
+    p_rt.add_argument("--rid", type=_did, required=True, help="routine identifier (4 hex)")
+    p_rt.add_argument("--sub", type=int, default=1, choices=[1, 2, 3], help="1 start, 2 stop, 3 results")
+    p_rt.add_argument("--data", default="", help="hex payload (optional)")
+    p_rt.add_argument("--confirm", action="store_true", help="required acknowledgement")
+    p_rt.add_argument("--bus", choices=["can-c", "can-ihs"], default="can-c")
+    p_rt.add_argument("--timeout-ms", type=_timeout_ms, default=100)
+    p_rt.set_defaults(func=cmd_routine)
 
     # Allow --json after the subcommand too, without clobbering the global value.
     for sp in sub.choices.values():
