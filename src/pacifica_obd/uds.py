@@ -358,13 +358,18 @@ def security_access(elm, level: int, seedkey=None, wait: float = 0.5,
     if seedkey is None:
         result["status"] = "no_key_provider"
         return result
-    key = seedkey(int(seed_hex, 16))
+    try:
+        key = seedkey(int(seed_hex, 16))
+    except Exception as exc:  # noqa: BLE001 - a broken provider must never send a key
+        result["status"] = "key_error"
+        result["error"] = str(exc)
+        return result
     if key is None:
         result["status"] = "no_key_provider"
         return result
     width = len(seed_hex)
-    if not isinstance(key, int) or key < 0 or key >= (1 << (4 * width)):
-        result["status"] = "key_overflow"
+    if type(key) is not int or key < 0 or key >= (1 << (4 * width)):
+        result["status"] = "key_overflow"  # bool, str, negative or too wide
         return result
     key_hex = "%0*X" % (width, key)
     header2, uds2 = parse_uds_frame(

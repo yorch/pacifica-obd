@@ -49,6 +49,14 @@ from pacifica_obd.profiles import (
     normalize_vin,
     year_from_vin,
 )
+from pacifica_obd.seedkey import (
+    SeedKeyError,
+    find_secrets,
+    load_algorithm,
+    load_provider,
+    parse_pairs,
+    recover_secret,
+)
 from pacifica_obd.store import Store, logging_enabled
 from pacifica_obd.uds import (
     BUS_PROTOCOL as _BUS_PROTOCOL,
@@ -237,6 +245,16 @@ def _positive_interval(text) -> float:
         raise argparse.ArgumentTypeError(f"not a number: {text!r}")
     if not (value > 0) or value != value or value in (float("inf"), float("-inf")):
         raise argparse.ArgumentTypeError("interval must be a finite positive number")
+    return value
+
+
+def _width(text) -> int:
+    try:
+        value = int(str(text))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not an integer: {text!r}")
+    if not 1 <= value <= 4:
+        raise argparse.ArgumentTypeError("width must be 1..4 bytes")
     return value
 
 
@@ -1362,12 +1380,27 @@ def _addr_and_session(elm, args, wait: float) -> tuple[str, str]:
 
 
 def cmd_security(args: argparse.Namespace) -> None:
-    """Request a UDS security seed (0x27) from a module (unlocking needs a provider)."""
+    """Request a UDS security seed (0x27); optionally send a key from a provider."""
+    if args.unlock and not args.confirm:
+        err_console.print("[red]--unlock requires --confirm (a wrong key can lock the ECU).[/red]")
+        sys.exit(2)
+    if args.unlock and not args.provider:
+        err_console.print("[red]--unlock requires --provider FILE.[/red]")
+        sys.exit(2)
+    provider = None
+    if args.provider:
+        try:
+            provider = load_provider(args.provider)
+        except SeedKeyError as exc:
+            err_console.print(f"[red]{exc}[/red]")
+            sys.exit(2)
+    seedkey = provider if args.unlock else None
+
     wait = max(0.25, args.timeout_ms / 1000 + 0.15)
     try:
         with open_elm(args) as elm:
             rid, resp = _addr_and_session(elm, args, wait)
-            result = _security_access(elm, args.level, seedkey=None, wait=wait, expect_header=resp)
+            result = _security_access(elm, args.level, seedkey=seedkey, wait=wait, expect_header=resp)
     except (AdapterError, Elm327Error, ValueError) as exc:
         err_console.print(f"[red]{exc}[/red]")
         sys.exit(2)
@@ -1378,7 +1411,38 @@ def cmd_security(args: argparse.Namespace) -> None:
     console.print(f"[bold]Module {rid} · 0x27 level {args.level:02X}[/bold] -> {result['status']}")
     if result.get("seed"):
         console.print(f"seed: [yellow]{result['seed']}[/yellow]")
-        console.print("[dim]No seed→key provider is configured, so the ECU is left locked.[/dim]")
+    if result["unlocked"]:
+        console.print("[green]Security access granted.[/green]")
+    elif result["status"] == "no_key_provider":
+        console.print("[dim]No seed→key provider; ECU left locked. Use --provider FILE --unlock.[/dim]")
+    if args.unlock and not result.get("unlocked"):
+        sys.exit(3)
+
+
+def cmd_seedkey_brute(args: argparse.Namespace) -> None:
+    """Recover a short per-ECU secret from observed (seed,key) pairs + an algorithm."""
+    try:
+        algorithm = load_algorithm(args.algorithm)
+        pairs = parse_pairs(",".join(args.pair), width=args.width)
+        matches = find_secrets(algorithm, pairs, width=args.width)
+    except SeedKeyError as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        sys.exit(2)
+
+    data = {
+        "width": args.width,
+        "pairs": [{"seed": "%X" % seed, "key": "%X" % key} for seed, key in pairs],
+        "candidates": ["%0*X" % (args.width * 2, match) for match in matches],
+    }
+    if args.json:
+        jdump(data)
+        return
+    if not matches:
+        console.print("[yellow]No secret consistent with those pairs.[/yellow]")
+    elif len(matches) > 1:
+        console.print("[yellow]Ambiguous: multiple secrets fit; supply more pairs.[/yellow]")
+    else:
+        console.print(f"[green]Recovered {args.width}-byte secret:[/green] {data['candidates'][0]}")
 
 
 def cmd_write_did(args: argparse.Namespace) -> None:
@@ -1578,9 +1642,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_sec = sub.add_parser("security", help="request a UDS 0x27 security seed from a module")
     p_sec.add_argument("--module", type=_can_id, required=True, help="request ID, e.g. 7E0")
     p_sec.add_argument("--level", type=int, default=1, help="security level (odd), default 1")
+    p_sec.add_argument("--provider", metavar="FILE", help="Python file exposing key_for(seed, **ctx) -> int")
+    p_sec.add_argument("--unlock", action="store_true", help="also send the key (requires --confirm)")
+    p_sec.add_argument("--confirm", action="store_true", help="acknowledge sending a key to the ECU")
     p_sec.add_argument("--bus", choices=["can-c", "can-ihs"], default="can-c")
     p_sec.add_argument("--timeout-ms", type=_timeout_ms, default=100)
     p_sec.set_defaults(func=cmd_security)
+
+    p_sk = sub.add_parser("seedkey-brute", help="recover a short per-ECU secret from seed/key pairs")
+    p_sk.add_argument("--pair", action="append", required=True, help="SEED:KEY in hex (repeatable)")
+    p_sk.add_argument("--algorithm", required=True, metavar="FILE",
+                      help="Python file exposing algorithm(seed, secret) -> key")
+    p_sk.add_argument("--width", type=_width, default=2, help="secret width in bytes, 1..4 (default 2)")
+    p_sk.set_defaults(func=cmd_seedkey_brute)
 
     p_wd = sub.add_parser("write-did", help="write a DID, UDS 0x2E (guarded/experimental)")
     p_wd.add_argument("--module", type=_can_id, required=True)
