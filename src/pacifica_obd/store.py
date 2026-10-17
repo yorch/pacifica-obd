@@ -33,6 +33,9 @@ CREATE TABLE IF NOT EXISTS vehicles (
     make       TEXT,
     model      TEXT,
     year       INTEGER,
+    profile_id TEXT,
+    powertrain TEXT,
+    nickname   TEXT,
     first_seen TEXT NOT NULL,
     last_seen  TEXT NOT NULL,
     notes      TEXT
@@ -73,9 +76,16 @@ CREATE TABLE IF NOT EXISTS readings (
     bus         TEXT, module TEXT, did TEXT, name TEXT,
     value_hex   TEXT, value_ascii TEXT, status TEXT, raw TEXT, category TEXT
 );
+CREATE TABLE IF NOT EXISTS samples (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER, ts TEXT, vin TEXT,
+    bus        TEXT, module TEXT, did TEXT, name TEXT,
+    value_num  REAL, value_text TEXT, status TEXT, raw TEXT
+);
 CREATE INDEX IF NOT EXISTS idx_dtcs_vin     ON dtcs(vin);
 CREATE INDEX IF NOT EXISTS idx_readings_vin ON readings(vin);
 CREATE INDEX IF NOT EXISTS idx_modules_vin  ON modules(vin);
+CREATE INDEX IF NOT EXISTS idx_samples_vin  ON samples(vin);
 """
 
 
@@ -131,6 +141,16 @@ class Store:
             conn = sqlite3.connect(self.db_file, check_same_thread=False, timeout=5.0)
             conn.row_factory = sqlite3.Row
             conn.executescript(_SCHEMA)
+            # lightweight migrations for databases created by older versions
+            for statement in (
+                "ALTER TABLE vehicles ADD COLUMN profile_id TEXT",
+                "ALTER TABLE vehicles ADD COLUMN powertrain TEXT",
+                "ALTER TABLE vehicles ADD COLUMN nickname TEXT",
+            ):
+                try:
+                    conn.execute(statement)
+                except sqlite3.Error:
+                    pass
             conn.commit()
             self._conn = conn
         except (sqlite3.Error, OSError):
@@ -239,20 +259,25 @@ class Store:
 
     # -- domain data -------------------------------------------------------
     def upsert_vehicle(self, vin: str, make: str | None = None, model: str | None = None,
-                       year: int | None = None) -> None:
+                       year: int | None = None, profile_id: str | None = None,
+                       powertrain: str | None = None, nickname: str | None = None) -> None:
         if not vin:
             return
         now = _now()
         self._execute(
-            """INSERT INTO vehicles (vin, make, model, year, first_seen, last_seen)
-               VALUES (?, ?, ?, ?, ?, ?)
+            """INSERT INTO vehicles (vin, make, model, year, profile_id, powertrain, nickname, first_seen, last_seen)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(vin) DO UPDATE SET last_seen = excluded.last_seen,
                    make = COALESCE(excluded.make, vehicles.make),
                    model = COALESCE(excluded.model, vehicles.model),
-                   year = COALESCE(excluded.year, vehicles.year)""",
-            (vin, make, model, year, now, now),
+                   year = COALESCE(excluded.year, vehicles.year),
+                   profile_id = COALESCE(excluded.profile_id, vehicles.profile_id),
+                   powertrain = COALESCE(excluded.powertrain, vehicles.powertrain),
+                   nickname = COALESCE(excluded.nickname, vehicles.nickname)""",
+            (vin, make, model, year, profile_id, powertrain, nickname, now, now),
         )
-        self._append_log({"kind": "vehicle", "vin": vin, "make": make, "model": model, "year": year})
+        self._append_log({"kind": "vehicle", "vin": vin, "make": make, "model": model,
+                          "year": year, "profile_id": profile_id, "powertrain": powertrain})
 
     def add_module(self, session_id: int | None, vin: str | None, bus: str, module: dict) -> None:
         self._execute(
@@ -294,6 +319,21 @@ class Store:
     # -- queries -----------------------------------------------------------
     def vehicles(self) -> list[dict]:
         return self._query("SELECT * FROM vehicles ORDER BY last_seen DESC")
+
+    def latest_vehicle(self) -> dict | None:
+        rows = self._query("SELECT * FROM vehicles ORDER BY last_seen DESC LIMIT 1")
+        return rows[0] if rows else None
+
+    def add_sample(self, session_id: int | None, vin: str | None, bus: str, module: str,
+                   did: str, name: str | None, value_num: float | None, value_text: str | None,
+                   unit: str | None = None, status: str = "ok", raw: str | None = None) -> None:
+        self._execute(
+            """INSERT INTO samples (session_id, ts, vin, bus, module, did, name, value_num, value_text, status, raw)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (session_id, _now(), vin, bus, module, did, name, value_num, value_text, status, raw),
+        )
+        self._append_log({"kind": "sample", "session_id": session_id, "module": module, "did": did,
+                          "value": value_num, "text": value_text, "unit": unit, "status": status})
 
     def sessions(self, limit: int = 50) -> list[dict]:
         return self._query("SELECT * FROM sessions ORDER BY id DESC LIMIT ?", (limit,))

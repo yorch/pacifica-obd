@@ -27,14 +27,29 @@ uv run pacifica-obd modules --start 7E0 --end 7E1 --timeout-ms 40 --json
 
 ```
 src/pacifica_obd/
-  cli.py    argparse subcommands, UDS helpers (_probe_ids, _parse_uds_frame, ...), storage wiring
-  elm.py    raw ELM327/STN transport (Elm327, Elm327Error)
-  store.py  SQLite + JSONL persistence (Store)
-  tui.py    interactive Textual UI (run())
+  cli.py      thin argparse adapters + Rich rendering (+ re-exports for compat)
+  adapter.py  device layer: ElmAdapter, find_port, bus config, protocol snapshot/restore
+  uds.py      pure ISO-TP/UDS logic: frame reassembly, DTC decode, DID reads
+  models.py   typed domain models (Vehicle, Module, Dtc, Reading, CaptureResult)
+  profiles.py data-driven VehicleProfile (years/powertrain/module buses/VIN year)
+  elm.py      raw ELM327/STN transport (Elm327, Elm327Error)
+  store.py    SQLite + JSONL persistence (Store)
+  tui.py      interactive Textual UI (run())
 docs/
-  chrysler-sgw.md          SGW, 12+8 bypass, AlfaOBD/Appcar/JScape path
+  chrysler-sgw.md          SGW, 12+8 bypass, AlfaOBD/Appcar/JScan path
   enhanced-diagnostics.md  roadmap P0–P6 toward AlfaOBD-class UDS
+  vehicle-support.md       cross-year/hybrid support matrix + profile design
 ```
+
+## Architecture / separation of concerns
+
+- **No I/O or printing in `uds.py`/`adapter.py`/`models.py`/`profiles.py`.** They are
+  reusable by the CLI, the TUI, and any future front end. `cli.py` only wires
+  argparse and renders; `tui.py` only renders and dispatches.
+- The device layer raises `AdapterError` (not `sys.exit`). Front ends decide how
+  to report and exit.
+- One owner talks to the adapter at a time (a single `ElmAdapter`/`Elm327`); do
+  not let two components issue `cmd()` concurrently.
 
 ## Conventions
 
@@ -59,6 +74,11 @@ docs/
   restore the snapshot from `current_protocol()`, and avoid `ATSP` writes.
 - The **Security Gateway (SGW)** blocks writes on 2018+ vehicles; reads pass.
   Do not assume a write will succeed. See `docs/chrysler-sgw.md`.
+- **Response addressing:** only `0x7E0`–`0x7E7` respond at `request + 8`. Most
+  other 11-bit modules respond at `request − 0x280`. Always use the response ID
+  captured by discovery (`modules`/`probe_ids`) rather than deriving `+8`.
+- Per-module request/response IDs and DID maps for many modules are still
+  unknown; see `docs/vehicle-support.md` §9.
 
 ## Persistence
 

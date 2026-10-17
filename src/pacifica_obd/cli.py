@@ -32,8 +32,30 @@ from rich.console import Console
 from rich.live import Live
 from rich.table import Table
 
+from pacifica_obd.adapter import (
+    AdapterError,
+    ElmAdapter,
+    configure_bus,
+    current_protocol,
+    find_port,
+    must_ok,
+    restore_protocol,
+)
 from pacifica_obd.elm import Elm327, Elm327Error
 from pacifica_obd.store import Store, logging_enabled
+from pacifica_obd.uds import (
+    BUS_PROTOCOL as _BUS_PROTOCOL,
+    INFO_DIDS as _INFO_DIDS,
+    ascii_payload as _ascii_payload,
+    classify_dtc_response as _classify_dtc_response,
+    did_ascii as _did_ascii,
+    did_value as _did_value,
+    enter_session as _enter_session,
+    parse_dtcs as _parse_dtcs,
+    parse_uds_frame as _parse_uds_frame,
+    probe_ids as _probe_ids,
+    read_did as _read_did,
+)
 
 console = Console()
 err_console = Console(stderr=True)
@@ -169,56 +191,9 @@ def open_elm(args: argparse.Namespace) -> Elm327:
         sys.exit(2)
     try:
         return Elm327(port, args.baud, timeout=args.timeout)
-    except Elm327Error as exc:
+    except (AdapterError, Elm327Error) as exc:
         err_console.print(f"[red]{exc}[/red]")
         sys.exit(2)
-
-
-def must_ok(elm: Elm327, command: str) -> None:
-    """Run a configuration command and require an 'OK' acknowledgement."""
-    response = elm.cmd(command)
-    if not any("OK" in line.upper() for line in response):
-        raise Elm327Error(f"{command!r} rejected by adapter: {response!r}")
-
-
-def configure_bus(elm: Elm327, bus: str, timeout_ms: int) -> int:
-    protocol = _BUS_PROTOCOL[bus]
-    must_ok(elm, f"STP {protocol}")
-    must_ok(elm, "ATH1")
-    must_ok(elm, "ATCAF1")
-    must_ok(elm, "ATAL")
-    must_ok(elm, f"STPTO {timeout_ms}")
-    return protocol
-
-
-def current_protocol(elm: Elm327):
-    """Snapshot the adapter's protocol as ('auto', None) | ('at', n) | ('st', n) | None."""
-    strings = elm.cmd("STPRS")
-    numbers = elm.cmd("STPR")
-    strings_line = (strings[0] if strings else "").upper()
-    if "AUTO" in strings_line:
-        return ("auto", None)
-    number_line = (numbers[0] if numbers else "").upper()
-    token = number_line.split()[0] if number_line else ""
-    if not re.fullmatch(r"[0-9A-Fa-f]{1,2}", token):
-        return None
-    return ("at" if "[AT]" in number_line else "st", token)
-
-
-def restore_protocol(elm: Elm327, previous) -> None:
-    """Restore the snapshot without writing adapter EEPROM."""
-    if not previous:
-        return
-    kind, token = previous
-    try:
-        if kind == "auto":
-            elm.cmd("ATTP0")          # try auto, non-saving
-        elif kind == "at":
-            elm.cmd("ATTP " + token)  # AT namespace, non-saving
-        elif kind == "st":
-            elm.cmd("STP " + token)   # ST preset (e.g. 33 / 53)
-    except Exception:  # noqa: BLE001
-        pass
 
 
 def _can_id(text) -> int:
@@ -672,7 +647,7 @@ def cmd_raw(args: argparse.Namespace) -> None:
         sys.exit(2)
     try:
         elm = Elm327(port, args.baud, timeout=args.timeout)
-    except Elm327Error as exc:
+    except (AdapterError, Elm327Error) as exc:
         err_console.print(f"[red]{exc}[/red]")
         sys.exit(2)
 
@@ -705,144 +680,6 @@ def cmd_raw(args: argparse.Namespace) -> None:
 # --------------------------------------------------------------------------- #
 # module discovery (UDS, CAN-C / CAN-IHS)
 # --------------------------------------------------------------------------- #
-# STN/ELM protocol presets: 33 = ISO 15765 11-bit 500k (HS/CAN-C),
-# 53 = ISO 15765 11-bit 125k (MS/CAN-IHS).
-_BUS_PROTOCOL = {"can-c": 33, "can-ihs": 53}
-
-
-_HEADER_LEN = 3  # 11-bit CAN; our STP presets (33/53) are 11-bit
-
-
-def _collect_frames(lines: list[str], header_len: int = _HEADER_LEN) -> list[tuple[str, list[bytes]]]:
-    """Group response lines by CAN header, preserving arrival order.
-
-    Handles both spaced ("7E8 06 50 03") and compact ("7E8065003") formats.
-    """
-    frames: dict[str, list[bytes]] = {}
-    order: list[str] = []
-    for line in lines:
-        tokens = line.split()
-        if len(tokens) >= 2:
-            header, data = tokens[0], "".join(tokens[1:])
-        else:
-            token = tokens[0] if tokens else ""
-            if len(token) <= header_len or not re.fullmatch(r"[0-9A-Fa-f]+", token):
-                continue
-            header, data = token[:header_len], token[header_len:]
-        header = header.upper()
-        if not re.fullmatch(r"[0-9A-Fa-f]{3}|[0-9A-Fa-f]{8}", header):
-            continue
-        if not re.fullmatch(r"[0-9A-Fa-f]+", data) or len(data) % 2:
-            continue
-        if len(data) > 16:  # classic CAN carries at most 8 bytes per frame
-            continue
-        if header not in frames:
-            frames[header] = []
-            order.append(header)
-        frames[header].append(bytes.fromhex(data))
-    return [(h, frames[h]) for h in order]
-
-
-def _messages_from_frames(frames: list[bytes]) -> list[str]:
-    """Split a frame list into one or more complete, validated UDS payloads."""
-    messages: list[str] = []
-    i = 0
-    n = len(frames)
-    while i < n:
-        first = frames[i]
-        i += 1
-        if not first or len(first) > 8:  # classic CAN: at most 8 bytes/frame
-            continue
-        pci = first[0] >> 4
-        if pci == 0:  # single frame: length must be 1..7
-            length = first[0] & 0x0F
-            if not 1 <= length <= 7:
-                continue
-            data = first[1:1 + length]
-            if len(data) == length:
-                messages.append(data.hex().upper())
-        elif pci == 1:  # first frame: always a full 8-byte classic-CAN frame
-            if len(first) != 8:
-                continue
-            length = ((first[0] & 0x0F) << 8) | first[1]
-            if not 8 <= length <= 0xFFF:
-                continue
-            payload = bytearray(first[2:])
-            expected = 1
-            while i < n and len(payload) < length:
-                cf = frames[i]
-                if not cf:
-                    i += 1
-                    continue
-                if len(cf) > 8 or (cf[0] >> 4) != 2 or (cf[0] & 0x0F) != expected:
-                    break  # invalid / missing / duplicated / reordered -> abandon
-                if len(cf) < 8 and len(payload) + (len(cf) - 1) < length:
-                    break  # a non-final consecutive frame must be full
-                payload += cf[1:]
-                expected = (expected + 1) & 0x0F
-                i += 1
-            if len(payload) >= length:
-                messages.append(bytes(payload[:length]).hex().upper())
-        # stray consecutive/flow-control frames are ignored
-    return messages
-
-
-def _parse_uds_frame(lines: list[str]) -> tuple[str | None, str | None]:
-    """Return (response_header, uds_hex), reassembling ISO-TP if needed.
-
-    Prefers the last non-responsePending (NRC 0x78) message so a pending
-    acknowledgement does not mask the real answer.
-    """
-    for header, frames in _collect_frames(lines):
-        messages = _messages_from_frames(frames)
-        if not messages:
-            continue
-        final = [
-            m
-            for m in messages
-            if not (m.startswith("7F") and len(m) >= 6 and m[4:6] == "78")
-        ]
-        return header, (final[-1] if final else messages[-1])
-    return None, None
-
-
-def _ascii_payload(uds_hex: str, prefix: str) -> str | None:
-    if not uds_hex.startswith(prefix):
-        return None
-    body = uds_hex[len(prefix):]
-    if not body or len(body) % 2:
-        return None
-    try:
-        raw = bytes.fromhex(body)
-    except ValueError:
-        return None
-    if any(byte < 0x20 or byte > 0x7E for byte in raw):  # reject non-printable
-        return None
-    return raw.decode("ascii").strip() or None
-
-
-def _probe_ids(elm, start: int, end: int, probe: str, wait: float):
-    """Yield responding module IDs by sending `probe` to each request ID."""
-    service = int(probe[:2], 16)
-    for rid in range(start, end + 1):
-        elm.cmd("ATSH %03X" % rid)
-        header, uds = _parse_uds_frame(elm.cmd(probe, wait=wait))
-        if header is None:
-            continue
-        if uds.startswith("%02X" % (service + 0x40)):
-            kind = "positive"
-        elif uds.startswith("7F"):
-            kind = "negative"
-        else:
-            kind = "other"
-        yield {
-            "request_id": "%03X" % rid,
-            "response_id": header,
-            "kind": kind,
-            "session_response": uds,
-        }
-
-
 def cmd_modules(args: argparse.Namespace) -> None:
     """Probe a CAN bus for UDS-responding modules."""
     start, end = args.start, args.end  # validated 11-bit ints (see _can_id)
@@ -874,7 +711,7 @@ def cmd_modules(args: argparse.Namespace) -> None:
                     if part:
                         entry["part_number"] = part
             found.append(entry)
-    except Elm327Error as exc:
+    except (AdapterError, Elm327Error) as exc:
         err_console.print(f"[red]{exc}[/red]")
         sys.exit(2)
     finally:
@@ -914,60 +751,6 @@ def cmd_modules(args: argparse.Namespace) -> None:
 # --------------------------------------------------------------------------- #
 # all-module DTC read (UDS 0x19 0x02)
 # --------------------------------------------------------------------------- #
-_DTC_STATUS_BITS = [
-    (0x01, "testFailed"),
-    (0x02, "testFailedThisCycle"),
-    (0x04, "pending"),
-    (0x08, "confirmed"),
-    (0x10, "testNotCompletedSinceClear"),
-    (0x20, "testFailedSinceClear"),
-    (0x40, "testNotCompletedThisCycle"),
-    (0x80, "warningLamp"),
-]
-
-
-def _decode_dtc(b0: int, b1: int, b2: int) -> tuple[str, int]:
-    """Decode a 3-byte UDS DTC into (e.g. 'P0300', failure_type_byte)."""
-    letter = "PCBU"[(b0 >> 6) & 0x03]
-    number = ((b0 & 0x3F) << 8) | b1
-    return f"{letter}{number:04X}", b2
-
-
-def _classify_dtc_response(uds_hex: str) -> str:
-    """Classify a 0x19 0x02 reply: ok | negative | unexpected | malformed."""
-    if uds_hex.startswith("7F"):
-        return "negative"
-    if not uds_hex.startswith("5902"):
-        return "unexpected"
-    body = uds_hex[4:]
-    if len(body) % 2:
-        return "malformed"
-    nbytes = len(body) // 2
-    if nbytes == 0 or (nbytes - 1) % 4 != 0:  # mask byte + N*4-byte records
-        return "malformed"
-    return "ok"
-
-
-def _parse_dtcs(uds_hex: str) -> list[dict]:
-    """Parse a well-formed 0x59 0x02 response: 59 02 <mask> (<dtc3><status>)*."""
-    if _classify_dtc_response(uds_hex) != "ok":
-        return []
-    records = bytes.fromhex(uds_hex[4:])[1:]  # skip the status-availability mask
-    dtcs: list[dict] = []
-    for i in range(0, len(records), 4):
-        b0, b1, b2, status = records[i:i + 4]
-        code, failure_type = _decode_dtc(b0, b1, b2)
-        dtcs.append(
-            {
-                "code": code,
-                "failure_type": "%02X" % failure_type,
-                "status": "%02X" % status,
-                "flags": [name for bit, name in _DTC_STATUS_BITS if status & bit],
-            }
-        )
-    return dtcs
-
-
 def cmd_dtc_all(args: argparse.Namespace) -> None:
     """Read DTCs (UDS 0x19) from every responding module on one or both buses."""
     start, end = args.start, args.end
@@ -1019,7 +802,7 @@ def cmd_dtc_all(args: argparse.Namespace) -> None:
                         _session(args), "dtc-read", rid,
                         {"status": record["status"], "count": len(record["dtcs"])},
                     )
-    except Elm327Error as exc:
+    except (AdapterError, Elm327Error) as exc:
         err_console.print(f"[red]{exc}[/red]")
         sys.exit(2)
     finally:
@@ -1075,88 +858,6 @@ def cmd_dtc_all(args: argparse.Namespace) -> None:
 # --------------------------------------------------------------------------- #
 # read data by identifier (UDS 0x22)
 # --------------------------------------------------------------------------- #
-_DID_NAMES = {
-    0xF186: "Active diagnostic session",
-    0xF187: "Spare part number",
-    0xF188: "ECU software number",
-    0xF189: "ECU software version",
-    0xF18A: "System supplier identifier",
-    0xF18C: "ECU serial number",
-    0xF190: "VIN",
-    0xF191: "ECU hardware number",
-}
-_INFO_DIDS = list(_DID_NAMES)
-
-
-def _read_did(elm: Elm327, did: int, wait: float, expect_header: str | None = None) -> dict:
-    request = "22%04X" % did
-    lines = elm.cmd(request, wait=wait)
-    header, uds = _parse_uds_frame(lines)
-    record = {
-        "did": "%04X" % did,
-        "name": _DID_NAMES.get(did),
-        "response_id": header,
-        "raw": uds,
-    }
-    if header is None:
-        record["status"] = "can_error" if any(
-            "CAN ERROR" in line.upper() or "BUFFER FULL" in line.upper() for line in lines
-        ) else "no_response"
-        record["raw_lines"] = lines
-        return record
-    if expect_header and header != expect_header:
-        record["status"] = "wrong_responder"  # a different ECU answered
-        return record
-    if uds.startswith("7F"):
-        if len(uds) >= 6 and uds[2:4] == "22":
-            record["status"] = "pending" if uds[4:6] == "78" else "negative"
-        else:
-            record["status"] = "malformed"
-        return record
-    prefix = "62%04X" % did
-    if not uds.startswith(prefix):
-        record["status"] = "unexpected"
-        return record
-    data_hex = uds[len(prefix):]
-    if not data_hex:
-        record["status"] = "malformed"
-        return record
-    record["status"] = "ok"
-    record["hex"] = data_hex
-    record["ascii"] = _ascii_payload(uds, prefix)
-    return record
-
-
-_DID_STATUS_TEXT = {
-    "no_response": "no response",
-    "can_error": "CAN error",
-    "negative": "negative response",
-    "pending": "pending (no final response)",
-    "unexpected": "unexpected response",
-    "wrong_responder": "wrong responder",
-    "malformed": "malformed data",
-}
-
-
-def _did_value(record: dict) -> str:
-    if record["status"] != "ok":
-        return _DID_STATUS_TEXT.get(record["status"], record["status"])
-    return record.get("hex", "")
-
-
-def _did_ascii(record: dict) -> str:
-    return (record.get("ascii") or "") if record["status"] == "ok" else ""
-
-
-def _enter_session(elm: Elm327, rid: str, wait: float) -> str | None:
-    """Send 0x10 0x03; return the ECU's response header and filter RX to it."""
-    lines = elm.cmd("1003", wait=wait)
-    header, _ = _parse_uds_frame(lines)
-    if header:
-        elm.cmd("ATCRA " + header)
-    return header
-
-
 def cmd_read_did(args: argparse.Namespace) -> None:
     """Read Data Identifiers (UDS 0x22) from a single module."""
     wait = max(0.25, args.timeout_ms / 1000 + 0.15)
@@ -1179,7 +880,7 @@ def cmd_read_did(args: argparse.Namespace) -> None:
                     record.get("name"), record.get("hex"), record.get("ascii"),
                     record["status"], record.get("raw"), category="did",
                 )
-    except Elm327Error as exc:
+    except (AdapterError, Elm327Error) as exc:
         err_console.print(f"[red]{exc}[/red]")
         sys.exit(2)
     finally:
@@ -1234,7 +935,7 @@ def cmd_module_info(args: argparse.Namespace) -> None:
                             record.get("name"), record.get("hex"), record.get("ascii"),
                             record["status"], record.get("raw"), category="module-info",
                         )
-    except Elm327Error as exc:
+    except (AdapterError, Elm327Error) as exc:
         err_console.print(f"[red]{exc}[/red]")
         sys.exit(2)
     finally:
@@ -1343,7 +1044,7 @@ def cmd_capture(args: argparse.Namespace) -> None:
                 snapshot["modules"].append(module)
                 if store:
                     store.add_module(session, vin, bus, module)
-    except Elm327Error as exc:
+    except (AdapterError, Elm327Error) as exc:
         err_console.print(f"[red]{exc}[/red]")
         sys.exit(2)
     finally:
@@ -1353,7 +1054,7 @@ def cmd_capture(args: argparse.Namespace) -> None:
     if vin and store:
         store.upsert_vehicle(vin)
         args.discovered_vin = vin
-    snapshot["vin"] = vin
+    snapshot["vin"] = vin or args.vin
 
     if args.json:
         jdump(snapshot)
@@ -1454,6 +1155,105 @@ def cmd_tui(args: argparse.Namespace) -> None:
     run()
 
 
+def cmd_vehicles(args: argparse.Namespace) -> None:
+    """List vehicles we have records for."""
+    store = _open_store(args)
+    if not store.available:
+        err_console.print("[yellow]No local database found.[/yellow]")
+        sys.exit(1)
+    vehicles = store.vehicles()
+    if args.json:
+        jdump({"vehicles": vehicles})
+        store.close()
+        return
+    if not vehicles:
+        console.print("[yellow]No vehicles recorded yet.[/yellow]")
+        store.close()
+        return
+    columns = ("vin", "make", "model", "year", "profile_id", "powertrain", "last_seen")
+    table = Table(title="Vehicles")
+    for column in columns:
+        table.add_column(column)
+    for vehicle in vehicles:
+        table.add_row(*(str(vehicle.get(column) or "") for column in columns))
+    console.print(table)
+    console.print(f"[dim]Database: {store.db_file}[/dim]")
+    store.close()
+
+
+def cmd_monitor(args: argparse.Namespace) -> None:
+    """Poll UDS DIDs on one or many modules and store each sample."""
+    if args.end < args.start:
+        err_console.print("[red]--end must be >= --start.[/red]")
+        sys.exit(2)
+    wait = max(0.25, args.timeout_ms / 1000 + 0.15)
+    dids = [did for group in args.dids for did in group]
+    store = _store(args)
+    session = _session(args)
+    elm = open_elm(args)
+    previous = current_protocol(elm)
+    try:
+        configure_bus(elm, args.bus, args.timeout_ms)
+        if args.module is not None:
+            modules = ["%03X" % args.module]
+        else:
+            modules = [t["request_id"] for t in _probe_ids(elm, args.start, args.end, "1003", wait)]
+        diag(args).print(
+            f"[dim]Monitoring {len(modules)} module(s) x {len(dids)} DID(s) every {args.interval}s — Ctrl-C to stop.[/dim]"
+        )
+        expects = {}
+        for rid in modules:
+            elm.cmd("ATSH " + rid)
+            expects[rid] = _enter_session(elm, rid, wait)
+        while True:
+            stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+            rows = []
+            for rid in modules:
+                elm.cmd("ATSH " + rid)
+                for did in dids:
+                    record = _read_did(elm, did, wait, expect_header=expects.get(rid))
+                    value = record.get("hex")
+                    number = None
+                    if value and len(value) <= 4:
+                        try:
+                            number = int(value, 16)
+                        except ValueError:
+                            number = None
+                    rows.append(
+                        {
+                            "module": rid, "did": record["did"], "name": record.get("name"),
+                            "status": record["status"], "hex": value,
+                            "ascii": record.get("ascii"), "num": number,
+                        }
+                    )
+                    if store:
+                        store.add_sample(
+                            session, _vin(args), args.bus, rid, record["did"], record.get("name"),
+                            number, record.get("ascii") or value, None, record["status"], record.get("raw"),
+                        )
+            if args.json:
+                print(json.dumps({"timestamp": stamp, "values": rows}, default=to_jsonable), flush=True)
+            else:
+                table = Table(title="Live UDS data")
+                for column in ("Module", "DID", "Name", "Hex", "ASCII"):
+                    table.add_column(column)
+                for row in rows:
+                    shown = row["hex"] or (row["status"] if row["status"] != "ok" else "")
+                    table.add_row(row["module"], row["did"], row["name"] or "", shown, row["ascii"] or "")
+                console.print(table)
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        diag(args).print("[dim]Stopped.[/dim]")
+    except (AdapterError, Elm327Error) as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        sys.exit(2)
+    finally:
+        restore_protocol(elm, previous)
+        elm.close()
+    if store:
+        console.print(f"[dim]Saved samples to {store.db_file}[/dim]")
+
+
 # --------------------------------------------------------------------------- #
 # argparse plumbing
 # --------------------------------------------------------------------------- #
@@ -1523,6 +1323,7 @@ def build_parser() -> argparse.ArgumentParser:
                            help="also read VIN/part number (22F190 / 22F187)")
     p_modules.add_argument("--timeout-ms", type=_timeout_ms, default=100,
                            help="per-request timeout in ms (STPTO, default 100)")
+    p_modules.add_argument("--vin", help="attach stored data to this VIN")
     p_modules.set_defaults(func=cmd_modules)
 
     p_dtc_all = sub.add_parser("dtc-all", help="read DTCs from every responding module (UDS 0x19)")
@@ -1533,6 +1334,7 @@ def build_parser() -> argparse.ArgumentParser:
                            help="query one request ID (e.g. 7E0) instead of scanning")
     p_dtc_all.add_argument("--timeout-ms", type=_timeout_ms, default=100,
                            help="per-request timeout in ms (STPTO, default 100)")
+    p_dtc_all.add_argument("--vin", help="attach stored data to this VIN")
     p_dtc_all.set_defaults(func=cmd_dtc_all)
 
     p_read_did = sub.add_parser("read-did", help="read Data Identifiers (UDS 0x22) from a module")
@@ -1541,6 +1343,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_read_did.add_argument("--bus", choices=["can-c", "can-ihs"], default="can-c")
     p_read_did.add_argument("--timeout-ms", type=_timeout_ms, default=100,
                             help="per-request timeout in ms (STPTO, default 100)")
+    p_read_did.add_argument("--vin", help="attach stored data to this VIN")
     p_read_did.set_defaults(func=cmd_read_did)
 
     p_module_info = sub.add_parser(
@@ -1553,6 +1356,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_module_info.add_argument("--end", type=_can_id, default=0x7FF, help="last request ID, hex")
     p_module_info.add_argument("--timeout-ms", type=_timeout_ms, default=100,
                                help="per-request timeout in ms (STPTO, default 100)")
+    p_module_info.add_argument("--vin", help="attach stored data to this VIN")
     p_module_info.set_defaults(func=cmd_module_info)
 
     p_capture = sub.add_parser("capture", help="full snapshot: modules + DTCs + ID block, stored")
@@ -1561,6 +1365,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_capture.add_argument("--end", type=_can_id, default=0x7FF, help="last request ID, hex")
     p_capture.add_argument("--timeout-ms", type=_timeout_ms, default=100,
                            help="per-request timeout in ms (STPTO, default 100)")
+    p_capture.add_argument("--vin", help="attach stored data to this VIN")
     p_capture.set_defaults(func=cmd_capture)
 
     p_history = sub.add_parser("history", help="show stored vehicles and sessions")
@@ -1572,6 +1377,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_show.set_defaults(func=cmd_show)
 
     sub.add_parser("tui", help="launch the interactive Textual UI").set_defaults(func=cmd_tui)
+
+    p_vehicles = sub.add_parser("vehicles", help="list vehicles with stored records")
+    p_vehicles.set_defaults(func=cmd_vehicles)
+
+    p_monitor = sub.add_parser("monitor", help="poll UDS DIDs on modules and store samples")
+    p_monitor.add_argument("--module", type=_can_id, default=None, help="one request ID; omit to scan")
+    p_monitor.add_argument("--bus", choices=["can-c", "can-ihs"], default="can-c")
+    p_monitor.add_argument("--start", type=_can_id, default=0x700, help="first request ID, hex")
+    p_monitor.add_argument("--end", type=_can_id, default=0x7FF, help="last request ID, hex")
+    p_monitor.add_argument("--did", dest="dids", type=_did, nargs="+", action="append", required=True,
+                           help="DID(s) to poll (repeatable), e.g. --did F190 F187")
+    p_monitor.add_argument("--interval", type=float, default=1.0, help="seconds between polls")
+    p_monitor.add_argument("--timeout-ms", type=_timeout_ms, default=100,
+                           help="per-request timeout in ms (STPTO, default 100)")
+    p_monitor.add_argument("--vin", help="attach stored samples to this VIN")
+    p_monitor.set_defaults(func=cmd_monitor)
 
     # Allow --json after the subcommand too, without clobbering the global value.
     for sp in sub.choices.values():
@@ -1597,7 +1418,7 @@ def main(argv: list[str] | None = None) -> None:
             )
             store = None
     args.store = store
-    args.discovered_vin = None
+    args.discovered_vin = getattr(args, "vin", None)  # user-supplied VIN, if any
 
     payload = {
         key: value
@@ -1626,8 +1447,22 @@ def main(argv: list[str] | None = None) -> None:
         raise
     finally:
         if store is not None:
+            vin = getattr(args, "discovered_vin", None)
+            if vin:
+                try:
+                    from pacifica_obd.profiles import resolve, year_from_vin
+
+                    year = year_from_vin(vin)
+                    profile = resolve(year=year)
+                    store.upsert_vehicle(
+                        vin, make=profile.make, model=profile.model, year=year,
+                        profile_id=profile.id,
+                        powertrain=None if profile.powertrain == "any" else profile.powertrain,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
             try:
-                store.finish_session(session_id, status, getattr(args, "discovered_vin", None))
+                store.finish_session(session_id, status, vin)
             except Exception:  # noqa: BLE001
                 pass
             try:
