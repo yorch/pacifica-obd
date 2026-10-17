@@ -1285,7 +1285,7 @@ def cmd_monitor(args: argparse.Namespace) -> None:
         if args.module is not None:
             modules = ["%03X" % args.module]
         else:
-            modules = [t["request_id"] for t in _probe_ids(elm, args.start, args.end, "1003", wait)]
+            modules = [t["request_id"] for t in _probe_ids_multi(elm, args.start, args.end, ("1003", "22F190"), wait)]
         if not modules:
             err_console.print("[yellow]No modules responded.[/yellow]")
             sys.exit(1)
