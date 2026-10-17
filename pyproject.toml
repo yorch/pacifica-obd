@@ -1,0 +1,20 @@
+[project]
+name = "pacifica-obd"
+version = "0.1.0"
+description = "OBD-II diagnostics toolkit for the 2021 Chrysler Pacifica (vLinker FS + python-OBD)"
+readme = "README.md"
+authors = [
+    { name = "Jorge Barnaby", email = "jorge.barnaby@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "obd>=0.7.3",
+    "rich>=15.0.0",
+]
+
+[project.scripts]
+pacifica-obd = "pacifica_obd:main"
+
+[build-system]
+requires = ["uv_build>=0.13.1,<0.14.0"]
+build-backend = "uv_build"
