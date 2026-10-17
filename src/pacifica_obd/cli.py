@@ -1444,6 +1444,16 @@ def cmd_show(args: argparse.Namespace) -> None:
     store.close()
 
 
+def cmd_tui(args: argparse.Namespace) -> None:
+    """Launch the interactive Textual UI."""
+    try:
+        from pacifica_obd.tui import run
+    except ImportError as exc:  # pragma: no cover - depends on optional build
+        err_console.print(f"[red]Interactive UI not available: {exc}[/red]")
+        sys.exit(1)
+    run()
+
+
 # --------------------------------------------------------------------------- #
 # argparse plumbing
 # --------------------------------------------------------------------------- #
@@ -1560,6 +1570,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_show = sub.add_parser("show", help="show everything stored for a VIN")
     p_show.add_argument("--vin", required=True, help="vehicle identification number")
     p_show.set_defaults(func=cmd_show)
+
+    sub.add_parser("tui", help="launch the interactive Textual UI").set_defaults(func=cmd_tui)
 
     # Allow --json after the subcommand too, without clobbering the global value.
     for sp in sub.choices.values():
