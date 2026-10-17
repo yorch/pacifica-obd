@@ -33,6 +33,7 @@ from rich.live import Live
 from rich.table import Table
 
 from pacifica_obd.elm import Elm327, Elm327Error
+from pacifica_obd.store import Store, logging_enabled
 
 console = Console()
 err_console = Console(stderr=True)
@@ -81,6 +82,24 @@ def diag(args: argparse.Namespace):
 def cmd_text(cmd) -> str:
     code = cmd.command
     return code.decode() if isinstance(code, (bytes, bytearray)) else str(code)
+
+
+def _store(args: argparse.Namespace) -> Store | None:
+    return getattr(args, "store", None)
+
+
+def _session(args: argparse.Namespace):
+    return getattr(args, "session_id", None)
+
+
+def _vin(args: argparse.Namespace):
+    """VIN discovered during this run (NOT the --vin argument)."""
+    return getattr(args, "discovered_vin", None)
+
+
+def _open_store(args: argparse.Namespace) -> Store:
+    """Read-only store for history/show; never creates files."""
+    return Store(db_file=getattr(args, "db", None) or None, readonly=True)
 
 
 def _codes(conn, cmd) -> list[dict]:
@@ -293,6 +312,9 @@ def cmd_vin(args: argparse.Namespace) -> None:
     conn = connect(args)
     resp = conn.query(obd.commands.VIN)
     vin = None if resp.is_null() else resp.value
+    if vin and _store(args):
+        _store(args).upsert_vehicle(vin)
+        args.discovered_vin = vin
     if args.json:
         jdump({"vin": vin})
     elif vin is None:
@@ -623,6 +645,12 @@ def cmd_scan(args: argparse.Namespace) -> None:
         "supported_pids": n_pids,
     }
 
+    if _store(args) and data["vin"]:
+        _store(args).upsert_vehicle(data["vin"])
+        args.discovered_vin = data["vin"]
+    if _store(args):
+        _store(args).add_dtcs(_session(args), _vin(args), "obd", "PCM", data["stored_dtcs"], None)
+
     if args.json:
         jdump(data)
         conn.close()
@@ -853,6 +881,10 @@ def cmd_modules(args: argparse.Namespace) -> None:
         restore_protocol(elm, previous)
         elm.close()
 
+    if _store(args):
+        for entry in found:
+            _store(args).add_module(_session(args), _vin(args), args.bus, entry)
+
     if args.json:
         jdump(
             {
@@ -967,30 +999,26 @@ def cmd_dtc_all(args: argparse.Namespace) -> None:
                 elm.cmd("1003", wait=wait)  # enter extended session
                 header, uds = _parse_uds_frame(elm.cmd("1902FF", wait=wait))
                 if header is None:
-                    # keep the module in the report rather than silently dropping it
-                    results.append(
-                        {
-                            "bus": bus,
-                            "request_id": rid,
-                            "response_id": None,
-                            "status": "no_response",
-                            "raw": None,
-                            "dtcs": [],
-                        }
-                    )
-                    continue
-
-                classification = _classify_dtc_response(uds)
-                results.append(
-                    {
-                        "bus": bus,
-                        "request_id": rid,
-                        "response_id": header,
-                        "status": classification,
-                        "raw": uds,
+                    record = {
+                        "bus": bus, "request_id": rid, "response_id": None,
+                        "status": "no_response", "raw": None, "dtcs": [],
+                    }
+                else:
+                    classification = _classify_dtc_response(uds)
+                    record = {
+                        "bus": bus, "request_id": rid, "response_id": header,
+                        "status": classification, "raw": uds,
                         "dtcs": _parse_dtcs(uds) if classification == "ok" else [],
                     }
-                )
+                results.append(record)  # keep every target in the report
+                if _store(args):
+                    _store(args).add_dtcs(
+                        _session(args), _vin(args), bus, rid, record["dtcs"], record["raw"]
+                    )
+                    _store(args).event(
+                        _session(args), "dtc-read", rid,
+                        {"status": record["status"], "count": len(record["dtcs"])},
+                    )
     except Elm327Error as exc:
         err_console.print(f"[red]{exc}[/red]")
         sys.exit(2)
@@ -1145,6 +1173,12 @@ def cmd_read_did(args: argparse.Namespace) -> None:
             record["module"] = rid
             record["bus"] = args.bus
             results.append(record)
+            if _store(args):
+                _store(args).add_reading(
+                    _session(args), _vin(args), args.bus, rid, record["did"],
+                    record.get("name"), record.get("hex"), record.get("ascii"),
+                    record["status"], record.get("raw"), category="did",
+                )
     except Elm327Error as exc:
         err_console.print(f"[red]{exc}[/red]")
         sys.exit(2)
@@ -1194,6 +1228,12 @@ def cmd_module_info(args: argparse.Namespace) -> None:
                     record["module"] = rid
                     record["bus"] = bus
                     results.append(record)
+                    if _store(args):
+                        _store(args).add_reading(
+                            _session(args), _vin(args), bus, rid, record["did"],
+                            record.get("name"), record.get("hex"), record.get("ascii"),
+                            record["status"], record.get("raw"), category="module-info",
+                        )
     except Elm327Error as exc:
         err_console.print(f"[red]{exc}[/red]")
         sys.exit(2)
@@ -1230,6 +1270,180 @@ def cmd_module_info(args: argparse.Namespace) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# full capture + local history
+# --------------------------------------------------------------------------- #
+def cmd_capture(args: argparse.Namespace) -> None:
+    """Full snapshot: discover modules, read DTCs and the ID block, persist it all."""
+    if args.end < args.start:
+        err_console.print("[red]--end must be >= --start.[/red]")
+        sys.exit(2)
+    wait = max(0.25, args.timeout_ms / 1000 + 0.15)
+    buses = ["can-c", "can-ihs"] if args.bus == "both" else [args.bus]
+    elm = open_elm(args)
+    previous = current_protocol(elm)
+    store = _store(args)
+    session = _session(args)
+    vin = None
+    snapshot: dict = {"vin": None, "buses": buses, "modules": [], "dtcs": [], "readings": []}
+    try:
+        for bus in buses:
+            diag(args).print(f"[dim]Capturing {bus} (STP {_BUS_PROTOCOL[bus]})…[/dim]")
+            configure_bus(elm, bus, args.timeout_ms)
+            for target in _probe_ids(elm, args.start, args.end, "1003", wait):
+                rid = target["request_id"]
+                elm.cmd("ATSH " + rid)
+                expect = _enter_session(elm, rid, wait)
+
+                _, dtc_uds = _parse_uds_frame(elm.cmd("1902FF", wait=wait))
+                dtcs = (
+                    _parse_dtcs(dtc_uds)
+                    if dtc_uds and _classify_dtc_response(dtc_uds) == "ok"
+                    else []
+                )
+                snapshot["dtcs"].append({"bus": bus, "request_id": rid, "dtcs": dtcs, "raw": dtc_uds})
+                if store:
+                    store.add_dtcs(session, vin, bus, rid, dtcs, dtc_uds)
+                    store.event(
+                        session, "dtc-read", rid,
+                        {"status": _classify_dtc_response(dtc_uds) if dtc_uds else "no_response",
+                         "count": len(dtcs)},
+                    )
+
+                module_vin = None
+                part = None
+                for did in _INFO_DIDS:
+                    record = _read_did(elm, did, wait, expect_header=expect)
+                    record["module"] = rid
+                    record["bus"] = bus
+                    snapshot["readings"].append(record)
+                    if did == 0xF190 and record["status"] == "ok" and record.get("ascii"):
+                        module_vin = record["ascii"]
+                        if vin is None:
+                            vin = module_vin
+                            if store:
+                                store.upsert_vehicle(vin)
+                                store.backfill_vin(session, vin)
+                    if did == 0xF187 and record["status"] == "ok":
+                        part = record.get("ascii") or record.get("hex")
+                    if store:
+                        store.add_reading(
+                            session, vin, bus, rid, record["did"], record.get("name"),
+                            record.get("hex"), record.get("ascii"), record["status"],
+                            record.get("raw"), category="module-info",
+                        )
+
+                module = {
+                    "request_id": rid,
+                    "response_id": target.get("response_id"),
+                    "kind": target.get("kind"),
+                    "vin": module_vin,
+                    "part_number": part,
+                }
+                snapshot["modules"].append(module)
+                if store:
+                    store.add_module(session, vin, bus, module)
+    except Elm327Error as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        sys.exit(2)
+    finally:
+        restore_protocol(elm, previous)
+        elm.close()
+
+    if vin and store:
+        store.upsert_vehicle(vin)
+        args.discovered_vin = vin
+    snapshot["vin"] = vin
+
+    if args.json:
+        jdump(snapshot)
+        return
+
+    n_dtcs = sum(len(item["dtcs"]) for item in snapshot["dtcs"])
+    console.print(f"[bold]VIN:[/bold] {vin or '—'}")
+    console.print(
+        f"[bold]Modules:[/bold] {len(snapshot['modules'])}  "
+        f"[bold]DTCs:[/bold] {n_dtcs}  "
+        f"[bold]Readings:[/bold] {len(snapshot['readings'])}"
+    )
+    if store:
+        console.print(f"[dim]Stored to {store.db_file}[/dim]")
+    elif args.no_log:
+        console.print("[dim]Not stored (--no-log).[/dim]")
+
+
+def cmd_history(args: argparse.Namespace) -> None:
+    """List stored vehicles and recent sessions."""
+    store = _open_store(args)
+    if not store.available:
+        err_console.print("[yellow]No local database found.[/yellow]")
+        sys.exit(1)
+    vehicles = store.vehicles()
+    sessions = store.sessions(limit=args.limit)
+    if args.json:
+        jdump({"vehicles": vehicles, "sessions": sessions})
+        store.close()
+        return
+
+    if vehicles:
+        table = Table(title="Vehicles")
+        for column in ("vin", "make", "model", "year", "last_seen"):
+            table.add_column(column)
+        for vehicle in vehicles:
+            table.add_row(
+                vehicle.get("vin") or "", vehicle.get("make") or "", vehicle.get("model") or "",
+                str(vehicle.get("year") or ""), vehicle.get("last_seen") or "",
+            )
+        console.print(table)
+
+    table = Table(title="Recent sessions")
+    for column in ("id", "started_at", "command", "status", "vin"):
+        table.add_column(column)
+    for session in sessions:
+        table.add_row(
+            str(session.get("id")), session.get("started_at") or "",
+            session.get("command") or "", session.get("status") or "", session.get("vin") or "",
+        )
+    console.print(table)
+    console.print(f"[dim]Database: {store.db_file}[/dim]")
+    store.close()
+
+
+def cmd_show(args: argparse.Namespace) -> None:
+    """Show everything stored for a VIN."""
+    store = _open_store(args)
+    summary = store.vehicle_summary(args.vin)
+    if args.json:
+        jdump(summary)
+        store.close()
+        return
+
+    console.print(f"[bold]VIN:[/bold] {summary['vin']}")
+    console.print(f"[dim]{len(summary['modules'])} module rows · {len(summary['dtcs'])} DTC rows · {len(summary['readings'])} readings[/dim]")
+
+    table = Table(title="Stored DTCs")
+    for column in ("ts", "module", "code", "failure_type", "status", "flags"):
+        table.add_column(column)
+    for row in summary["dtcs"]:
+        table.add_row(
+            row.get("ts") or "", row.get("module") or "", row.get("code") or "",
+            row.get("failure_type") or "", row.get("status") or "", row.get("flags") or "",
+        )
+    console.print(table)
+
+    table = Table(title="Stored readings")
+    for column in ("ts", "module", "did", "name", "ascii", "hex", "status"):
+        table.add_column(column)
+    for row in summary["readings"]:
+        table.add_row(
+            row.get("ts") or "", row.get("module") or "", row.get("did") or "",
+            row.get("name") or "", row.get("value_ascii") or "", row.get("value_hex") or "",
+            row.get("status") or "",
+        )
+    console.print(table)
+    store.close()
+
+
+# --------------------------------------------------------------------------- #
 # argparse plumbing
 # --------------------------------------------------------------------------- #
 def build_parser() -> argparse.ArgumentParser:
@@ -1246,6 +1460,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="verify battery voltage during init (leave off when bench-testing)",
     )
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    parser.add_argument("--db", metavar="PATH",
+                        help="SQLite database path (default: XDG data dir)")
+    parser.add_argument("--no-log", action="store_true", help="do not persist this run")
 
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -1327,6 +1544,22 @@ def build_parser() -> argparse.ArgumentParser:
                                help="per-request timeout in ms (STPTO, default 100)")
     p_module_info.set_defaults(func=cmd_module_info)
 
+    p_capture = sub.add_parser("capture", help="full snapshot: modules + DTCs + ID block, stored")
+    p_capture.add_argument("--bus", choices=["can-c", "can-ihs", "both"], default="can-c")
+    p_capture.add_argument("--start", type=_can_id, default=0x700, help="first request ID, hex")
+    p_capture.add_argument("--end", type=_can_id, default=0x7FF, help="last request ID, hex")
+    p_capture.add_argument("--timeout-ms", type=_timeout_ms, default=100,
+                           help="per-request timeout in ms (STPTO, default 100)")
+    p_capture.set_defaults(func=cmd_capture)
+
+    p_history = sub.add_parser("history", help="show stored vehicles and sessions")
+    p_history.add_argument("--limit", type=int, default=25, help="max sessions to list")
+    p_history.set_defaults(func=cmd_history)
+
+    p_show = sub.add_parser("show", help="show everything stored for a VIN")
+    p_show.add_argument("--vin", required=True, help="vehicle identification number")
+    p_show.set_defaults(func=cmd_show)
+
     # Allow --json after the subcommand too, without clobbering the global value.
     for sp in sub.choices.values():
         sp.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
@@ -1337,7 +1570,56 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
-    args.func(args)
+
+    store = None
+    if logging_enabled(flag_disabled=getattr(args, "no_log", False)):
+        try:
+            store = Store(db_file=getattr(args, "db", None) or None)
+        except Exception:  # noqa: BLE001 - never let logging break a command
+            store = None
+        if store is not None and not store.available:
+            diag(args).print(
+                "[yellow]Warning: could not open the log database; continuing without persistence.[/yellow]"
+            )
+            store = None
+    args.store = store
+    args.discovered_vin = None
+
+    payload = {
+        key: value
+        for key, value in vars(args).items()
+        if key not in ("func", "store") and isinstance(value, (str, int, float, bool, list, type(None)))
+    }
+    session_id = None
+    if store is not None:
+        try:
+            session_id = store.start_session(args.command, payload, getattr(args, "port", None))
+        except Exception:  # noqa: BLE001
+            session_id = None
+    args.session_id = session_id
+
+    status = "ok"
+    try:
+        args.func(args)
+    except SystemExit as exc:
+        status = f"exit {exc.code}"
+        raise
+    except KeyboardInterrupt:
+        status = "interrupted"
+        raise
+    except Exception:
+        status = "error"
+        raise
+    finally:
+        if store is not None:
+            try:
+                store.finish_session(session_id, status, getattr(args, "discovered_vin", None))
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                store.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 if __name__ == "__main__":

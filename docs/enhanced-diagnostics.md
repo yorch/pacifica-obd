@@ -130,6 +130,7 @@ Start with A; move to B if multi-frame handling gets painful.
 | **P1** ✅ | `modules` — scan CAN‑C/CAN‑IHS for responders (`10 03`, `22 F190`) | Needs car for data |
 | **P2** ✅ | `dtc-all` — read DTCs (UDS `0x19 02`) from every responder, decode + JSON | Needs car for data |
 | **P3** ✅ | `read-did` (UDS `0x22`) + `module-info` (F186–F191), reply-correlated | Needs car for data |
+| **P4** ✅ | Local persistence (SQLite + JSONL) + `capture`/`history`/`show` | Partly |
 | **P2** | `dtc-all` — read DTCs (0x19 02) from every responding module, JSON | Yes |
 | **P3** | `read-did <module> <did>` + module info (F187–F190) | Yes |
 | **P4** | Live manufacturer PIDs (periodic 0x22) from the database | Yes |

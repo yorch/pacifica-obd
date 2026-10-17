@@ -42,6 +42,9 @@ uv run pacifica-obd dtc-all        # read DTCs from every module on CAN-C
 uv run pacifica-obd dtc-all --bus both --json
 uv run pacifica-obd read-did --module 7E0 F190 F187   # read DIDs from one module
 uv run pacifica-obd module-info --bus both            # identification block per module
+uv run pacifica-obd capture --bus both                # full snapshot, stored locally
+uv run pacifica-obd history                           # stored vehicles + sessions
+uv run pacifica-obd show --vin <VIN>                  # everything stored for a VIN
 ```
 
 Raw/UDS examples:
@@ -107,6 +110,29 @@ docs/
   chrysler-sgw.md          SGW + bypass + tool path
   enhanced-diagnostics.md  AlfaOBD-class plan
 ```
+
+## Local storage
+
+Every run is logged locally — the interaction log plus any vehicle data read —
+so `capture`, DTC reads, module discovery, and DID reads are queryable later.
+
+- **SQLite** (`pacifica.db`): `vehicles`, `sessions`, `events`, `modules`,
+  `dtcs`, `readings`.
+- **JSONL** (`events.jsonl`): append-only log of every interaction.
+- Location: `$PACIFICA_OBD_HOME`, else `$XDG_DATA_HOME/pacifica-obd`, else
+  `~/.local/share/pacifica-obd`. Override the files with `--db PATH`,
+  `PACIFICA_OBD_DB`, `PACIFICA_OBD_LOG`.
+- Disable with `--no-log` or `PACIFICA_OBD_NO_LOG=1`.
+- Persistence never breaks a command: if the database can't be opened, the tool
+  continues without it.
+
+```sh
+uv run pacifica-obd capture --bus both --json   # read + store everything
+uv run pacifica-obd history                     # vehicles + recent sessions
+uv run pacifica-obd show --vin 3C4PDCAB0LT123456
+```
+
+See [`AGENTS.md`](AGENTS.md) for the data model and conventions.
 
 ## python-OBD vs pyobd
 

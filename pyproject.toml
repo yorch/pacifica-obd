@@ -10,6 +10,7 @@ requires-python = ">=3.12"
 dependencies = [
     "obd>=0.7.3",
     "rich>=15.0.0",
+    "textual>=8.2.8",
 ]
 
 [project.scripts]
