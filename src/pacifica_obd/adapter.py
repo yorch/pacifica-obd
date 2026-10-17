@@ -41,9 +41,15 @@ def must_ok(elm, command: str) -> None:
 
 
 def current_protocol(elm):
-    """Snapshot the adapter protocol as ('auto',None) | ('at',n) | ('st',n) | None."""
-    strings = elm.cmd("STPRS")
-    numbers = elm.cmd("STPR")
+    """Snapshot the adapter protocol as ('auto',None) | ('at',n) | ('st',n) | None.
+
+    Never raises: a snapshot failure must not stop a diagnostic command.
+    """
+    try:
+        strings = elm.cmd("STPRS")
+        numbers = elm.cmd("STPR")
+    except Exception:  # noqa: BLE001 - Elm327Error / serial errors
+        return None
     strings_line = (strings[0] if strings else "").upper()
     if "AUTO" in strings_line:
         return ("auto", None)

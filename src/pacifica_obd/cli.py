@@ -42,6 +42,7 @@ from pacifica_obd.adapter import (
     restore_protocol,
 )
 from pacifica_obd.elm import Elm327, Elm327Error
+from pacifica_obd.profiles import looks_like_vin, normalize_vin, year_from_vin
 from pacifica_obd.store import Store, logging_enabled
 from pacifica_obd.uds import (
     BUS_PROTOCOL as _BUS_PROTOCOL,
@@ -220,6 +221,16 @@ def _timeout_ms(text) -> int:
         raise argparse.ArgumentTypeError(f"not an integer: {text!r}")
     if not 1 <= value <= 65535:
         raise argparse.ArgumentTypeError("timeout must be 1..65535 ms")
+    return value
+
+
+def _positive_interval(text) -> float:
+    try:
+        value = float(str(text))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {text!r}")
+    if not (value > 0) or value != value or value in (float("inf"), float("-inf")):
+        raise argparse.ArgumentTypeError("interval must be a finite positive number")
     return value
 
 
@@ -1017,7 +1028,7 @@ def cmd_capture(args: argparse.Namespace) -> None:
                     record["module"] = rid
                     record["bus"] = bus
                     snapshot["readings"].append(record)
-                    if did == 0xF190 and record["status"] == "ok" and record.get("ascii"):
+                    if did == 0xF190 and record["status"] == "ok" and looks_like_vin(record.get("ascii")):
                         module_vin = record["ascii"]
                         if vin is None:
                             vin = module_vin
@@ -1187,7 +1198,7 @@ def cmd_monitor(args: argparse.Namespace) -> None:
         err_console.print("[red]--end must be >= --start.[/red]")
         sys.exit(2)
     wait = max(0.25, args.timeout_ms / 1000 + 0.15)
-    dids = [did for group in args.dids for did in group]
+    dids = list(dict.fromkeys(did for group in args.dids for did in group))
     store = _store(args)
     session = _session(args)
     elm = open_elm(args)
@@ -1198,6 +1209,9 @@ def cmd_monitor(args: argparse.Namespace) -> None:
             modules = ["%03X" % args.module]
         else:
             modules = [t["request_id"] for t in _probe_ids(elm, args.start, args.end, "1003", wait)]
+        if not modules:
+            err_console.print("[yellow]No modules responded.[/yellow]")
+            sys.exit(1)
         diag(args).print(
             f"[dim]Monitoring {len(modules)} module(s) x {len(dids)} DID(s) every {args.interval}s — Ctrl-C to stop.[/dim]"
         )
@@ -1251,7 +1265,7 @@ def cmd_monitor(args: argparse.Namespace) -> None:
         restore_protocol(elm, previous)
         elm.close()
     if store:
-        console.print(f"[dim]Saved samples to {store.db_file}[/dim]")
+        diag(args).print(f"[dim]Saved samples to {store.db_file}[/dim]")
 
 
 # --------------------------------------------------------------------------- #
@@ -1388,7 +1402,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_monitor.add_argument("--end", type=_can_id, default=0x7FF, help="last request ID, hex")
     p_monitor.add_argument("--did", dest="dids", type=_did, nargs="+", action="append", required=True,
                            help="DID(s) to poll (repeatable), e.g. --did F190 F187")
-    p_monitor.add_argument("--interval", type=float, default=1.0, help="seconds between polls")
+    p_monitor.add_argument("--interval", type=_positive_interval, default=1.0, help="seconds between polls")
     p_monitor.add_argument("--timeout-ms", type=_timeout_ms, default=100,
                            help="per-request timeout in ms (STPTO, default 100)")
     p_monitor.add_argument("--vin", help="attach stored samples to this VIN")
@@ -1406,7 +1420,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     store = None
-    read_only_command = args.command in ("history", "show")
+    read_only_command = args.command in ("history", "show", "vehicles")
     if logging_enabled(flag_disabled=getattr(args, "no_log", False)) and not read_only_command:
         try:
             store = Store(db_file=getattr(args, "db", None) or None)
@@ -1418,7 +1432,7 @@ def main(argv: list[str] | None = None) -> None:
             )
             store = None
     args.store = store
-    args.discovered_vin = getattr(args, "vin", None)  # user-supplied VIN, if any
+    args.discovered_vin = normalize_vin(getattr(args, "vin", None))
 
     payload = {
         key: value
@@ -1450,15 +1464,9 @@ def main(argv: list[str] | None = None) -> None:
             vin = getattr(args, "discovered_vin", None)
             if vin:
                 try:
-                    from pacifica_obd.profiles import resolve, year_from_vin
+                    from pacifica_obd.profiles import year_from_vin
 
-                    year = year_from_vin(vin)
-                    profile = resolve(year=year)
-                    store.upsert_vehicle(
-                        vin, make=profile.make, model=profile.model, year=year,
-                        profile_id=profile.id,
-                        powertrain=None if profile.powertrain == "any" else profile.powertrain,
-                    )
+                    store.upsert_vehicle(vin, year=year_from_vin(vin))
                 except Exception:  # noqa: BLE001
                     pass
             try:

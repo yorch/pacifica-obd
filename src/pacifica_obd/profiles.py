@@ -8,9 +8,26 @@ See docs/vehicle-support.md for the full analysis.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 from pacifica_obd.uds import INFO_DIDS
+
+_VIN_RE = re.compile(r"^[A-HJ-NPR-Z0-9]{17}$")
+
+
+def normalize_vin(vin: str | None) -> str | None:
+    """Upper-case/strip a VIN; returns None for empty input."""
+    if not vin:
+        return None
+    return vin.strip().upper() or None
+
+
+def looks_like_vin(text: str | None) -> bool:
+    """True for a plausible 17-char VIN (rejects blanks/all-zeros)."""
+    if not text or not _VIN_RE.match(text.upper()):
+        return False
+    return any(char not in "0" for char in text)
 
 # Module name -> bus, distilled from NHTSA scan reports for Pacifica (RU).
 _COMMON_CAN_C = [
@@ -25,7 +42,7 @@ _COMMON_CAN_IHS = [
 _PHEV_CAN_C = ["BPCM", "OBCM", "AHCP", "HCP", "EAC", "IDCM", "EBBM"]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class VehicleProfile:
     id: str
     make: str

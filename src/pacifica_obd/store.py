@@ -80,12 +80,13 @@ CREATE TABLE IF NOT EXISTS samples (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id INTEGER, ts TEXT, vin TEXT,
     bus        TEXT, module TEXT, did TEXT, name TEXT,
-    value_num  REAL, value_text TEXT, status TEXT, raw TEXT
+    value_num  REAL, value_text TEXT, unit TEXT, status TEXT, raw TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_dtcs_vin     ON dtcs(vin);
-CREATE INDEX IF NOT EXISTS idx_readings_vin ON readings(vin);
-CREATE INDEX IF NOT EXISTS idx_modules_vin  ON modules(vin);
-CREATE INDEX IF NOT EXISTS idx_samples_vin  ON samples(vin);
+CREATE INDEX IF NOT EXISTS idx_dtcs_vin      ON dtcs(vin);
+CREATE INDEX IF NOT EXISTS idx_readings_vin  ON readings(vin);
+CREATE INDEX IF NOT EXISTS idx_modules_vin   ON modules(vin);
+CREATE INDEX IF NOT EXISTS idx_samples_vin   ON samples(vin);
+CREATE INDEX IF NOT EXISTS idx_samples_sess  ON samples(session_id, ts);
 """
 
 
@@ -174,7 +175,7 @@ class Store:
             return self._conn is not None
 
     # -- low level ---------------------------------------------------------
-    def _append_log(self, record: dict) -> None:
+    def _append_log(self, record: dict, mirror: bool = True) -> None:
         record.setdefault("ts", _now())
         try:
             self.log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -182,6 +183,8 @@ class Store:
                 handle.write(json.dumps(record, default=str) + "\n")
         except OSError:
             pass
+        if not mirror:
+            return
         # mirror every event into the SQLite events table
         self._execute(
             "INSERT INTO events (session_id, ts, kind, name, detail) VALUES (?, ?, ?, ?, ?)",
@@ -250,7 +253,7 @@ class Store:
         """Attach a late-discovered VIN to rows recorded earlier in the session."""
         if not session_id or not vin:
             return
-        for table in ("modules", "dtcs", "readings"):
+        for table in ("modules", "dtcs", "readings", "samples"):
             self._execute(
                 "UPDATE %s SET vin = ? WHERE session_id = ? AND vin IS NULL" % table,
                 (vin, session_id),
@@ -328,12 +331,14 @@ class Store:
                    did: str, name: str | None, value_num: float | None, value_text: str | None,
                    unit: str | None = None, status: str = "ok", raw: str | None = None) -> None:
         self._execute(
-            """INSERT INTO samples (session_id, ts, vin, bus, module, did, name, value_num, value_text, status, raw)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (session_id, _now(), vin, bus, module, did, name, value_num, value_text, status, raw),
+            """INSERT INTO samples (session_id, ts, vin, bus, module, did, name, value_num, value_text, unit, status, raw)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (session_id, _now(), vin, bus, module, did, name, value_num, value_text, unit, status, raw),
         )
+        # high-rate samples go to the JSONL log only, not the events table
         self._append_log({"kind": "sample", "session_id": session_id, "module": module, "did": did,
-                          "value": value_num, "text": value_text, "unit": unit, "status": status})
+                          "value": value_num, "text": value_text, "unit": unit, "status": status},
+                         mirror=False)
 
     def sessions(self, limit: int = 50) -> list[dict]:
         return self._query("SELECT * FROM sessions ORDER BY id DESC LIMIT ?", (limit,))
@@ -344,6 +349,7 @@ class Store:
             "dtcs": self._query("SELECT * FROM dtcs WHERE vin = ? ORDER BY ts DESC", (vin,)),
             "modules": self._query("SELECT * FROM modules WHERE vin = ? ORDER BY ts DESC", (vin,)),
             "readings": self._query("SELECT * FROM readings WHERE vin = ? ORDER BY ts DESC", (vin,)),
+            "samples": self._query("SELECT * FROM samples WHERE vin = ? ORDER BY ts DESC", (vin,)),
         }
 
     def close(self) -> None:

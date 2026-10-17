@@ -49,15 +49,21 @@ class Elm327:
     def cmd(self, command: str, wait: float | None = None) -> list[str]:
         """Send one command and return its response lines (prompt stripped)."""
         command = command.strip()
-        self.ser.reset_input_buffer()
-        self.ser.write((command + "\r").encode("ascii"))
-        self.ser.flush()
+        try:
+            self.ser.reset_input_buffer()
+            self.ser.write((command + "\r").encode("ascii"))
+            self.ser.flush()
+        except (serial.SerialException, OSError) as exc:
+            raise Elm327Error(f"serial write failed: {exc}") from exc
 
         deadline = time.monotonic() + (wait if wait is not None else self.timeout)
         buf = bytearray()
         seen_prompt = False
         while time.monotonic() < deadline:
-            chunk = self.ser.read(256)
+            try:
+                chunk = self.ser.read(256)
+            except (serial.SerialException, OSError) as exc:
+                raise Elm327Error(f"serial read failed: {exc}") from exc
             if not chunk:
                 continue
             buf += chunk

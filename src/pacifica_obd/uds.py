@@ -94,13 +94,18 @@ def messages_from_frames(frames: list[bytes]) -> list[str]:
     return messages
 
 
-def parse_uds_frame(lines: list[str]) -> tuple[str | None, str | None]:
+def parse_uds_frame(lines: list[str], prefer_header: str | None = None) -> tuple[str | None, str | None]:
     """Return (response_header, uds_hex), reassembling ISO-TP if needed.
 
     Prefers the last non-responsePending (NRC 0x78) message so a pending
-    acknowledgement does not mask the real answer.
+    acknowledgement does not mask the real answer. When `prefer_header` is
+    given, that responder wins (so a stray frame cannot be mis-attributed).
     """
-    for header, frames in collect_frames(lines):
+    groups = collect_frames(lines)
+    if prefer_header:
+        want = prefer_header.upper()
+        groups = sorted(groups, key=lambda group: group[0] != want)
+    for header, frames in groups:
         messages = messages_from_frames(frames)
         if not messages:
             continue
@@ -245,11 +250,14 @@ DID_STATUS_TEXT = {
 
 
 def enter_session(elm, rid: str | None = None, wait: float = 0.5) -> str | None:
-    """Send 0x10 0x03; return the ECU's response header and filter RX to it."""
+    """Send 0x10 0x03; return the ECU's response header.
+
+    Does NOT set a persistent RX filter: doing so hides every *other* ECU and
+    breaks multi-module scans. Reply correlation is done in the parser via
+    `prefer_header` instead.
+    """
     lines = elm.cmd("1003", wait=wait)
     header, _ = parse_uds_frame(lines)
-    if header:
-        elm.cmd("ATCRA " + header)
     return header
 
 
@@ -257,7 +265,7 @@ def read_did(elm, did: int, wait: float, expect_header: str | None = None) -> di
     """Read one DID (0x22) from the currently addressed module."""
     request = "22%04X" % did
     lines = elm.cmd(request, wait=wait)
-    header, uds = parse_uds_frame(lines)
+    header, uds = parse_uds_frame(lines, prefer_header=expect_header)
     record = {
         "did": "%04X" % did,
         "name": DID_NAMES.get(did),
