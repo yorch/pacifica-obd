@@ -141,7 +141,7 @@ class Store:
             self._conn = None
             return
         try:
-            uri = "file:%s?mode=ro" % self.db_file
+            uri = self.db_file.resolve().as_uri() + "?mode=ro"
             conn = sqlite3.connect(uri, uri=True, check_same_thread=False, timeout=5.0)
             conn.row_factory = sqlite3.Row
             self._conn = conn
@@ -196,6 +196,10 @@ class Store:
             try:
                 return [dict(row) for row in self._conn.execute(sql, params).fetchall()]
             except sqlite3.Error:
+                try:
+                    self._conn.rollback()
+                except sqlite3.Error:
+                    pass
                 return []
 
     # -- sessions ----------------------------------------------------------

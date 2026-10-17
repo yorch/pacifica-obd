@@ -1320,6 +1320,7 @@ def cmd_capture(args: argparse.Namespace) -> None:
                         module_vin = record["ascii"]
                         if vin is None:
                             vin = module_vin
+                            args.discovered_vin = vin  # record even if we stop early
                             if store:
                                 store.upsert_vehicle(vin)
                                 store.backfill_vin(session, vin)
@@ -1572,7 +1573,8 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     store = None
-    if logging_enabled(flag_disabled=getattr(args, "no_log", False)):
+    read_only_command = args.command in ("history", "show")
+    if logging_enabled(flag_disabled=getattr(args, "no_log", False)) and not read_only_command:
         try:
             store = Store(db_file=getattr(args, "db", None) or None)
         except Exception:  # noqa: BLE001 - never let logging break a command
