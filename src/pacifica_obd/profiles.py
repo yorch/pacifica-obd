@@ -86,6 +86,16 @@ def response_id(request_id: int) -> int:
     return request_id - 0x280
 
 
+# Hybrid-only request IDs (HCP, BPCM). If one answers, it is a PHEV.
+PHEV_HINT_REQUEST_IDS = frozenset({0x7E2, 0x7E7})
+
+
+def detect_powertrain(request_ids) -> str | None:
+    """Best-effort powertrain from responding module IDs: 'phev' or None."""
+    ids = {int(r, 16) if isinstance(r, str) else int(r) for r in request_ids}
+    return "phev" if ids & PHEV_HINT_REQUEST_IDS else None
+
+
 @dataclass(frozen=True, eq=False)
 class VehicleProfile:
     id: str

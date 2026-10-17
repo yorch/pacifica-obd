@@ -79,6 +79,9 @@ docs/
   captured by discovery (`modules`/`probe_ids`) rather than deriving `+8`.
 - Per-module request/response IDs and DID maps for many modules are still
   unknown; see `docs/vehicle-support.md` §9.
+- **Powertrain detection:** if a hybrid-only module answers (HCP `0x7E2` or
+  BPCM `0x7E7`), it is a Pacifica **PHEV** — `profiles.detect_powertrain()`
+  uses this because the VIN cannot tell gas from hybrid.
 
 ## Persistence
 

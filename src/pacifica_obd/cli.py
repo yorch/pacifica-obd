@@ -44,7 +44,9 @@ from pacifica_obd.adapter import (
 from pacifica_obd.elm import Elm327, Elm327Error
 from pacifica_obd.database import AlfaDatabase
 from pacifica_obd.profiles import (
+    DEFAULT_PROFILE,
     addresses as module_addresses,
+    detect_powertrain,
     looks_like_vin,
     normalize_vin,
     resolve as resolve_profile,
@@ -766,6 +768,7 @@ def cmd_modules(args: argparse.Namespace) -> None:
     finally:
         elm.close()
 
+    args.discovered_powertrain = detect_powertrain({entry["request_id"] for entry in found})
     if _store(args):
         for entry in found:
             _store(args).add_module(_session(args), _vin(args), args.bus, entry)
@@ -1096,8 +1099,9 @@ def cmd_capture(args: argparse.Namespace) -> None:
         elm.close()
 
     if vin and store:
-        store.upsert_vehicle(vin)
+        store.upsert_vehicle(vin, powertrain=detect_powertrain({m["request_id"] for m in snapshot["modules"]}))
         args.discovered_vin = vin
+    args.discovered_powertrain = detect_powertrain({m["request_id"] for m in snapshot["modules"]})
     snapshot["vin"] = vin
 
     if args.json:
@@ -1929,6 +1933,7 @@ def main(argv: list[str] | None = None) -> None:
             store = None
     args.store = store
     args.discovered_vin = normalize_vin(getattr(args, "vin", None))
+    args.discovered_powertrain = None
 
     payload = {
         key: value
@@ -1960,9 +1965,10 @@ def main(argv: list[str] | None = None) -> None:
             vin = getattr(args, "discovered_vin", None)
             if vin:
                 try:
-                    from pacifica_obd.profiles import year_from_vin
-
-                    store.upsert_vehicle(vin, year=year_from_vin(vin))
+                    store.upsert_vehicle(
+                        vin, year=year_from_vin(vin),
+                        powertrain=getattr(args, "discovered_powertrain", None),
+                    )
                 except Exception:  # noqa: BLE001
                     pass
             try:
