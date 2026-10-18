@@ -146,7 +146,8 @@ Small, focused commits with a descriptive subject and a body explaining *why*
   confirmation path.
 - Treat the SGW and any module write as high-risk; prefer read-only operations.
 - Do not commit secrets, VINs, or captured vehicle data. Real captures live in
-  the local data dir (`~/.local/share/pacifica-obd/`) and any assessment or
-  dump belongs in the **separate private project** `~/code/pacifica-vehicle/`.
+  the tool's local data dir (`~/.local/share/pacifica-obd/`, overridable with
+  `PACIFICA_OBD_HOME`/`PACIFICA_OBD_DB`), and any assessment or dump belongs in
+  a **separate private project outside this repo** (the operator chooses where).
   This repo must never contain a real VIN, DTC list, or scan of a specific car;
   `.gitignore` blocks `docs/vehicle-*.md` and `*.vehicle.json` as a backstop.

@@ -29,20 +29,20 @@ schema proposal in [§8.2](#82-profilespy-real-addresses-plus-a-rule-engine).
 | **[inferred]** | Follows logico-mechanically from an observation (e.g. a numeric column correlates perfectly with a known bus split) but is not stated anywhere. |
 | **[unknown]** | Not established. Listed in [§10](#10-open-unknowns); must be settled on a car. |
 
-Source material (read-only, never modified) is a separate worktree:
-`/Users/yorch/temp/alfa-obd`, a RE of **AlfaOBD v2.4.2** (Windows exe + Android
-APK). All database paths below are relative to that tree.
+Source material (read-only, never modified) is a separate worktree — set
+`ALFAOBD_RE` to its root on your machine, e.g. an RE of **AlfaOBD v2.4.2**
+(Windows exe + Android APK). All database paths below are relative to that tree.
 
 ```sh
 # The decrypted DB used throughout this document.
-DB=/Users/yorch/temp/alfa-obd/scratchpad/db/alfaobd_plain.db
+DB=$ALFAOBD_RE/scratchpad/db/alfaobd_plain.db
 # A fully layer-2-decoded copy (same schema, obfuscated text columns resolved).
-DB2=/Users/yorch/temp/alfa-obd/scratchpad/db/alfaobd_decoded.db
+DB2=$ALFAOBD_RE/scratchpad/db/alfaobd_decoded.db
 ```
 
 Every query in this document is **read-only**. `sqlite3` opens the plain copy;
 do not point anything writable at the original
-`/Users/yorch/temp/alfa-obd/app-win/AlfaOBD_PC/alfaobd.db`.
+`$ALFAOBD_RE/app-win/AlfaOBD_PC/alfaobd.db`.
 
 ---
 
@@ -163,7 +163,7 @@ Function_ID: 7
 The brand columns carry **comma-delimited model-code lists**. The model-code
 table is recoverable from the Android build:
 
-**[observed]** `/Users/yorch/temp/alfa-obd/analysis/jadx_out/sources/com/AlfaOBD/AlfaOBD/j8.java`
+**[observed]** `$ALFAOBD_RE/analysis/jadx_out/sources/com/AlfaOBD/AlfaOBD/j8.java`
 line 15 (`f4827c`) is the FCA vehicle-line table:
 
 ```
@@ -352,7 +352,7 @@ medium-speed — see [§4.4](#44-inittype-7-vs-9-correlates-with-can-c-vs-can-ih
 ### 3.4 Runnable extraction query
 
 ```sh
-DB=/Users/yorch/temp/alfa-obd/scratchpad/db/alfaobd_plain.db
+DB=$ALFAOBD_RE/scratchpad/db/alfaobd_plain.db
 
 # Pacifica-family (PowerNet) module map with the response rule made explicit.
 # NB: use GLOB, not LIKE '%[_]PN' — in SQLite LIKE has no bracket classes,
@@ -658,12 +658,12 @@ layer-2-obfuscated ones; use `alfaobd_decoded.db` (or decrypt with
 
 ### 6.1 The algorithms are shipped, named, and countable
 
-**[observed]** `/Users/yorch/temp/alfa-obd/scratchpad/named/AlfaOBDKeys.cs`
+**[observed]** `$ALFAOBD_RE/scratchpad/named/AlfaOBDKeys.cs`
 (11,291 lines; identical to `scratchpad/dec/ad.cs`, only identifiers renamed)
 contains **833 `CalculateKey*` functions**, **388 of them tagged `_PN`**:
 
 ```sh
-cd /Users/yorch/temp/alfa-obd
+cd $ALFAOBD_RE
 grep -o "CalculateKey[A-Za-z0-9_]*" scratchpad/named/AlfaOBDKeys.cs | sort -u | wc -l   # 833
 grep -o "CalculateKey.*_PN_[A-Za-z0-9_]*" scratchpad/named/AlfaOBDKeys.cs | sort -u | wc -l  # 388
 ```
@@ -1156,9 +1156,9 @@ identity/address (§3.3), whether a third "Hybrid LAN" bus exists
 
 **Database** (read-only, never modified):
 
-- `/Users/yorch/temp/alfa-obd/app-win/AlfaOBD_PC/alfaobd.db` — shipped, encrypted
-- `/Users/yorch/temp/alfa-obd/scratchpad/db/alfaobd_plain.db` — RC4-decrypted (used above)
-- `/Users/yorch/temp/alfa-obd/scratchpad/db/alfaobd_decoded.db` — + layer-2 3DES decoded
+- `$ALFAOBD_RE/app-win/AlfaOBD_PC/alfaobd.db` — shipped, encrypted
+- `$ALFAOBD_RE/scratchpad/db/alfaobd_plain.db` — RC4-decrypted (used above)
+- `$ALFAOBD_RE/scratchpad/db/alfaobd_decoded.db` — + layer-2 3DES decoded
 - Decode tooling: `tools/decrypt_db.py`, `tools/decrypt_layer2.py`, `tools/decstrings.py`
 
 **Source** (decompiled / renamed):
