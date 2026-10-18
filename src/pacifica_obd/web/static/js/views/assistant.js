@@ -7,7 +7,7 @@
 import { h, clear, mount, on } from "../dom.js";
 import { api, post, ApiError } from "../api.js";
 import { postStream } from "../stream.js";
-import { card, pill, banner, errorState, toast, modal, untrustedBadge } from "../components.js";
+import { card, pill, banner, errorState, toast, modal, untrustedBadge, emptyState } from "../components.js";
 
 const SUGGESTED = [
   ["Pre-trip health check", "pretrip"],
@@ -56,6 +56,7 @@ export function render(root, ctx) {
   loadChips();
   renderMeter(null);
   renderNotice();
+  showEmptyTranscript();
 
   // Deterministic deep link for screenshots: ask a question on load.
   const ask = ctx.params?.get("ask");
@@ -69,10 +70,18 @@ export function render(root, ctx) {
     return card({ eyebrow: "Prompt", title: "Message", body: h("div", null,
       input,
       h("div.row.row--between", null,
-        h("label.field.field--check", null, toolsToggle,
+        h("label.field.field--check.field--check--flush", null, toolsToggle,
           h("span", { text: "Use the bounded tool loop (opt-in; read-only tools)" })),
-        h("button.btn", { type: "button", text: "Send", onClick: () => send(input.value, null, toolsToggle.checked) })),
+        h("button.btn.btn--primary", { type: "button", text: "Send", onClick: () => send(input.value, null, toolsToggle.checked) })),
       h("p.sub", { text: "Vehicle data is fenced as untrusted before it reaches any model." })) });
+  }
+
+  function showEmptyTranscript() {
+    if (transcript.children.length) return;
+    mount(transcript, emptyState({
+      icon: "sparkles", title: "No messages yet",
+      hint: "Ask about the codes, a module or your stored sessions — or start from one of the suggestions below. The assistant can read; it cannot write.",
+    }));
   }
 
   async function loadChips() {
@@ -122,6 +131,8 @@ export function render(root, ctx) {
 
   function send(text, task, tools = false) {
     if (stream) { toast("A turn is already running", "warn"); return; }
+    // Only the placeholder is cleared: a running conversation accumulates.
+    if (transcript.querySelector(".empty")) clear(transcript);
     if (text) bubble("user").textContent = text;
     const assistant = bubble("assistant");
     state.assistant = assistant;
@@ -162,10 +173,10 @@ export function render(root, ctx) {
         h("span.mono", { text: data.name }), " ",
         h("span.sub.mono", { text: JSON.stringify(data.args || {}) })));
     } else if (event === "tool_result") {
-      const last = timeline.querySelector(".tool:last-child .tool__result");
+      const host = timeline.querySelector(".tool:last-child");
       const line = h("div.tool__result", null,
         h("span.sub", { text: data.summary || "" }), " ", untrustedBadge());
-      if (last) last.replaceWith(line); else timeline.appendChild(line);
+      (host || timeline).appendChild(line);
     } else if (event === "usage") {
       renderMeter(data);
     } else if (event === "warning") {
@@ -215,6 +226,7 @@ export function render(root, ctx) {
     clear(transcript); clear(timeline); clear(notice);
     conversation = null;
     renderMeter(null);
+    showEmptyTranscript();
   }
 
   function flushNow() {

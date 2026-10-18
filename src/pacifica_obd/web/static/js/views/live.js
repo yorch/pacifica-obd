@@ -82,8 +82,8 @@ export function render(root, ctx) {
   const moduleField = field({ id: "module-id", label: "Module request ID (optional)", placeholder: "7E0", mono: true });
 
   const filterField = field({ id: "filter", label: "Filter values", placeholder: "type to filter…" });
-  const chipsHolder = h("div.chips");
-  const didFreeEntry = h("div.row", { style: { marginTop: "8px" } },
+  const chipsHolder = h("div.chips.chips--picker");
+  const didFreeEntry = h("div.row.row--spaced",
     field({ id: "free-did", label: "Add DID (hex)", placeholder: "F190", mono: true }),
     h("button.btn.btn--sm", { type: "button", text: "Add", onClick: addFreeDid }));
 
@@ -92,6 +92,7 @@ export function render(root, ctx) {
     h("span.recording__time", { id: "rec-time", text: "00:00.0" }),
     h("span.sub", { id: "rec-rate", text: "idle" }),
     h("span.sub", { id: "rec-count", text: "0 samples" }),
+    h("span.spacer"),
     h("button.btn.btn--sm", { type: "button", text: "Bookmark", onClick: bookmark, disabled: true , id: "rec-bookmark" }),
     h("button.btn.btn--sm", { type: "button", text: "Clear", onClick: clearBuffers }),
     h("button.btn.btn--sm", { type: "button", text: "Freeze", onClick: toggleFreeze, id: "rec-freeze" }),
@@ -119,16 +120,15 @@ export function render(root, ctx) {
   const chartWrap = h("div", null, h("div.legend"), h("div.chart-holder", { id: "chart-holder" }));
 
   const controls = card({ eyebrow: "Configuration", title: "Signals", body: h("div", null,
-    h("div.row", null, sourceSelect, displaySelect, busSelect, intervalField, storeBox,
-      h("div.field", null, h("label", { text: " " }), startButton)),
+    h("div.row", null, sourceSelect, displaySelect, busSelect, intervalField, storeBox, startButton),
     h("div.row", { id: "ecu-row", hidden: true }, ecuSelect, moduleField),
     filterField, chipsHolder, didFreeEntry) });
 
   const templatesCard = card({ eyebrow: "Presets", title: "Templates & replay",
-    body: h("div", null, templateRow, h("div.row", { style: { marginTop: "10px" } }, replayRow)) });
+    body: h("div", null, templateRow, h("div.row.row--spaced", replayRow)) });
 
   const instrumentsCard = card({ eyebrow: "Live", title: "Instruments",
-    actions: recordBar, body: instruments });
+    body: h("div", null, recordBar, instruments) });
   const chartCard = card({ eyebrow: "Time series", title: "Chart",
     body: h("div", null, chartWrap) });
 
@@ -136,7 +136,7 @@ export function render(root, ctx) {
     h("div", null, h("h1", { text: "Live data" }),
       h("div.sub", { text: "Pick signals, choose an instrument, and record. Achieved rate is shown honestly next to the timer." })));
 
-  mount(root, head, controls, templatesCard, instrumentsCard, chartCard);
+  mount(root, head, controls, instrumentsCard, chartCard, templatesCard);
 
   /* ------------------------------------------------------------- pickers */
 
@@ -185,12 +185,14 @@ export function render(root, ctx) {
     }
     for (const row of rows.slice(0, 80)) {
       const active = selection.includes(row.key);
+      const label = row.label === row.key ? row.key : `${row.label} (${row.key})`;
       chipsHolder.appendChild(h("button.chip", {
         type: "button", "aria-pressed": active ? "true" : "false",
+        title: label,
         onClick: () => toggleSelection(row.key),
       },
         h("span.chip__swatch", { style: { background: seriesColorValue(selection.indexOf(row.key) >= 0 ? selection.indexOf(row.key) : 0) } }),
-        h("span", { text: row.label ? `${row.label} (${row.key})` : row.key }),
+        h("span.chip__label", { text: label }),
         active ? h("span", { text: "✓" }) : null));
     }
   }
@@ -243,7 +245,7 @@ export function render(root, ctx) {
         stale: isStale(def.key), status: lastValues.get(def.key)?.status,
       }))));
     } else if (mode === "bars") {
-      instruments.appendChild(h("div", null, defs.map((def) => gaugeBar({
+      instruments.appendChild(h("div.grid.grid--bars", null, defs.map((def) => gaugeBar({
         label: def.label, ...instrumentValue(def.key), min: def.range.min, max: def.range.max,
         warnAt: def.range.warn, redlineFrom: def.range.redline, stale: isStale(def.key),
       }))));
@@ -251,6 +253,7 @@ export function render(root, ctx) {
       instruments.appendChild(h("div.grid.grid--kpi", null, defs.map((def) => digitalReadout({
         label: def.label, ...instrumentValue(def.key), stale: isStale(def.key),
         status: lastValues.get(def.key)?.status,
+        history: (buffer.get(def.key) || []).slice(-48).map((entry) => entry.value),
       }))));
     } else {
       instruments.appendChild(h("p.sub", { text: "Chart mode — see the chart below." }));
@@ -346,18 +349,24 @@ export function render(root, ctx) {
   }
 
   function updateInstrumentValues() {
-    // Cheap in-place update for gauges/bars/digital.
+    // Cheap in-place update for gauges: the arc eases to the new value and the
+    // digit stays put, so a 10 Hz stream reads as a needle, not a flash.
     const defs = seriesDefs();
-    if (source.display === "gauges") {
-      const nodes = [...instruments.querySelectorAll(".gauge")];
+    if (source.display === "gauges" || source.display === "bars") {
+      const nodes = [...instruments.querySelectorAll(source.display === "gauges" ? ".gauge" : ".bar")];
       defs.forEach((def, index) => {
         const node = nodes[index];
         if (!node) return;
-        replaceWith(node, gaugeRadial({ label: def.label, ...instrumentValue(def.key), min: def.range.min,
+        const next = {
+          label: def.label, ...instrumentValue(def.key), min: def.range.min,
           max: def.range.max, warnAt: def.range.warn, redlineFrom: def.range.redline,
-          size: defs.length <= 4 ? "lg" : "md", stale: isStale(def.key), status: lastValues.get(def.key)?.status }));
+          size: defs.length <= 4 ? "lg" : "md", stale: isStale(def.key),
+          status: lastValues.get(def.key)?.status,
+        };
+        if (node.update) node.update(next);
+        else if (source.display === "gauges") replaceWith(node, gaugeRadial(next));
       });
-    } else if (source.display === "bars" || source.display === "digital") {
+    } else if (source.display === "digital") {
       renderInstruments();
     }
   }
@@ -507,13 +516,17 @@ export function render(root, ctx) {
         byId.set(serie.id, uniqueTimes.map((t) => (lookup.has(t) ? lookup.get(t) : null)));
       }
       // Populate the instruments with the replay's final values so a replay shows
-      // gauges/bars/digital too, not just a chart.
+      // gauges/bars/digital too, not just a chart, and seed the sample buffer so
+      // the digital readouts get their sparklines.
       for (const serie of series) {
         const last = serie.points[serie.points.length - 1];
         meta.set(serie.id, { key: serie.id, label: serie.name || serie.id, unit: serie.unit || "" });
         if (last) lastValues.set(serie.id, { key: serie.id, label: serie.name || serie.id,
           value: last[1], unit: serie.unit || "", status: "ok" });
         lastSeen.set(serie.id, Date.now());
+        buffer.set(serie.id, serie.points.slice(-48).map(([t, value_]) => ({
+          t, value: value_, unit: serie.unit || "", status: "ok",
+        })));
       }
       selection = series.map((serie) => serie.id);
       const chartSeries = series.map((serie, index) => ({

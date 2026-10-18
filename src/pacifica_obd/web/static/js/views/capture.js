@@ -30,9 +30,9 @@ export function render(root, ctx) {
   mount(root, head,
     card({ eyebrow: "Snapshot", title: "Full capture", body: h("div", null,
       h("div.row", null, busField, startField, endField, timeoutField, vinField),
-      h("div.row", { style: { marginTop: "10px" } }, runButton, cancelButton),
-      h("div", { style: { marginTop: "10px" } }, progress),
-      h("div", { style: { marginTop: "10px" } }, feed)) }),
+      h("div.row.row--spaced", runButton, cancelButton),
+      h("div.row--spaced", progress),
+      h("div.row--spaced", feed)) }),
     card({ eyebrow: "Result", title: "Summary", body: resultHolder }));
 
   function log(text, status) {
@@ -100,7 +100,7 @@ export function render(root, ctx) {
     }
     const dtcs = (result.dtcs || []).reduce((sum, item) => sum + (item.dtcs || []).length, 0);
     if (result.aborted) {
-      resultHolder.appendChild(h("div.banner.banner--warn", { style: { marginBottom: "12px" } },
+      resultHolder.appendChild(h("div.banner.banner--warn", { class: "mb-5" },
         h("span", { text: `Partial capture — the adapter stopped mid-run: ${result.aborted}` })));
     }
     resultHolder.appendChild(h("div.row", null,
@@ -110,7 +110,7 @@ export function render(root, ctx) {
       result.vin ? h("span.mono", { text: result.vin }) : null,
       result.powertrain ? pill(result.powertrain, "ok") : null,
       h("span.sub", { text: dateTimeOf(new Date().toISOString()) })));
-    resultHolder.appendChild(h("div.row", { style: { marginTop: "12px" } },
+    resultHolder.appendChild(h("div.row.row--spaced",
       h("a.btn.btn--sm", { href: "#/db?table=dtcs", text: "Open DTCs in the database" }),
       h("a.btn.btn--sm", { href: "#/reports", text: "Build a report" }),
       h("a.btn.btn--sm.btn--ghost", { href: "#/modules", text: "See the module tree" })));

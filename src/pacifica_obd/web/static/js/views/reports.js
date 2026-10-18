@@ -21,7 +21,7 @@ export function render(root, ctx) {
   const udsBox = checkbox({ id: "rep-uds", label: "UDS pass", checked: true });
   const formats = { json: true, xml: true, html: true };
   const formatRow = h("div.row", null, ["json", "xml", "html"].map((fmt) =>
-    h("span.chip", { role: "button", "aria-pressed": "true", onClick: (event) => {
+    h("button.chip", { type: "button", "aria-pressed": "true", onClick: (event) => {
       formats[fmt] = !formats[fmt];
       event.currentTarget.setAttribute("aria-pressed", formats[fmt] ? "true" : "false");
     } }, h("span", { text: fmt }))));
@@ -45,7 +45,7 @@ export function render(root, ctx) {
   mount(root, head,
     card({ eyebrow: "Generate", title: "From the vehicle", body: h("div", null,
       h("div.row", null, busField, startField, endField, timeoutField, genericBox, udsBox),
-      h("div.row", { style: { marginTop: "10px" } }, formatRow, generateButton)) }),
+      h("div.row.row--spaced", formatRow, generateButton)) }),
     card({ eyebrow: "Generate", title: "From a stored session (no adapter)", body: h("div.row", null, sessionField, fromSessionButton) }),
     card({ eyebrow: "This session", title: "Generated reports", flush: true, body: listHolder }),
     card({ eyebrow: "Preview", title: "Review report", body: previewHolder }),

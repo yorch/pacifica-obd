@@ -23,10 +23,13 @@ function feedRow(text, status) {
     status ? pill(status, status) : null);
 }
 
-function verdictPill(verdict) {
-  const cls = verdict === "READY" ? "ok" : verdict === "DO NOT DRIVE" ? "crit" : "warn";
-  const map = { READY: "pill--ok", "DO NOT DRIVE": "pill--crit", ATTENTION: "pill--warn" };
-  return h("span", { class: `pill ${map[verdict]}`, text: verdict });
+function verdictBlock(verdict, reasons) {
+  const kind = verdict === "READY" ? "ok" : verdict === "DO NOT DRIVE" ? "crit" : "warn";
+  return h("div", { class: `verdict verdict--${kind}` },
+    h("div", null,
+      h("div.verdict__word", { text: verdict }),
+      h("div.verdict__meta", { text: `checked ${dateTimeOf(new Date().toISOString())}` }),
+      h("ul", null, reasons.map((reason) => h("li", { text: reason })))));
 }
 
 function computeVerdict(readiness, dtc) {
@@ -85,13 +88,13 @@ export function render(root, ctx) {
       unit: voltage ? voltage.unit : "V", foot: pill(adapter.attached ? "attached" : "not connected",
         adapter.attached ? "ok" : "no_response") }));
     kpis.appendChild(kpi({ label: "Stored DTCs", value: dtc ? dtc.total_dtcs : null,
-      foot: dtc ? (dtc.total_dtcs ? pill("faults present", "negative") : pill("none", "ok")) : h("span.sub", { text: "not read" }) }));
+      foot: dtc ? (dtc.total_dtcs ? pill("faults present", "negative") : h("span.sub", { text: "none" })) : h("span.sub", { text: "not read" }) }));
     kpis.appendChild(kpi({ label: "Modules seen", value: dtc ? (dtc.modules?.length ?? 0) : null,
       foot: h("span.sub", { text: dtc ? `${(dtc.modules || []).filter((m) => m.status === "ok").length} answered ok` : "not scanned" }) }));
     kpis.appendChild(kpi({ label: "Supported PIDs", value: pids ?? null,
       foot: h("a.sub", { href: "#/live", text: "open live data" }) }));
-    kpis.appendChild(kpi({ label: "Powertrain", value: adapter.powertrain || "—",
-      unit: "", foot: h("span.sub", { text: "detected from responding modules" }) }));
+    kpis.appendChild(kpi({ label: "Powertrain", value: adapter.powertrain || null,
+      foot: h("span.sub", { text: adapter.powertrain ? "detected from responding modules" : "not detected" }) }));
   }
 
   function setAdapterBody(status, error) {
@@ -215,9 +218,7 @@ export function render(root, ctx) {
       ]);
       const { verdict, reasons } = computeVerdict(readiness, dtc);
       clear(holder);
-      holder.appendChild(h("div.row", null, verdictPill(verdict),
-        h("span.sub", { text: `checked ${dateTimeOf(new Date().toISOString())}` })));
-      holder.appendChild(h("ul", null, reasons.map((reason) => h("li", { text: reason }))));
+      holder.appendChild(verdictBlock(verdict, reasons));
       if (readiness?.monitors?.length) {
         holder.appendChild(h("div.row", null, readiness.monitors.map((m) =>
           h("span", { class: `chip`, "aria-pressed": m.complete ? "true" : "false" },

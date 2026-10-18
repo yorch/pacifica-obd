@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
+<meta name="description" content="Local OBD-II and UDS diagnostics for one vehicle, read-first and auditable.">
 <title>pacifica-obd · diagnostics</title>
 <link rel="stylesheet" href="/vendor/uplot.min.css">
 <link rel="stylesheet" href="/css/app.css">
@@ -16,29 +17,53 @@
   <nav class="rail" id="rail" aria-label="Sections">
     <div class="rail__brand">
       <span class="rail__mark" aria-hidden="true">PO</span>
-      <span class="rail__title">pacifica-obd<small>read-only</small></span>
+      <span class="rail__title">pacifica-obd<small id="rail-posture">read-only</small></span>
     </div>
     <div class="rail__groups" id="rail-groups"></div>
     <div class="rail__foot">
-      <button class="btn btn--ghost btn--sm" id="theme-toggle" type="button">Theme</button>
+      <div class="seg" id="theme-toggle" role="group" aria-label="Colour theme">
+        <button class="seg__btn" type="button" data-theme-choice="system" aria-pressed="true" aria-label="Use the system theme">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>
+          <span class="rail__label">Auto</span>
+        </button>
+        <button class="seg__btn" type="button" data-theme-choice="light" aria-pressed="false" aria-label="Use the light theme">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg>
+          <span class="rail__label">Light</span>
+        </button>
+        <button class="seg__btn" type="button" data-theme-choice="dark" aria-pressed="false" aria-label="Use the dark theme">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5z"/></svg>
+          <span class="rail__label">Dark</span>
+        </button>
+      </div>
     </div>
   </nav>
 
   <div class="main">
     <header class="topbar">
-      <button class="topbar__menu" id="menu-toggle" type="button" aria-label="Toggle navigation">☰</button>
+      <button class="iconbtn topbar__menu" id="menu-toggle" type="button"
+              aria-label="Toggle navigation" aria-expanded="false" aria-controls="rail">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+      </button>
+      <div class="topbar__title">
+        <span class="eyebrow">pacifica-obd</span>
+        <span class="topbar__where" id="page-title">Dashboard</span>
+      </div>
       <div class="topbar__conn">
         <span class="dot" id="conn-dot" data-state="idle" aria-hidden="true"></span>
-        <span class="mono" id="conn-port">—</span>
+        <span class="mono" id="conn-port">no adapter</span>
         <span class="sep" aria-hidden="true">·</span>
-        <span id="conn-proto">—</span>
+        <span id="conn-proto">not connected</span>
         <span class="sep" aria-hidden="true">·</span>
-        <span class="pill" id="conn-bus">can-c</span>
+        <span class="pill pill--idle" id="conn-bus">can-c</span>
       </div>
       <div class="topbar__actions">
-        <span class="pill pill--idle" id="lock-pill" hidden>adapter busy</span>
-        <button class="btn btn--sm" id="connect-btn" type="button">Connect</button>
-        <button class="btn btn--sm btn--danger" id="stop-btn" type="button" disabled>Stop</button>
+        <span class="posture" id="posture-pill" data-posture="read-only">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l7 3v6c0 4.4-2.9 7.4-7 9-4.1-1.6-7-4.6-7-9V6l7-3z"/><path id="posture-mark" d="M9 12l2 2 4-4"/></svg>
+          <span id="posture-text">read-only</span>
+        </span>
+        <span class="pill pill--warn" id="lock-pill" hidden>adapter busy</span>
+        <button class="btn" id="connect-btn" type="button">Connect</button>
+        <button class="btn btn--danger" id="stop-btn" type="button" disabled>Stop</button>
       </div>
     </header>
 

@@ -1,7 +1,7 @@
 // Help (#/help) — the CLI↔screen map, the protocol glossary and what "no
 // response" means. Fully offline.
 
-import { h } from "../dom.js";
+import { h, clear } from "../dom.js";
 import { card, dataTable } from "../components.js";
 
 const CLI_MAP = [
@@ -46,6 +46,9 @@ const STATES = [
 ];
 
 export function render(root) {
+  // Help builds its page by appending, so it must first drop the router's
+  // loading placeholder.
+  clear(root);
   root.appendChild(h("div.view__head", null,
     h("div", null, h("h1", { text: "Help" }),
       h("div.sub", { text: "Every screen maps to a CLI command; the vocabulary is the CLI's, verbatim." }))));

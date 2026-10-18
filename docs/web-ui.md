@@ -2449,3 +2449,291 @@ Also accepted: audit is best-effort, so the response now reports whether the
 `raw-send` event was stored (`audit.stored`). No parser smuggling, unicode or
 control-character bypass was found beyond the above, and the adapter is only ever
 reached inside a `BusWorker` job.
+
+---
+
+# Appendix: the 2026 visual redesign ("Bench Scope")
+
+This appendix records a full visual-design pass over `src/pacifica_obd/web/static/`
+only. **No behaviour changed**: the hash router, the `VIEWS` map, the
+`dom.js`/`api.js`/`stream.js` contracts, every element id the JS reads, the
+read-only/writes posture logic, the raw-console tiers and the typed-confirm
+semantics are untouched. No Python file was modified. Build-free is preserved:
+vanilla ES modules, one hand-written CSS file, the vendored uPlot, no Node, no
+bundler, no CDN, no web font.
+
+## 1. Direction
+
+The redesign was built with a design review of the existing front end and a
+token/component brief. The direction adopted is **Bench Scope**:
+
+> A diagnostics UI is bench test equipment, not a car-dealer app. Graphite
+> chrome, hairline borders, one phosphor-cyan accent (≈197°) that means *this is
+> live, or this is yours to act on*. A strict status vocabulary lights up only
+> when the vehicle or the adapter actually reports something. Numbers are the
+> hero; anything that touches the wire (CAN ids, DIDs, frames, VIN) is set in
+> mono so it reads as data, not prose. The light theme is a lab printout; the
+> dark theme is the scope at night.
+
+Principles applied, in the order they decide a question:
+
+1. **Dense by default.** 14 px body, 32 px rows, 30 px controls, 16 px card
+   padding. At 1280×800 the live state is visible without scrolling.
+2. **Flat in the flow, lifted only when floating.** Structure comes from 1 px
+   borders and surface steps. Shadows belong to popovers, toasts, drawers and
+   modals only.
+3. **Colour is a signal, not a theme.** Neutral chrome; the accent marks
+   interactive/selected/live; status hues only for real state; series colours only
+   inside plots.
+4. **Colour is never alone.** Every state carries a word or a glyph: pill text, a
+   3 px row rule, a dashed series, an icon.
+5. **Red is earned.** Red appears on writes, unlocks, faults and Stop. The only
+   solid red button in the app is the typed-confirm commit.
+6. **The wire is mono.** Hex, ids, frames and the VIN are mono; measured values
+   are sans with tabular figures so a value never reflows while updating.
+7. **Numbers snap; state moves.** Digits never tween; gauge arcs ease ≤160 ms;
+   overlays enter ≤240 ms. Only "busy" and "recording" pulse.
+8. **Dark is designed, not inverted.** In dark, elevation means a *lighter*
+   surface and borders are lighter than what they enclose.
+9. **Reduced motion is a first-class state.** `prefers-reduced-motion` removes
+   every translate/scale, snaps instruments, and replaces the busy pulse with a
+   static ring so the state stays visible.
+
+## 2. Token set
+
+Every colour, space, radius, shadow, duration and type step is a custom property
+on `:root` (light) and `[data-theme="dark"]` (dark) in `css/app.css`. `print.css`
+re-points the same names, so there is one vocabulary for screen and paper.
+
+**Surfaces and structure**
+
+| Token | Light | Dark |
+|---|---|---|
+| `--canvas` / `--sunken` | `#f2f4f6` / `#eceff2` | `#0b0d10` / `#08090b` |
+| `--panel` / `--panel-soft` / `--raised` | `#ffffff` / `#f8f9fb` / `#ffffff` | `#13161a` / `#101317` / `#1a1e23` |
+| `--border-subtle` / `--border` / `--border-strong` / `--border-input` | `#e8ebee` / `#dde1e6` / `#c6ccd3` / `#878f99` | `#22262c` / `#2c3138` / `#3b414a` / `#5f6873` |
+| `--text` / `--text-2` / `--text-muted` / `--text-disabled` | `#14181d` / `#3d4651` / `#5c6672` / `#9aa2ac` | `#e6e9ed` / `#b2b9c2` / `#8a939d` / `#555d67` |
+| `--fill-hover` / `--fill-active` | 4.5 % / 9 % ink | 4.5 % / 9 % white |
+
+**Accent and status.** Each semantic state is a four-part ramp — `-fg` (text and
+icons), `-bg` (fill), `-line` (border) and `-solid` (dots, bars, arcs, and the one
+commit button) — for `ok`, `warn`, `danger`, `info`, `idle` and `untested`.
+
+| | Light | Dark |
+|---|---|---|
+| `--accent` / `--on-accent` | `#0b6a8c` / `#ffffff` | `#4fbfe6` / `#04161e` |
+| `--accent-soft` / `--accent-line` | `#e3f1f6` / `#9ccbdc` | `#0f2530` / `#1f5670` |
+| `--ok-fg/-bg/-solid` | `#13693f` / `#e6f4ec` / `#177f4c` | `#5bd197` / `#0f251b` / `#2ea86b` |
+| `--warn-fg/-bg/-solid` | `#8a4f00` / `#fcf0da` / `#b86e00` | `#efb352` / `#2a1f0c` / `#d6962a` |
+| `--danger-fg/-bg/-solid` | `#b1251c` / `#fcebe9` / `#c22d22` | `#ff8e83` / `#2d1513` / `#cf3d34` |
+| `--info-fg/-bg/-solid` | `#0b5f80` / `#e4f1f7` / `#0e7ba3` | `#6cc6ec` / `#0e212d` / `#2c9fd0` |
+| `--idle-fg/-bg/-solid` | `#535c67` / `#edf0f3` / `#6f7883` | `#9aa2ac` / `#1b1f25` / `#69727d` |
+
+Every `-fg` is ≥4.5:1 on its own `-bg` and on `--panel`; every `-solid` is
+≥3:1 on `--panel` (non-text marks). `--on-danger` is `#ffffff` on both themes.
+
+**Series.** `--series-1..4` are colour-vision-safe apart; `--series-5..8` are
+*always* drawn dashed (`[6,3]`, `[2,3]`, `[8,3,2,3]`, `[1,3]`) as well as
+coloured, so a chart never depends on hue alone.
+
+**Type, space, radius, depth, motion.** Space is a 13-step scale
+(2/4/6/8/12/16/20/24/32/40/48/64); radius is 2/4/6/8 + pill and never exceeds 8;
+shadows are a four-step ladder (`--shadow-xs…-lg`) used only on floating layers;
+durations are 80/140/200/240 ms with `--ease-out` for enter and `--ease-in` for
+exit. Type is one ramp: display 32, h1 20, h2 15, label 11 (uppercase, the *only*
+uppercase style, plus table headers), body 14, body-sm 13, caption 12, mono 13/12.
+
+## 3. What changed
+
+- **Shell.** 48 px top bar that lines up with the rail's brand row: page title
+  (breadcrumb), a bordered **connection segment** (dot, port, protocol, bus), the
+  read-only / **writes-enabled posture badge** with a shield, and Connect/Stop.
+  The rail is 232 px, collapses to a 60 px icon rail at 1100 px and to an
+  off-canvas sheet below 768 px; the top bar wraps to two rows on a phone.
+- **Icons.** The unicode grab-bag (`▤ ◉ ⌗ 🔒 ✦ …`) is replaced by ~30 inline
+  stroke SVG icons built by `components.icon()` (path-only, `currentColor`, so
+  `dom.js` keeps its whitelist and its no-`innerHTML` guarantee). The emoji in
+  empty states are mapped onto the same set.
+- **Surfaces.** The grey `.card__head` band is gone: a card is a border-only
+  surface (6 px radius, no shadow) with a small eyebrow, a 15 px title, a muted
+  meta line and right-aligned actions. `dataTable()` no longer returns a whole
+  card, so tables stop nesting cards inside cards.
+- **Metrics.** The five KPI tiles are one bordered strip with hairline dividers;
+  a null value reads "Not read" in 13 px muted rather than a 24–32 px em dash.
+- **Instruments.** Gauges gained a real scale (major/minor ticks and min/max
+  labels inside the arc), an amber warn zone and an outside 3 px redline band, a
+  stale treatment (dashed muted arc) and an in-place `.update()` so the arc eases
+  and the digit never reflows; a missing value is a quiet 15 px dash. Bars got a
+  6 px track, a two-up grid and the same `.update()`. The digital readouts now
+  carry a real sparkline of the recent samples (`.update()` seeded from the
+  record buffer, and from a replay). Nothing is rebuilt per sample any more.
+- **Charts.** uPlot is themed from tokens (`--chart-grid`, `--chart-axis`), the
+  y grid is hairline, series 5–8 are dashed, the cursor has a focus band, and the
+  legend is a chip row with `aria-pressed` toggles.
+- **Tables.** 32 px rows, sticky header under the 48 px bar, sortable headers with
+  `aria-sort` and a direction glyph, row severity as a 3 px inset rule (the only
+  stripe left in the app), copy cells, and a themed pager/toolbar.
+- **Status.** The tier badge in the raw console is now a 24 px worded chip with a
+  glyph, inside a tinted tier panel that updates as you type (read = neutral
+  check, confirm = amber triangle, deny = red ban).
+- **Dialogs.** Modal and typed-confirm gained a focus trap, focus restore,
+  `aria-labelledby`, enter/exit motion, and a danger top border. The confirm shows
+  the exact wire bytes in a large mono block with a live "type NNN exactly to arm
+  this button" state; the commit is the only solid red button in the app.
+- **States.** Empty states are left-aligned with a 20 px icon, a title, a hint and
+  one action; route loads use shaped skeletons (with a 300 ms delay so a fast view
+  never flashes); errors split into recoverable (amber + Retry) and fault (red +
+  copyable code + HTTP status); toasts carry an icon and fade out.
+- **Accessibility.** Visible focus rings everywhere (no bare `outline: none`),
+  one control height shared by inputs/selects/buttons/chips/tabs, `accent-color`
+  on checkboxes, `aria-live` regions kept for banners/toasts/streams, per-axis
+  ARIA on meters, and the skip link now focuses `#view` instead of navigating to a
+  non-existent `#view` route.
+- **Theme control.** A three-way segmented control (Auto / Light / Dark) that
+  persists to `localStorage["pacifica-obd.theme"]`. A deep link may pin a theme
+  for the session without persisting it: `#/live?theme=light`.
+
+## 4. Screenshot repro
+
+```sh
+export PACIFICA_OBD_HOME=$(mktemp -d)
+uv run --extra web pacifica-obd web --demo --allow-writes --port 8791 &
+
+CH="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+OUT=/private/var/folders/q7/_th5q3g576330bq4pl0gs1n00000gn/T/opencode/web_shots_design
+shot () { "$CH" --headless=new --disable-gpu --hide-scrollbars \
+  --virtual-time-budget=9000 --window-size="$3" \
+  --screenshot="$OUT/$1.png" "http://127.0.0.1:8791/$2"; }
+
+# 1600x1100 unless noted; the two Live shots are 1600x1600 so the whole plot,
+# its axes and the legend are inside the frame.
+shot dashboard-dark    "#/"                                        1600,1100
+shot modules-dark      "#/modules?auto=1"                          1600,1100
+shot database-dark     "#/db?table=samples"                        1600,1100
+shot security-dark     "#/security?auto=explain"                    1600,1100
+shot raw-deny-dark     "#/raw?command=04"                          1600,1100
+shot assistant-dark    "#/assistant"                               1600,1100
+shot live-chart-dark   "#/live?display=chart&replay=2"              1600,1600
+shot dashboard-light   "#/?theme=light"                            1600,1100
+shot live-light        "#/live?display=chart&replay=2&theme=light"  1600,1600
+```
+
+The nine PNGs live in `web_shots_design/` (`dashboard-dark`, `live-chart-dark`,
+`modules-dark`, `database-dark`, `security-dark`, `raw-deny-dark`,
+`assistant-dark`, `dashboard-light`, `live-light`).
+
+Notes for reproducing: the demo database is seeded on first start, so the replay
+routes (`?replay=2`) have samples without a live adapter. A live SSE stream is
+**not** pumped under `--virtual-time-budget`, which is why the chart shots replay
+a stored session instead of starting a recording — and why the assistant has a
+`?collect=1` non-streaming drain. `?theme=light|dark|system` pins the theme for
+one session without persisting it. Headless Chrome cannot lay out a window
+narrower than ~500 CSS px on macOS (a 414-wide capture is a *crop* of a ~500px
+layout), so the narrow layout was checked at 520×1000 and 820×1000; those two
+captures are in the same directory as `narrow-520.png` / `tablet-820.png`.
+
+## 5. Adversarial and design review of the redesign
+
+An adversarial pass over the changed front end (DOM contracts, XSS sinks,
+contrast, dead CSS, regressions) found and this pass fixed:
+
+1. **Live bars froze** (high). `gaugeBar()` had no `.update()`, but the new
+   in-place instrument update called it, so a recording's bars kept their first
+   value. Fixed: `gaugeBar()` now returns a node with `.update()` that mutates
+   the fill width, the value, the unit and the `role="meter"` ARIA values, and
+   `updateInstrumentValues()` calls it for both gauges and bars.
+2. **Gauges lost their units** (medium). The unit `<text>` was only created when
+   the initial `unit` was non-empty, and a fresh PID picker has no units, so the
+   first sample with `unit: "rpm"` could never show it. Fixed: the unit node
+   always exists and `.update()` fills it.
+3. **The assistant wiped the conversation** (medium). Clearing the transcript to
+   hide the new empty state deleted every previous exchange. Fixed: only the
+   placeholder is cleared.
+4. **Help kept the loading card** (medium). `help.js` builds its page with
+   `appendChild`, so the router's placeholder stayed above it. Fixed with
+   `clear(root)`.
+5. **Hidden theme labels had no accessible name** (medium). The three theme
+   buttons lost their only text below 1100 px. Fixed with `aria-label`s.
+6. **Contrast** (medium). The dark commit-button hover (2.22:1), enabled copy
+   buttons and the feed timestamps (2.58 / 2.45:1), the empty-state icon, the
+   stale gauge label and a toggled-off legend label all used the disabled-text
+   ink with text opacity. Fixed: the commit hover darkens instead of lightening,
+   every one of those uses `--text-muted` (≥5.8:1) and state is carried by the
+   strike-through, the dashed arc and the dimmed swatch instead of by opacity.
+7. **Sticky table headers stopped sticking** (medium) when `--table-max-h`
+   became `none` under 1024 px; the bounded scroller is back (module-detail
+   tables deliberately expand inline instead).
+8. **The drawer declared modality without trapping focus** (medium, also in
+   HEAD). The drawer now shares the modal's `trapFocus()`.
+9. **Report downloads threw** and the module map rendered into a detached node
+   (both pre-existing, left alone — see below).
+10. **Printing dropped every chart** (medium). `.chart-holder` was in the print
+    hide list; it is back, with `break-inside: avoid`.
+11. **Small multiples had no layout.** `smallMultiples()` now tags its container
+    `.small-multiples`, which is a real responsive grid.
+12. **Keyboard access to the report format toggles** (pre-existing) — `span`s
+    with `role="button"` are now real `.chip` buttons.
+
+Verified after the fixes: `gaugeBar().update()` exists and mutates in place, the
+gauge unit node appears on the first sample, the warn zone and redline bands are
+both emitted, all 21 ES modules parse, and every route renders with a clean
+renderer console.
+
+A second pass reviewed the components against the direction and found:
+
+13. **`.update()` merged against the *initial* props** rather than the running
+    state, so a partial update (e.g. `update({ stale: true })`) reset the value to
+    `null` and blanked the instrument. Fixed: both instruments keep a `state`
+    object. A non-finite value can no longer write `stroke-dashoffset="NaN"`.
+14. **The stale treatment drew a full arc**: the stale rule overrode
+    `stroke-dasharray`, so the whole 270° track turned dotted and the gauge looked
+    full-scale. Fixed: stale is a muted stroke, and the number's colour is now set
+    with `fill` (SVG text ignores `color`).
+15. **Round caps made zero look like a reading** and ran past the redline band.
+    The track and value arcs are butt-capped now; the warn zone also gets a 3 px
+    marker on the outer ring so the value arc cannot cover it when the reading
+    lands *in* the zone.
+16. **The confirm dialog showed an error before there was one** (a pink disabled
+    commit button and a red hint). Fixed: the disabled commit is a neutral
+    `--sunken` button, and the arming line is muted when empty, amber/red only
+    once the typed text does not match. A danger dialog now commits to red (its
+    wire block is danger-tinted) instead of mixing amber and red.
+17. **`Enter` sent the command in one keystroke.** It now moves focus to the
+    commit button, so the last act is still deliberate. The acknowledgement ids
+    are unique per dialog, and the live region no longer re-announces on every
+    keystroke.
+18. **`:focus-visible` forced `border-radius`**, which squared off focused pills,
+    chips and legend items. Removed; the outline follows each element's own
+    radius.
+19. **Sorting could not be done from the keyboard.** `dataTable()` now renders a
+    real `<button class="th-sort">` inside every sortable header, sets
+    `aria-sort="none|ascending|descending"` on all of them, and gives a clickable
+    row `role="button"`, `tabindex="0"` and an Enter/Space handler.
+20. **`cursor.focus.prox`** was missing so the uPlot focus band never appeared;
+    the x grid shimmered on a live time axis; and a theme change rebuilt the plot
+    with the *old* resolved series colours. Fixed, and series 5–8 now show their
+    dash in the legend chip itself.
+21. **The dashboard read as a template**: four levels of uppercase tracked
+    micro-labels and 600-weight 24–32 px numerals. Table headers and `h3` are now
+    sentence case, and the hero numerals are 500 weight at −0.02em, which reads
+    as an instrument rather than a marketing tile.
+
+## 6. What was deliberately left alone
+
+- `views/reports.js` calls `rawResponse(...)` in `save()` without importing it
+  (a pre-existing `ReferenceError` caught by its own `try/catch`, so the download
+  degrades to a toast), and `views/modules.js` renders the offline module map into
+  a `mapHolder` that is never mounted, so "Load map" fetches and shows nothing.
+  Both are functional bugs, not design ones, so they were left for the owner
+  rather than smuggled into this pass.
+- The `/settings` AI-key `<input type="password">` is not inside a `<form>`, which
+  makes Chrome log one informational `[DOM] Password field is not contained in a
+  form` message on that route. It is a notice, not an error, and wrapping it in a
+  form would add an implicit submit path.
+- The "vLinker FS" mentions in the adapter empty state are pre-existing shipped
+  strings that the docs and the CLI error text also use; no *new* vendor name was
+  introduced anywhere in the front end.
+- There is no separate HV-battery route in this front end (13 routes, not 15), so
+  there was nothing to restyle there.
+- The pre-existing `?auto=…`, `?replay=…`, `?start=1` deep links and the
+  `?collect=1` screenshot drain are unchanged.

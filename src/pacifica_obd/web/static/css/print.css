@@ -1,43 +1,78 @@
-/* Print stylesheet — "print is a first-class target" (design §2.5 rule 7).
- *
- * White background, black text, no chrome, pills become bracketed text, and the
- * data tables/lists keep their rows together so a report prints cleanly on one
- * page. Loaded with media="print" from index.html.
+/* Print stylesheet — "print is a first-class target": white paper, black ink, no
+ * chrome, pills become bracketed text, and tables/lists keep their rows
+ * together so a report prints cleanly. Loaded with media="print" from
+ * index.html; it re-points the same token names the screen theme uses, so there
+ * is exactly one vocabulary of custom properties.
  */
 @media print {
   :root, [data-theme="dark"] {
     color-scheme: light;
-    --bg: #ffffff; --bg-soft: #ffffff; --panel: #ffffff; --panel-soft: #ffffff;
-    --panel-raised: #ffffff;
-    --text: #000000; --text-soft: #1a1a1a; --muted: #444444;
-    --border: #bbbbbb; --border-strong: #888888;
-    --accent: #000000; --accent-ink: #000000; --on-accent: #ffffff;
-    --shadow: none; --shadow-sm: none; --shadow-lg: none;
-    --gauge-track: #dddddd; --gauge-tick: #666666; --gauge-redline: #999999;
+    --canvas: #ffffff; --sunken: #ffffff; --panel: #ffffff;
+    --panel-soft: #ffffff; --raised: #ffffff; --overlay: #ffffff;
+    --text: #000000; --text-2: #1a1a1a;
+    --text-muted: #444444; --text-disabled: #666666;
+    --border-subtle: #dddddd; --border: #bbbbbb; --border-strong: #888888;
+    --border-input: #888888;
+    --accent: #000000; --accent-hover: #000000; --on-accent: #ffffff;
+    --accent-soft: #ffffff; --accent-line: #bbbbbb;
+    --fill-hover: transparent; --fill-active: transparent;
+    --ok-fg: #000000; --ok-bg: #ffffff; --ok-line: #999999;
+    --warn-fg: #000000; --warn-bg: #ffffff; --warn-line: #999999;
+    --danger-fg: #000000; --danger-bg: #ffffff; --danger-line: #999999;
+    --info-fg: #000000; --info-bg: #ffffff; --info-line: #999999;
+    --idle-fg: #000000; --idle-bg: #ffffff; --idle-line: #999999;
+    --untested-fg: #000000; --untested-bg: #ffffff; --untested-line: #999999;
+    --shadow-xs: none; --shadow-sm: none; --shadow: none; --shadow-md: none;
+    --shadow-lg: none; --focus-ring: none;
+    --gauge-track: #dddddd; --gauge-tick: #666666; --gauge-tick-major: #333333;
+    --gauge-value: #000000; --gauge-redline: #999999;
+    --gauge-warn-zone: #eeeeee; --gauge-redline-zone: #dddddd;
+    --chart-grid: #dddddd; --chart-axis: #333333;
   }
-  body { background: #fff; color: #000; font-size: 11pt; }
+  html, body { background: #fff; color: #000; font-size: 11pt; }
   .rail, .topbar, .toasts, .card__actions, .toolbar, .pager, .view__head .btn,
-  .recording, .legend, .skip-link, .cellcopy, .tabs, .drawer-backdrop { display: none !important; }
+  .view__head .row, .recording, .legend, .skip-link, .cellcopy, .tabs,
+  .drawer-backdrop, .modal-backdrop, .progress { display: none !important; }
   .shell { display: block; }
-  .view { padding: 0; max-width: none; }
-  .card { break-inside: avoid; border: 1px solid #ccc; box-shadow: none; margin: 0 0 12pt; }
-  .card__head { background: #fff; border-bottom: 1px solid #ccc; }
-  .kpi { border: 1px solid #ccc; box-shadow: none; }
-  .grid--kpi { display: flex; flex-wrap: wrap; gap: 10pt; }
-  .kpi { flex: 1 1 140pt; }
-  .pill, .untrusted {
+  .view, .view--prose { padding: 0; max-width: none; }
+  .banners { padding: 0 0 10pt; }
+  .card {
+    break-inside: avoid; border: 1px solid #ccc; box-shadow: none;
+    margin: 0 0 12pt; border-radius: 0;
+  }
+  .card__head { background: #fff; border-bottom: 1px solid #ccc; min-height: 0; }
+  .grid--kpi { display: flex; flex-wrap: wrap; gap: 10pt; border: 0; }
+  .kpi { flex: 1 1 140pt; box-shadow: none; border: 1px solid #ccc; padding: 6pt; }
+  .kpi__label, .eyebrow { color: #000; }
+  .pill, .untrusted, .posture, .tiernote {
     background: #fff !important; color: #000 !important; border: 1px solid #999;
     font-weight: 400;
   }
   .pill::before { content: "["; }
   .pill::after { content: "]"; }
+  .pill .icon, .untrusted .icon, .posture .icon, .banner .icon { display: none; }
+  .pill::before, .pill::after { font-weight: 400; }
+  .verdict { border: 1px solid #999; background: #fff; }
+  .verdict__word { color: #000; }
   table.data { font-size: 9.5pt; }
-  table.data thead th { position: static; background: #fff; color: #000; border-bottom: 1pt solid #000; }
-  table.data tbody td { border-bottom: 1px solid #ddd; }
+  table.data thead th {
+    position: static; background: #fff; color: #000; border-bottom: 1pt solid #000;
+  }
+  table.data tbody td { border-bottom: 1px solid #ddd; height: auto; }
   table.data tr { break-inside: avoid; }
+  table.data tr.row--crit td:first-child,
+  table.data tr.row--warn td:first-child,
+  table.data tr.row--ok td:first-child { box-shadow: none; }
   .table-wrap { max-height: none; overflow: visible; }
   .chart { break-inside: avoid; }
+  .chart-holder { break-inside: avoid; }
   a { color: #000; text-decoration: none; }
   a[href]::after { content: ""; }
   .banner { border: 1px solid #999; background: #fff; color: #000; break-inside: avoid; }
+  .feed { max-height: none; border: 1px solid #ccc; background: #fff; }
+  pre.json, pre.code-block, code.code-line, .dialog__wire {
+    background: #fff; border: 1px solid #ccc; color: #000; max-height: none;
+  }
+  .empty { padding: 8pt; }
+  .empty__icon { display: none; }
 }

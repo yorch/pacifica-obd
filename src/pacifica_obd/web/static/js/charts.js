@@ -15,9 +15,15 @@ export function themeToken(name, fallback = "") {
 
 const MAX_POINTS = 4000;
 
+// Series 5-8 sit close together under deuteranopia, so they are always drawn
+// dashed as well as coloured (colour is never the only channel).
+const DASHES = [[6, 3], [2, 3], [8, 3, 2, 3], [1, 3]];
+
 export class TimeSeriesChart {
   constructor(container, { height = 320, yLabel = "" } = {}) {
     this.container = container;
+    // A container that used to hold small multiples must not keep that grid.
+    container.classList?.remove("small-multiples");
     this.height = height;
     this.yLabel = yLabel;
     this.series = [];      // [{key,label,unit,visible}]
@@ -69,8 +75,7 @@ export class TimeSeriesChart {
   }
 
   clear() {
-    this.data = [this.series.map(() => [])].flatMap((x) => x);
-    this.data = [[] , ...this.series.map(() => [])];
+    this.data = [[], ...this.series.map(() => [])];
     if (this.plot) this.plot.setData(this.data);
   }
 
@@ -118,22 +123,28 @@ export class TimeSeriesChart {
 
   ensurePlot() {
     if (this.plot || !this.series.length || typeof window.uPlot !== "function") return;
-    const grid = themeToken("--border", "#e4e7ec");
-    const axis = themeToken("--muted", "#5b6474");
-    const text = themeToken("--text", "#111827");
+    const grid = themeToken("--chart-grid", "#eceef1");
+    const axis = themeToken("--chart-axis", "#5c6672");
+    const border = themeToken("--border", "#dde1e6");
+    const font = themeToken("--font-sans", "sans-serif");
     const self = this;
-    const colours = this.series.map((s) => s.colour);
+    const axisBase = (extra) => ({
+      stroke: axis, font: `11px ${font}`, labelFont: `11px ${font}`,
+      grid: { stroke: grid, width: 1 }, ticks: { stroke: grid, width: 1, size: 6 },
+      border: { stroke: border, width: 1 }, ...extra,
+    });
     const options = {
       width: this.container.clientWidth || 720,
       height: this.height,
-      padding: [12, 12, 0, 0],
+      padding: [14, 10, 0, 0],
       series: [
         { label: "time" },
-        ...this.series.map((serie) => ({
+        ...this.series.map((serie, index) => ({
           label: serie.label,
           stroke: () => self.series.find((s) => s.key === serie.key)?.colour || serie.colour,
           width: 2,
           points: { show: false },
+          dash: index >= 4 ? DASHES[index - 4] : undefined,
           value: (u, value) => (value === null || value === undefined
             ? "—" : `${Math.round(value * 100) / 100}${serie.unit ? " " + serie.unit : ""}`),
         })),
@@ -143,14 +154,14 @@ export class TimeSeriesChart {
         y: { auto: true },
       },
       axes: [
-        { stroke: axis, grid: { stroke: grid, width: 1 }, ticks: { stroke: grid }, font: "12px " + themeToken("--font-sans", "sans-serif") },
-        {
-          stroke: axis, grid: { stroke: grid, width: 1 }, ticks: { stroke: grid },
-          label: this.yLabel, labelSize: 22, labelFont: "12px sans-serif",
-          font: "12px " + themeToken("--font-sans", "sans-serif"),
-        },
+        axisBase({ grid: { stroke: grid, width: 1, show: true } }),
+        axisBase({ label: this.yLabel, labelSize: 20, size: 54 }),
       ],
-      cursor: { show: true, points: { show: true }, drag: { x: true, y: false } },
+      cursor: {
+        show: true, points: { show: true, size: 6, width: 1 },
+        drag: { x: true, y: false, setScale: true },
+      },
+      focus: { alpha: 0.14 },
       legend: { show: false },
       plugins: [self._bookmarkPlugin()],
       hooks: {
@@ -200,12 +211,13 @@ export class TimeSeriesChart {
   }
 }
 
-// Small multiples: one chart per series, used when a selection exceeds 6 signals.
+/* Small multiples: one chart per series, used when a selection exceeds 6 signals. */
 export function smallMultiples(container, series) {
   clear(container);
+  container.classList.add("small-multiples");
   const charts = [];
   for (const serie of series) {
-    const wrap = h("div", null,
+    const wrap = h("div.small-multiple", null,
       h("div.eyebrow", { text: `${serie.label}${serie.unit ? " (" + serie.unit + ")" : ""}` }),
       h("div.legend"), h("div.chart-holder"));
     container.appendChild(wrap);

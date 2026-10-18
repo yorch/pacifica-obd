@@ -43,7 +43,7 @@ export function render(root, ctx) {
   mount(root, head,
     card({ eyebrow: "Target", title: "Module & DIDs", body: h("div", null,
       h("div.row", null, ecuSelect, moduleField, busField, timeoutField),
-      filterField, chips, h("div.row", { style: { marginTop: "8px" } }, freeField,
+      filterField, chips, h("div.row.row--spaced", freeField,
         h("button.btn.btn--sm", { type: "button", text: "Add", onClick: addFree }),
         readButton, infoButton, adaptationsButton),
       h("p.sub", { text: "DIDs are addressed by number. The bundled dataset lists per-ECU data items by name and unit but carries no DID numbers, so free entry is the way to read anything beyond the identification block." })) }),
@@ -137,7 +137,7 @@ export function render(root, ctx) {
     readButton.disabled = true;
     infoButton.disabled = true;
     clear(resultsHolder);
-    resultsHolder.appendChild(h("div", { style: { padding: "16px" } }, h("span.sub", { text: "Reading…" })));
+    resultsHolder.appendChild(h("div", { class: "pad" }, h("span.sub", { text: "Reading…" })));
     try {
       const payload = await api.udsReadDid({
         module: document.getElementById("did-module").value,
@@ -149,7 +149,7 @@ export function render(root, ctx) {
       renderResults();
     } catch (error) {
       clear(resultsHolder);
-      resultsHolder.appendChild(h("div", { style: { padding: "16px" } }, errorState(error, { onRetry: () => read(list) })));
+      resultsHolder.appendChild(h("div", { class: "pad" }, errorState(error, { onRetry: () => read(list) })));
       toast(error.message, "err", 0);
     } finally {
       state.busy = false;
@@ -184,7 +184,7 @@ export function render(root, ctx) {
     }));
     const refused = records.filter((rec) => rec.status !== "ok");
     if (refused.length) {
-      resultsHolder.appendChild(h("div", { style: { padding: "12px 16px" } },
+      resultsHolder.appendChild(h("div.pad",
         h("span.sub", { text: `${refused.length} DID(s) did not return ok — per-DID status is shown verbatim above.` })));
     }
   }

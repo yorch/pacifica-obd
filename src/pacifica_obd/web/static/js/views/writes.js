@@ -19,8 +19,10 @@ export function render(root, ctx) {
   const writesEnabled = health ? !health.read_only : false;
 
   const holders = {
-    writePreview: h("div"), writeResult: h("div"),
-    routinePreview: h("div"), routineResult: h("div"),
+    writePreview: h("p.sub", { text: "Preview reads the current value and shows the exact bytes. Nothing is written yet." }),
+    writeResult: h("div"),
+    routinePreview: h("p.sub", { text: "Preview shows the exact 0x31 request. The routine runs only after a typed confirmation." }),
+    routineResult: h("div"),
   };
 
   const write = {

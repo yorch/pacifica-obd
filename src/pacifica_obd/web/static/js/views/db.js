@@ -63,7 +63,7 @@ export async function render(root, ctx) {
 
   mount(root, head,
     card({ eyebrow: "Tables", title: "Browse", flush: true, body: h("div", null, tabs,
-      h("div", { style: { padding: "12px 16px 0" } }, filtersHolder)) }),
+      h("div", { class: "pad-t" }, filtersHolder)) }),
     card({ eyebrow: "Rows", title: "Records", flush: true, body: h("div", null, gridHolder, pagerHolder) }));
 
   /* ------------------------------------------------------------------ load */
@@ -110,7 +110,7 @@ export async function render(root, ctx) {
       });
       filtersHolder.appendChild(input);
     }
-    filtersHolder.appendChild(h("div.field", null, h("label", { text: "Rows" }),
+    filtersHolder.appendChild(h("div.field.field--tight", null, h("label", { text: "Rows" }),
       h("select", { id: "db-limit" },
         [25, 50, 100, 250].map((n) => h("option", { value: n, text: String(n), selected: n === state.limit ? true : undefined })))));
     on(document.getElementById("db-limit"), "change", (event) => { state.limit = Number(event.target.value); state.offset = 0; load(); });
@@ -127,7 +127,7 @@ export async function render(root, ctx) {
       return;
     }
     clear(gridHolder);
-    gridHolder.appendChild(h("div", { style: { padding: "16px" } }, h("span.sub", { text: "Loading…" })));
+    gridHolder.appendChild(h("div.pad", null, h("span.sub", { text: "Loading…" })));
     try {
       const payload = await api.dbTable(state.table, {
         ...state.filters, limit: state.limit, offset: state.offset,
@@ -138,7 +138,7 @@ export async function render(root, ctx) {
       renderPager();
     } catch (error) {
       clear(gridHolder);
-      gridHolder.appendChild(h("div", { style: { padding: "16px" } }, errorState(error, { onRetry: load })));
+      gridHolder.appendChild(h("div", { class: "pad" }, errorState(error, { onRetry: load })));
     }
   }
 
@@ -148,29 +148,27 @@ export async function render(root, ctx) {
       gridHolder.appendChild(emptyState({ icon: "▦", title: "No rows match", hint: "Adjust the filters above." }));
       return;
     }
+    const sortBy = (name) => {
+      state.dir = state.order === name && state.dir === "desc" ? "asc" : "desc";
+      state.order = name; state.offset = 0; load();
+    };
     const columns = (state.columns || Object.keys(state.rows[0])).map((name) => ({
       key: name, label: name, mono: /id|vin|did|code|bus|module|request|ts|hex|raw|ftb|type/i.test(name),
       num: /^(id|session_id)$/.test(name),
       render: (row) => renderCell(name, row),
+      sortable: true,
+      sorted: state.order === name ? state.dir : null,
+      onSort: () => sortBy(name),
     }));
     if (state.table === "samples") {
       columns.push({ key: "__chart", label: "", render: (row) => h("button.btn.btn--sm", {
         type: "button", text: "Chart",
         onClick: (event) => { event.stopPropagation(); chartRow(row); } }) });
     }
-    const table = dataTable({
+    gridHolder.appendChild(dataTable({
       columns, rows: state.rows, empty: "no rows",
       onRowClick: (row) => openDrawer(row),
-    });
-    const header = table.querySelectorAll("th");
-    (state.columns || []).forEach((name, index) => {
-      header[index]?.classList.add("clickable");
-      on(header[index], "click", () => {
-        state.dir = state.order === name && state.dir === "desc" ? "asc" : "desc";
-        state.order = name; state.offset = 0; load();
-      });
-    });
-    gridHolder.appendChild(table);
+    }));
   }
 
   function renderCell(name, row) {
@@ -245,7 +243,7 @@ export async function render(root, ctx) {
       if (!series.length) { clear(holder); holder.appendChild(emptyState({ icon: "◉", title: "No numeric samples", hint: "This signal has no stored numbers to chart." })); return; }
       clear(holder);
       series.forEach((serie) => {
-        const wrap = h("div", { style: { marginBottom: "18px" } },
+        const wrap = h("div", { class: "mb-6" },
           h("div.eyebrow", { text: `${serie.name || serie.id}${serie.unit ? " (" + serie.unit + ")" : ""} · ${serie.raw_count} raw → ${serie.points.length} points${serie.downsampled ? " (lttb)" : ""}` }),
           h("div.legend"), h("div.chart-holder"));
         holder.appendChild(wrap);

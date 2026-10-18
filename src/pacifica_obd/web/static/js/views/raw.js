@@ -10,14 +10,11 @@ import { h, mount, on, debounce } from "../dom.js";
 import { api, ApiError } from "../api.js";
 import { escapeControls } from "../format.js";
 import {
-  card, pill, banner, errorState, toast, typedConfirm, dataTable, emptyState,
+  card, pill, banner, errorState, toast, typedConfirm, dataTable, emptyState, tierPill,
 } from "../components.js";
 
 // Read = neutral, confirm = amber, deny = red. Never colour alone: the badge
-// always carries the tier word.
-const TIER_CLASS = { read: "pill--idle", confirm: "pill--warn", deny: "pill--crit" };
-
-// A deny reason may point at the screen that *does* expose the operation.
+// always carries the tier word and a glyph (components.js:tierPill).
 const POINTERS = {
   security: { href: "#/security", label: "Open Security 0x27" },
   writes: { href: "#/writes", label: "Open Guarded writes" },
@@ -54,7 +51,7 @@ export function render(root, ctx) {
       h("div.field", null,
         h("label", { for: "raw-command", text: "Command (hex bytes or one AT command)" }),
         input),
-      h("div.row", { style: { marginTop: "8px" } }, sendButton,
+      h("div.row.row--spaced", sendButton,
         h("button.btn.btn--ghost.btn--sm", {
           type: "button", text: "Reset addressing",
           title: "Send ATD (set all adapter settings to their defaults)",
@@ -100,9 +97,10 @@ export function render(root, ctx) {
   function tierLine(decision) {
     if (!decision) return h("div");
     const pointer = decision.pointer ? POINTERS[decision.pointer] : null;
-    return h("div", null,
-      tierBadge(decision.tier),
-      h("p.sub", { text: escapeControls(decision.reason) }),
+    const word = decision.tier === "invalid" ? "deny" : decision.tier;
+    return h("div", { class: `tiernote tiernote--${word}`, role: "status" },
+      h("div.row", null, tierBadge(decision.tier),
+        h("span.sub", { text: escapeControls(decision.reason) })),
       decision.note ? h("p.sub", null, escapeControls(decision.note), " ",
         pointer ? h("a", { href: pointer.href, text: pointer.label }) : null) : null,
       decision.tier === "confirm" && !writesEnabled
@@ -111,8 +109,7 @@ export function render(root, ctx) {
   }
 
   function tierBadge(tier) {
-    const text = tier === "invalid" ? "deny" : tier;
-    return h("span", { class: `pill ${TIER_CLASS[text] || "pill--idle"}`, text });
+    return tierPill(tier);
   }
 
   /* -------------------------------------------------------------- sending */

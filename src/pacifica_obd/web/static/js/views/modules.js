@@ -50,9 +50,9 @@ export function render(root, ctx) {
 
   const formCard = card({ eyebrow: "UDS discovery", title: "Scan", body: h("div", null,
     h("div.row", null, busField, startField, endField, timeoutField, identifyBox),
-    h("div.row", { style: { marginTop: "10px" } }, discoverButton, dtcButton, infoButton, scanButton, cancelButton),
-    h("div", { style: { marginTop: "10px" } }, progress),
-    h("div", { style: { marginTop: "10px" } }, feed)) });
+    h("div.row.row--spaced", discoverButton, dtcButton, infoButton, scanButton, cancelButton),
+    h("div.row--spaced", progress),
+    h("div.row--spaced", feed)) });
 
   const filterCard = card({ eyebrow: "Filter", title: "Results", body: h("div.row", null,
     filterText, filterBus, filterStatus, filterDtc),
@@ -223,13 +223,13 @@ export function render(root, ctx) {
 
   function moduleNode(row) {
     const dtcCount = (row.dtcs || []).length;
-    const details = h("details", { open: dtcCount > 0 },
+    const details = h("details.module", { open: dtcCount > 0 },
       h("summary", null,
         h("span.mono", { text: `${row.request_id} → ${row.response_id || "?"}` }),
         " ", h("span.sub", { text: row.kind || "module" }),
         " ", row.status ? pill(row.status, row.status) : null,
         " ", h("span", { class: `pill ${dtcCount ? "pill--crit" : "pill--ok"}`, text: `${dtcCount} DTC` })));
-    const body = h("div", { style: { paddingLeft: "12px" } });
+    const body = h("div.module-body");
     if (row.dtcs?.length) {
       body.appendChild(dataTable({
         columns: [
@@ -238,7 +238,7 @@ export function render(root, ctx) {
           { key: "description", label: "Description", render: (dtc) => dtc.description || h("span.sub", { text: "no dataset text" }) },
           { key: "status", label: "Status", render: (dtc) => pill(dtc.status, dtc.status) },
           { key: "flags", label: "Flags", render: (dtc) => h("span", null,
-            (dtc.flags || []).map((flag) => h("span", { class: `pill ${statusClass(flag)}`, text: flag, style: { marginRight: "4px" } }))) },
+            (dtc.flags || []).map((flag) => h("span", { class: `pill ${statusClass(flag)}`, text: flag }))) },
           { key: "action", label: "AI", render: (dtc) => h("a.pill.pill--ghost", {
             title: "ask the read-only assistant", text: "explain",
             href: `#/assistant?ask=${encodeURIComponent(`Explain DTC ${dtc.code} in one or two sentences.`)}` }) },

@@ -18,10 +18,10 @@ export function render(root, ctx) {
   const writesEnabled = health ? !health.read_only : false;
 
   const hold = {
-    explain: h("div"),
-    seed: h("div"),
-    preview: h("div"),
-    result: h("div"),
+    explain: h("p.sub", { text: "Offline: picks the algorithm for this target from the bundled selector table. Reads nothing from the vehicle." }),
+    seed: h("p.sub", { text: "Reads the seed only (0x27 <level>). Nothing is sent to the module." }),
+    preview: h("p.sub", { text: "Reads the seed, computes the key and shows the exact wire bytes. Still nothing sent." }),
+    result: h("p.sub", { text: "The reviewed key is sent here, after a typed confirmation." }),
   };
 
   const fields = {
