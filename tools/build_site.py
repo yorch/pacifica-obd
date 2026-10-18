@@ -100,10 +100,10 @@ NAV: list[dict[str, Any]] = [
         "title": "Deep dives",
         "items": [
             ("Chrysler Security Gateway", "docs/chrysler-sgw.md"),
-            ("Enhanced (AlfaOBD-class) diagnostics", "docs/enhanced-diagnostics.md"),
+            ("Enhanced (manufacturer-aware) diagnostics", "docs/enhanced-diagnostics.md"),
+            ("FCA modules", "docs/fca-modules.md"),
             ("Vehicle assessment", "docs/vehicle-assessment.md"),
             ("FCA seed/key selector", "docs/fca-seedkey-selector.md"),
-            ("FCA modules (AlfaOBD database)", "docs/fca-modules.md"),
         ],
     },
 ]

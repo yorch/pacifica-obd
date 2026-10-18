@@ -454,22 +454,12 @@ def _run_brute_subprocess(
 
 
 def _enter_session(elm, rid: str | None = None, wait: float = 0.5) -> str | None:
-    """``uds.enter_session`` plus responder-targeted ISO-TP flow control.
+    """``uds.enter_session``; ISO-TP flow control stays in automatic mode.
 
-    Pointing flow control at the responder (from the profile mapping, or whatever
-    answered) is what lets a multi-frame reply from a ``-0x280`` or CAN-IHS module
-    complete; without it those reads look like "no response". Best-effort.
+    Reply correlation is handled by the receive filter (``ATCRA``), never by
+    manual flow control — see AGENTS.md.
     """
-    learned = _uds_enter_session(elm, rid, wait)
-    responder = _known_response_id(rid) if rid else None
-    if responder or learned:
-        from pacifica_obd.adapter import configure_flow_control
-
-        try:
-            configure_flow_control(elm, responder or learned)
-        except Exception:  # noqa: BLE001 - best effort
-            pass
-    return learned
+    return _uds_enter_session(elm, rid, wait)
 
 
 def _known_response_id(request_id: str) -> str | None:
@@ -609,10 +599,6 @@ def _probe_modules_multi(
                     elm.cmd("ATCRA " + mapped)
                 except Exception:  # noqa: BLE001 - no mapping (e.g. broadcast)
                     elm.cmd("ATAR")
-            # Flow control frames go *to the responder*: a multi-frame 22F190 probe
-            # reply from a -0x280 / CAN-IHS module cannot complete without this.
-            for command in ("ATFCSM1", "ATFCSH" + (mapped or "%03X" % rid), "ATFCSD3000"):
-                elm.cmd(command)
             header, uds = _parse_uds_frame(elm.cmd(probe, wait=wait))
             if header is None:
                 continue
