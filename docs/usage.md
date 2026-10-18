@@ -64,7 +64,7 @@ file.
 | [`readiness`](#readiness) | OBD-II | Readiness / I-M monitors (pre-emissions-test). |
 | [`freeze`](#freeze) | OBD-II | Freeze-frame snapshot behind a DTC (mode `02`). |
 | [`modules`](#modules) | UDS | Discover responding modules on a bus. |
-| [`module-map`](#module-map) | — | Known module addresses (built-in, plus the AlfaOBD DB if present). |
+| [`module-map`](#module-map) | — | Known module addresses (built-in, plus an optional external ECU database if one is given). |
 | [`dtc-all`](#dtc-all) | UDS | Read DTCs (`19 02`) from every responding module. |
 | [`read-did`](#read-did) | UDS | Read DIDs (`22`) from one module. |
 | [`module-info`](#module-info) | UDS | Identification block (`F186`–`F191`) per module. |
@@ -246,16 +246,15 @@ touching the vehicle — useful before a scan to know what to expect.
 ```sh
 uv run pacifica-obd module-map
 uv run pacifica-obd module-map --json
-uv run pacifica-obd module-map --alfa-db ~/temp/alfa-obd/scratchpad/db/alfaobd_plain.db
+uv run pacifica-obd module-map --ecu-db ~/ecu-db.sqlite
 ```
 
 | Flag | Meaning |
 |---|---|
-| `--alfa-db PATH` | Optional path to an extracted AlfaOBD SQLite database (`PACIFICA_OBD_ALFAOBD_DB`). It is opened **read-only** and only used to print the full FCA PowerNet ECU map. |
+| `--ecu-db PATH` | Optional path to an external ECU SQLite database (`PACIFICA_OBD_ECU_DB`). It is opened **read-only** and only used to print the full FCA PowerNet ECU map. |
 
 Without the database, the built-in profile addresses are listed and a note says
-so. See [FCA modules (AlfaOBD database)](fca-modules.md) for what that database
-contains and how it was extracted.
+so. The database is opt-in: the tool ships no default and never requires one.
 
 ## dtc-all
 
@@ -389,8 +388,8 @@ uv run pacifica-obd security --module 7E0 --level 1 --json
 
 `status` is one of `ok` (seed returned), `already_unlocked` (an all-zero seed),
 `no_key_provider` (seed returned, no key to send), `negative`, `unexpected` or
-`no_response`. Background on where FCA keeps its algorithms:
-[FCA modules §6](fca-modules.md#6-security-access-0x27-where-the-algorithms-live).
+`no_response`. Where FCA keeps its seed/key algorithms is out of scope for this
+tool: the `security` command only requests a seed, and no provider is shipped.
 
 ## write-did
 

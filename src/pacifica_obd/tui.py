@@ -1,9 +1,20 @@
 """Interactive terminal UI (Textual) for pacifica-obd.
 
-A keyboard- and mouse-driven front end over the same helpers the CLI uses:
-generic OBD-II reads (live PIDs, readiness, freeze frame, VIN) and
-manufacturer-specific UDS work (module discovery, all-module DTCs, DID reads)
-through the raw ELM/STN transport in :mod:`pacifica_obd.elm`.
+A keyboard- and mouse-driven front end for the whole ``pacifica-obd`` command
+surface:
+
+* adapter reads — ports, info, VIN, generic DTCs (modes 03/07/0A), live
+  supported-PID dump, watch, readiness, freeze frame, scan, raw commands,
+  module discovery, all-module UDS DTCs (0x19), ``read-did`` (0x22) and the
+  F186-F191 identification block;
+* long-running adapter work — :func:`capture` (modules + DTCs + ID block) and
+  :func:`monitor` (UDS DIDs polled into the local database);
+* offline local-database views — ``vehicles``, ``history``, ``show``,
+  ``module-map`` and the pure-Python ``seedkey-brute`` recovery;
+* guarded writes — ``security`` (0x27 seed/key), ``write-did`` (0x2E) and
+  ``routine`` (0x31). These never auto-send: a dialog states the exact request
+  and the Security-Gateway/irreversibility warning, and only an explicit "yes"
+  reaches the adapter.
 
 Design notes
 ------------
@@ -12,25 +23,46 @@ Design notes
   ``App.call_from_thread``. Nothing blocking ever runs on the event loop.
 * A single non-blocking lock means only one operation owns the adapter at a
   time; a second request is refused with a visible message instead of
-  interleaving two conversations on the same CAN bus.
+  interleaving two conversations on the same CAN bus. Offline operations take
+  the same lock so the busy state stays consistent (they just ignore the
+  handle).
 * Lifecycle: the protocol is snapshotted with ``current_protocol()`` when the
   port opens and restored with ``restore_protocol()`` before ``close()`` on
-  disconnect / app exit.
+  disconnect / app exit. That is deliberately the raw transport rather than
+  :class:`pacifica_obd.adapter.ElmAdapter` (the CLI's one-shot wrapper): the TUI
+  must be able to close a port *without* commanding a bus another worker still
+  owns.
 * Exceptions never reach the UI as a traceback: worker bodies are wrapped and
   reported as log lines plus a notification.
+* The TUI stays on the raw transport for the generic OBD commands the CLI runs
+  through python-OBD (``dtc``, ``live``, ``scan``): handing the port back and
+  forth would close/reopen it, and ``cli.connect()`` is free to ``sys.exit``.
+
+Protocol/parsing logic is never re-implemented here: the UDS layer
+(:mod:`pacifica_obd.uds`), the adapter helpers (:mod:`pacifica_obd.adapter`),
+the optional external ECU database reader (:mod:`pacifica_obd.database`), the
+seed/key tools (:mod:`pacifica_obd.seedkey`) and the store (:mod:`pacifica_obd.store`)
+do the work; this module only drives them and renders the results.
 
 Launch with ``pacifica-obd tui`` (or ``python -c 'from pacifica_obd.tui import run; run()'``).
 """
 
 from __future__ import annotations
 
+import json
 import re
+import subprocess
+import sys
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from functools import partial
+from pathlib import Path
+from types import SimpleNamespace
 
+from obd.codes import DTC as _DTC_TEXT
 from rich.table import Table
 from rich.text import Text
 from serial.tools import list_ports
@@ -54,26 +86,46 @@ from textual.widgets import (
     Switch,
 )
 
-from pacifica_obd.cli import (
-    DEFAULT_BAUD,
-    DEFAULT_WATCH,
-    _BUS_PROTOCOL,
-    _classify_dtc_response,
-    _did_ascii,
-    _did_value,
-    _enter_session,
-    _FREEZE_PIDS,
-    _INFO_DIDS,
-    _parse_dtcs,
-    _parse_uds_frame,
-    _read_did,
+from pacifica_obd.adapter import (
+    AdapterError,
     configure_bus,
     current_protocol,
     find_port,
     must_ok,
+    reset_flow_control,
     restore_protocol,
 )
+from pacifica_obd.cli import (
+    DEFAULT_BAUD,
+    DEFAULT_WATCH,
+    _addr_and_session,
+    _FREEZE_PIDS,
+    _WRITE_WARNING,
+)
+from pacifica_obd.database import EcuDatabase, default_db
 from pacifica_obd.elm import Elm327, Elm327Error
+from pacifica_obd.profiles import (
+    addresses as module_addresses,
+    looks_like_vin,
+    response_id,
+    year_from_vin,
+)
+from pacifica_obd.seedkey import SeedKeyError, load_provider
+from pacifica_obd.store import Store, logging_enabled
+from pacifica_obd.uds import (
+    BUS_PROTOCOL as _BUS_PROTOCOL,
+    INFO_DIDS as _INFO_DIDS,
+    classify_dtc_response as _classify_dtc_response,
+    did_ascii as _did_ascii,
+    did_value as _did_value,
+    enter_session as _uds_enter_session,
+    parse_dtcs as _parse_dtcs,
+    parse_uds_frame as _parse_uds_frame,
+    read_did as _read_did,
+    routine_control,
+    security_access,
+    write_did as uds_write_did,
+)
 
 __all__ = ["run", "PacificaTui"]
 
@@ -84,6 +136,15 @@ class _Refused(Exception):
     Raised by ``PacificaTui._exclusive`` so a worker can never accidentally run
     its body without owning the adapter.
     """
+
+
+class _SearchAborted(Exception):
+    """Raised by the seed/key search wrapper when cancelled or out of budget."""
+
+
+# Bound on the (uncancellable, in-library) seed/key search so a slow plugin
+# cannot hold the adapter lock forever; Stop also trips it via the cancel event.
+BRUTE_BUDGET_SECONDS = 30.0
 
 
 # Per-request CAN timeout (STPTO) and the derived read wait, mirroring the CLI.
@@ -102,9 +163,9 @@ Snapshot = tuple[str, str | None] | None
 # --------------------------------------------------------------------------- #
 # generic OBD-II PID decoding (raw mode 01, no python-OBD needed)
 # --------------------------------------------------------------------------- #
-# name -> (request, payload bytes required, decoder, unit). Payload is what
-# follows the "41 <pid>" echo of the reply.
-Pid = tuple[str, int, Callable[[bytes], float], str]
+# name -> (mode-01 PID code, payload bytes required, decoder, unit). The payload
+# is everything after the "41 <pid>" echo of the reply.
+Pid = tuple[int, int, Callable[[bytes], float], str]
 
 
 def _u8(data: bytes) -> float:
@@ -128,18 +189,33 @@ def _maf(data: bytes) -> float:
 
 
 _PIDS: dict[str, Pid] = {
-    "RPM": ("010C", 2, _rpm, "rpm"),
-    "SPEED": ("010D", 1, _u8, "km/h"),
-    "COOLANT_TEMP": ("0105", 1, _temp, "°C"),
-    "ENGINE_LOAD": ("0104", 1, _percent, "%"),
-    "THROTTLE_POS": ("0111", 1, _percent, "%"),
-    "INTAKE_TEMP": ("010F", 1, _temp, "°C"),
-    "MAF": ("0110", 2, _maf, "g/s"),
-    "FUEL_LEVEL": ("012F", 1, _percent, "%"),
+    "RPM": (0x0C, 2, _rpm, "rpm"),
+    "SPEED": (0x0D, 1, _u8, "km/h"),
+    "COOLANT_TEMP": (0x05, 1, _temp, "°C"),
+    "ENGINE_LOAD": (0x04, 1, _percent, "%"),
+    "THROTTLE_POS": (0x11, 1, _percent, "%"),
+    "INTAKE_TEMP": (0x0F, 1, _temp, "°C"),
+    "MAF": (0x10, 2, _maf, "g/s"),
+    "FUEL_LEVEL": (0x2F, 1, _percent, "%"),
 }
 # ATRV is an adapter command, not a PID; handled separately in the poll loop.
 _VOLTAGE_KEY = "ELM_VOLTAGE"
 _PID_NAMES = [*_PIDS, _VOLTAGE_KEY]
+# PID code -> decoder, so the "live" dump can decode any PID we know how to.
+_PID_BY_CODE: dict[int, tuple[str, int, Callable[[bytes], float], str]] = {
+    code: (name, needed, decoder, unit) for name, (code, needed, decoder, unit) in _PIDS.items()
+}
+
+# Generic (non-UDS) trouble-code services and their 0x40 replies.
+_GENERIC_DTC_MODES = (
+    ("03", "Stored (mode 03)"),
+    ("07", "Pending (mode 07)"),
+    ("0A", "Permanent (mode 0A)"),
+)
+
+# A 4-byte seed/key secret is 2**32 candidates: minutes-to-hours of uncancellable
+# Python in one thread. The TUI caps it (and says so); the CLI can still do it.
+MAX_BRUTE_WIDTH = 3
 
 # Readiness (mode 01 PID 01) bit names, copied from python-OBD's obd/codes.py so
 # the layout matches `obd.decoders.status` exactly (see _decode_readiness).
@@ -218,6 +294,27 @@ def _decode_obd_dtc(data: bytes) -> str | None:
     return f"{letter}{(data[0] >> 4) & 0x03}{data[0] & 0x0F:X}{data[1]:02X}"
 
 
+def _decode_generic_dtcs(payload: bytes) -> list[str]:
+    """Decode a mode 03/07/0A payload: a count byte then two bytes per code.
+
+    Mirrors python-OBD's ``dtc`` decoder, which drops the mode byte *and* the
+    reported DTC count before pairing the remaining bytes (``43 01 03 00`` is one
+    code, P0300 — not P0103).
+    """
+    codes: list[str] = []
+    data = payload[1:]  # payload[0] is the number of codes that follow
+    for index in range(1, len(data), 2):  # pair up, ignoring an odd trailing byte
+        code = _decode_obd_dtc(data[index - 1:index + 1])
+        if code is not None:  # 00 00 padding
+            codes.append(code)
+    return codes
+
+
+def _dtc_description(code: str) -> str:
+    """Human description from python-OBD's code table (same text as the CLI)."""
+    return str(_DTC_TEXT.get(code, ""))
+
+
 def _decode_vin(uds: str) -> str | None:
     """Pull the VIN out of a mode 09 02 ('4902…') payload."""
     if not uds.startswith("4902"):
@@ -251,6 +348,161 @@ def _payload_after(lines: list[str], prefix: str) -> bytes | None:
     if not body or len(body) % 2 or not re.fullmatch(r"[0-9A-Fa-f]+", body):
         return None
     return bytes.fromhex(body)
+
+
+def _read_vin(elm, wait: float) -> str | None:
+    """Read the VIN with generic mode 09 02 (works without a UDS session)."""
+    elm.cmd("ATSH 7E0")
+    payload = _payload_after(elm.cmd("0902", wait=wait), "4902")
+    if payload is None:
+        return None
+    return _decode_vin("4902" + payload.hex().upper())
+
+
+def _read_uds_vin(
+    elm,
+    wait: float,
+    cancel: threading.Event,
+    warn: Callable[[str], None] | None = None,
+) -> str | None:
+    """VIN over UDS F190 from the known module addresses (mirrors the CLI).
+
+    Some vehicles (e.g. the Pacifica Hybrid) do not serve mode 09 02 at all but
+    do return F190 from their powertrain/body modules.
+    """
+    for bus in ("can-c", "can-ihs"):
+        if cancel.is_set():
+            return None
+        try:
+            _prepare_bus(elm, bus, warn)
+        except (AdapterError, Elm327Error):
+            continue
+        for _name, request, response in module_addresses(bus, powertrain="phev"):
+            if cancel.is_set():
+                return None
+            rid = "%03X" % request
+            if not _address(elm, rid, warn):
+                continue
+            learned = _enter_session(elm, rid, wait)
+            expect = ("%03X" % response if response else None) or learned
+            record = _read_did(elm, 0xF190, wait, expect_header=expect)
+            if record["status"] == "ok" and looks_like_vin(record.get("ascii")):
+                return record["ascii"]
+    return None
+
+
+# Recovery runs in a child interpreter: a plugin is arbitrary code and the
+# library's search loop cannot be interrupted from another thread, so the only
+# reliable Stop/budget guarantee is to terminate the process.
+_BRUTE_CHILD = r"""
+import json, sys
+from pacifica_obd.seedkey import find_secrets, load_algorithm, parse_pairs
+
+algorithm_path, pairs_text, width = sys.argv[1], sys.argv[2], int(sys.argv[3])
+try:
+    algorithm = load_algorithm(algorithm_path)
+    pairs = parse_pairs(pairs_text, width=width)
+    matches = find_secrets(algorithm, pairs, width=width)
+except BaseException as exc:  # a broken plugin must not look like "no match"
+    print(json.dumps({"error": f"{type(exc).__name__}: {exc}"}))
+    raise SystemExit(0)
+print(json.dumps({"matches": matches}))
+"""
+
+
+def _run_brute_subprocess(
+    algorithm_path: str, pairs_text: str, width: int, cancel: threading.Event, budget: float
+) -> dict:
+    """Run seed/key recovery in a killable child process.
+
+    Returns ``{"matches": [...]}`` or ``{"error": "..."}``; raises
+    ``_SearchAborted`` when Stop or the budget ends it first.
+    """
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _BRUTE_CHILD, algorithm_path, pairs_text, str(width)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    deadline = time.monotonic() + budget
+
+    def stop() -> None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:  # pragma: no cover - a wedged child
+            proc.kill()
+            proc.wait(timeout=2.0)
+
+    while True:
+        if cancel.is_set() or time.monotonic() > deadline:
+            stop()
+            raise _SearchAborted()
+        try:
+            out, err = proc.communicate(timeout=0.2)
+            break
+        except subprocess.TimeoutExpired:
+            continue
+    text = (out or "").strip()
+    if proc.returncode != 0:
+        detail = (err or text or "the recovery process failed").strip().splitlines()
+        return {"error": detail[-1] if detail else "the recovery process failed"}
+    try:
+        return json.loads(text.splitlines()[-1])
+    except (ValueError, IndexError):
+        return {"error": (err or text or "unreadable result from the recovery process").strip()}
+
+
+def _enter_session(elm, rid: str | None = None, wait: float = 0.5) -> str | None:
+    """``uds.enter_session`` plus responder-targeted ISO-TP flow control.
+
+    Pointing flow control at the responder (from the profile mapping, or whatever
+    answered) is what lets a multi-frame reply from a ``-0x280`` or CAN-IHS module
+    complete; without it those reads look like "no response". Best-effort.
+    """
+    learned = _uds_enter_session(elm, rid, wait)
+    responder = _known_response_id(rid) if rid else None
+    if responder or learned:
+        from pacifica_obd.adapter import configure_flow_control
+
+        try:
+            configure_flow_control(elm, responder or learned)
+        except Exception:  # noqa: BLE001 - best effort
+            pass
+    return learned
+
+
+def _known_response_id(request_id: str) -> str | None:
+    """Response ID for a request ID from the profile tables, if we know one.
+
+    Used to attribute replies to the module we asked: without an expectation a
+    stray frame from another ECU could be recorded against the wrong module.
+    """
+    try:
+        return "%03X" % response_id(int(request_id, 16))
+    except ValueError:
+        return None
+
+
+def _supported_pids(elm, wait: float, cancel: threading.Event) -> list[int]:
+    """Decode the mode-01 supported-PID bitmaps (01 00 / 20 / 40 / 60)."""
+    found: list[int] = []
+    base = 0x00
+    for _block in range(4):
+        if cancel.is_set():
+            break
+        payload = _payload_after(elm.cmd("01%02X" % base, wait=wait), "41%02X" % base)
+        if payload is None or len(payload) < 4:
+            break
+        for index, byte in enumerate(payload[:4]):
+            for bit in range(8):
+                if byte & (0x80 >> bit):
+                    found.append(base + index * 8 + bit + 1)
+        next_base = base + 0x20
+        if next_base not in found:  # the continuation bit was clear
+            break
+        base = next_base
+    return found
 
 
 def _protocol_label(snapshot: Snapshot) -> str:
@@ -294,8 +546,13 @@ def _prepare_bus(
     would present that module's data as the PCM's. The filter clear is only
     warned about, because a surviving filter shows up as missing modules rather
     than as someone else's data.
+
+    Automatic ISO-TP flow control is restored here too: UDS reads set it manually
+    per responder, and the CLI can leave it set (it exits), but a long-lived TUI
+    would otherwise send later mode 01/09 flow-control frames to a stale address.
     """
     protocol = configure_bus(elm, bus, timeout_ms)
+    reset_flow_control(elm)
     must_ok(elm, "ATSH 7E0")
     if not _acknowledged(elm.cmd("ATCRA")):
         _warn(warn, "'ATCRA' was not acknowledged; a stale ECU filter may hide modules")
@@ -312,47 +569,99 @@ def _warn(warn: Callable[[str], None] | None, message: str) -> None:
         warn(message)
 
 
-def _probe_modules(
+def _probe_modules_multi(
     elm: Elm327,
     start: int,
     end: int,
-    probe: str,
+    probes: Sequence[str],
     wait: float,
     cancel: threading.Event,
     warn: Callable[[str], None] | None = None,
+    receive_id: Callable[[int], int] | None = response_id,
 ) -> Iterator[dict]:
-    """Cancellable probe of UDS request IDs, mirroring ``cli._probe_ids``.
+    """Cancellable multi-service probe, mirroring ``uds.probe_ids_multi``.
 
-    The CLI's generator cannot be interrupted and only yields responders, so a
-    Stop press while scanning an empty range would otherwise have no effect.
-    Parsing still goes through the shared ``_parse_uds_frame``.
-
-    A rejected ``ATSH`` skips that ID instead of querying the previous module:
-    with the old header still in place its reply would be attributed to the
-    wrong module.
+    Many modules reject ``10 03`` but answer ``22 F190`` (and vice versa), so the
+    CLI tries several services; this is the cancellable equivalent (the library
+    generator cannot be interrupted and only yields responders, so a Stop press
+    while scanning an empty range would otherwise have no effect). ``receive_id``
+    applies the same receive-address fix as the CLI, without which the adapter
+    silently drops ``-0x280`` and CAN-IHS answers. An ID whose ``ATSH`` is
+    rejected is skipped rather than misattributed to the previous module.
     """
-    service = int(probe[:2], 16)
-    for rid in range(start, end + 1):
-        if cancel.is_set():
-            return
-        if not _acknowledged(elm.cmd("ATSH %03X" % rid)):
-            _warn(warn, f"ATSH {rid:03X} was not acknowledged; skipping that ID")
-            continue
-        header, uds = _parse_uds_frame(elm.cmd(probe, wait=wait))
-        if header is None:
-            continue
-        if uds.startswith("%02X" % (service + 0x40)):
-            kind = "positive"
-        elif uds.startswith("7F"):
-            kind = "negative"
-        else:
-            kind = "other"
-        yield {
-            "request_id": "%03X" % rid,
-            "response_id": header,
-            "kind": kind,
-            "session_response": uds,
-        }
+    known: set[int] = set()
+    ignored: set[int] = set()
+    for probe in probes:
+        service = int(probe[:2], 16)
+        for rid in range(start, end + 1):
+            if cancel.is_set():
+                return
+            if rid in known:
+                continue
+            if not _acknowledged(elm.cmd("ATSH %03X" % rid)):
+                _warn(warn, f"ATSH {rid:03X} was not acknowledged; skipping that ID")
+                known.add(rid)
+                continue
+            mapped: str | None = None
+            if receive_id is not None:
+                try:
+                    mapped = "%03X" % receive_id(rid)
+                    elm.cmd("ATCRA " + mapped)
+                except Exception:  # noqa: BLE001 - no mapping (e.g. broadcast)
+                    elm.cmd("ATAR")
+            # Flow control frames go *to the responder*: a multi-frame 22F190 probe
+            # reply from a -0x280 / CAN-IHS module cannot complete without this.
+            for command in ("ATFCSM1", "ATFCSH" + (mapped or "%03X" % rid), "ATFCSD3000"):
+                elm.cmd(command)
+            header, uds = _parse_uds_frame(elm.cmd(probe, wait=wait))
+            if header is None:
+                continue
+            if mapped is not None and header != mapped:
+                # Someone else answered. Yielding this pair would outrank the
+                # known mapping downstream, so ignore it and let the next probe
+                # service try the same ID.
+                if rid not in ignored:
+                    ignored.add(rid)
+                    _warn(warn, f"{rid:03X} answered from {header}, expected {mapped}; ignoring")
+                continue
+            if uds.startswith("%02X" % (service + 0x40)):
+                kind = "positive"
+            elif uds.startswith("7F"):
+                kind = "negative"
+            else:
+                kind = "other"
+            known.add(rid)
+            yield {
+                "request_id": "%03X" % rid,
+                "response_id": header,
+                "kind": kind,
+                "probe": probe,
+                "session_response": uds,
+            }
+
+
+def _address(elm: Elm327, rid: str, warn: Callable[[str], None] | None = None) -> bool:
+    """Aim the adapter at one module: set the RX filter, then set the header.
+
+    Non-standard modules answer at an address other than ``request + 8``, and the
+    adapter needs the receive filter (``ATCRA``) pointed at the responder so it can
+    reassemble (and flow-control) multi-frame replies. When the profile knows the
+    responder we filter to it; otherwise the filter is cleared to accept any reply.
+    ISO-TP flow control is deliberately left in the adapter's automatic mode:
+    forcing it into user-defined mode switches the STN to an indexed frame format
+    that breaks multi-frame parsing.
+
+    Returns False if the adapter rejected the header, in which case the caller
+    must skip the module — the previous one would still be selected.
+    """
+    mapped = _known_response_id(rid)
+    reply = elm.cmd("ATCRA " + mapped) if mapped else elm.cmd("ATCRA")
+    if not _acknowledged(reply):
+        _warn(warn, "'ATCRA' was not acknowledged; replies may be missed")
+    if not _acknowledged(elm.cmd("ATSH " + rid)):
+        _warn(warn, f"'ATSH {rid}' was not acknowledged; skipping this module")
+        return False
+    return True
 
 
 def _list_serial_ports() -> list[str]:
@@ -400,6 +709,53 @@ def _open_adapter(port: str) -> tuple[Elm327, Snapshot, str]:
         elm.close()
         raise
     return elm, previous, (lines[0].strip() if lines else "")
+
+
+def _open_writable_store() -> Store | None:
+    """Writable log database, or None when logging is off/unavailable."""
+    if not logging_enabled():
+        return None
+    try:
+        store = Store()
+    except Exception:  # noqa: BLE001 - persistence must never break a command
+        return None
+    return store if store.available else None
+
+
+def _open_readonly_store() -> Store | None:
+    """Read-only database for the offline views; None when there is none."""
+    try:
+        store = Store(readonly=True)
+    except Exception:  # noqa: BLE001
+        return None
+    return store if store.available else None
+
+
+def _write_warning() -> Text:
+    """The CLI's SGW/irreversibility warning, as renderable text."""
+    return Text.from_markup(_WRITE_WARNING)
+
+
+def _addressed_session(
+    elm, bus: str, module: str, wait: float, timeout_ms: int = DEFAULT_TIMEOUT_MS
+) -> tuple[str, str]:
+    """Configure the bus, address `module` and require an extended session.
+
+    Delegates to the CLI's guard, which refuses to return unless the ECU
+    answered ``5003`` — without that, a write could land on whatever ECU was
+    selected by the previous command. It then additionally requires the session
+    responder to match the independently known response address: otherwise a
+    stray ECU's session (and later its seed/acknowledgement) would be treated as
+    this module's, and a key could be sent to the wrong address.
+    """
+    args = SimpleNamespace(bus=bus, timeout_ms=timeout_ms, module=int(module, 16))
+    rid, header = _addr_and_session(elm, args, wait)
+    mapped = _known_response_id(rid)
+    if mapped is not None and header is not None and header != mapped:
+        raise AdapterError(
+            f"module {rid} answered from {header}, expected {mapped}; refusing"
+        )
+    return rid, header  # type: ignore[return-value]
 
 
 # --------------------------------------------------------------------------- #
@@ -471,6 +827,28 @@ def _parse_raw_command(text: str) -> str | None:
     return command if re.fullmatch(r"[0-9A-Za-z ._-]+", command) else None
 
 
+def _parse_path(text: str) -> str | None:
+    """Expand a user-supplied file path; None when blank."""
+    value = text.strip()
+    return str(Path(value).expanduser()) if value else None
+
+
+def _parse_hex_payload(text: str, *, allow_empty: bool = False) -> str | None:
+    """Validate an even-length hex byte string."""
+    value = (text or "").strip().upper().replace(" ", "")
+    if not value:
+        return "" if allow_empty else None
+    if len(value) % 2 or not re.fullmatch(r"[0-9A-F]+", value):
+        return None
+    return value
+
+
+def _parse_vin_field(text: str) -> str | None:
+    """Normalise a VIN (any non-blank text; the caller may warn if it looks odd)."""
+    value = text.strip().upper()
+    return value or None
+
+
 # Vehicle services that write, clear or reset state, and adapter commands that
 # persist to EEPROM. Both need an explicit yes/no before they go out.
 _RAW_DANGEROUS_SERVICES = {
@@ -528,6 +906,162 @@ def _raw_risk(command: str, framing_off: bool = False) -> str | None:
 # --------------------------------------------------------------------------- #
 # modal screens
 # --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class Field:
+    """One entry in a :class:`FormDialog`."""
+
+    name: str
+    label: str
+    value: str = ""
+    placeholder: str = ""
+    kind: str = "text"  # "text" | "switch" | "select"
+    options: tuple[tuple[str, str], ...] = ()
+    hint: str = ""
+
+
+class FormDialog(ModalScreen[dict | None]):
+    """Collect parameters for the parameterised actions.
+
+    ``validate`` receives the raw values and returns an error string (shown
+    in the dialog, which stays open) or None to accept.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("ctrl+s", "submit", "Submit", show=False),
+    ]
+
+    def __init__(
+        self,
+        title: str,
+        fields: Sequence[Field],
+        hint: str = "",
+        validate: Callable[[dict], str | None] | None = None,
+        submit_label: str = "Submit",
+    ) -> None:
+        super().__init__()
+        self._title = title
+        self._fields = list(fields)
+        self._hint = hint
+        self._validate = validate
+        self._submit_label = submit_label
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="dialog"):
+            yield Label(self._title, id="dialog-title")
+            for spec in self._fields:
+                if spec.kind == "switch":
+                    with Horizontal(classes="field-row"):
+                        yield Switch(value=spec.value == "1", id=f"field-{spec.name}")
+                        yield Label(spec.label, classes="field-label")
+                else:
+                    yield Label(spec.label, classes="field-label")
+                    if spec.kind == "select":
+                        yield Select(
+                            list(spec.options),
+                            value=spec.value,
+                            allow_blank=False,
+                            compact=True,
+                            id=f"field-{spec.name}",
+                        )
+                    else:
+                        yield Input(
+                            value=spec.value,
+                            placeholder=spec.placeholder,
+                            compact=True,
+                            id=f"field-{spec.name}",
+                        )
+                if spec.hint:
+                    yield Label(spec.hint, classes="hint")
+            yield Label("", id="dialog-error")
+            if self._hint:
+                yield Label(self._hint, classes="hint")
+            with Horizontal(id="dialog-buttons"):
+                yield Button(self._submit_label, variant="primary", id="dialog-submit")
+                yield Button("Cancel", id="dialog-cancel")
+
+    def on_mount(self) -> None:
+        for widget in self.query(Input):
+            widget.focus()
+            break
+
+    def values(self) -> dict:
+        values: dict = {}
+        for spec in self._fields:
+            widget = self.query_one(f"#field-{spec.name}")
+            if isinstance(widget, Switch):
+                values[spec.name] = bool(widget.value)
+            elif isinstance(widget, Select):
+                values[spec.name] = str(widget.value)
+            else:
+                values[spec.name] = str(widget.value)
+        return values
+
+    @on(Input.Submitted)
+    def _submitted(self, event: Input.Submitted) -> None:
+        event.stop()
+        self.action_submit()
+
+    @on(Button.Pressed)
+    def _pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        if event.button.id == "dialog-submit":
+            self.action_submit()
+        else:
+            self.dismiss(None)
+
+    def action_submit(self) -> None:
+        values = self.values()
+        if self._validate is not None:
+            error = self._validate(values)
+            if error:
+                # A Text (not markup) keeps user input out of the markup parser.
+                self.query_one("#dialog-error", Label).update(Text(error, style="bold red"))
+                return
+        self.dismiss(values)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class HelpScreen(ModalScreen[None]):
+    """Every action and its key, built from the app's own bindings."""
+
+    BINDINGS = [Binding("escape", "close", "Close"), Binding("q", "close", "Close", show=False)]
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="dialog"):
+            yield Label("pacifica-obd — actions and keys", id="dialog-title")
+            yield Static(self._bindings_table(), id="help-table")
+            yield Label(
+                "Reads are always safe. The writes (security key, 0x2E, 0x31) ask for "
+                "confirmation and show the exact request first; the Security Gateway on "
+                "2018+ vehicles usually blocks them without a bypass.",
+                classes="hint",
+            )
+            yield Label("Esc closes · Ctrl+P opens the command palette", classes="hint")
+
+    def on_mount(self) -> None:
+        self.query_one("#dialog", VerticalScroll).focus()
+
+    def _bindings_table(self) -> Table:
+        table = Table(show_header=False, box=None, pad_edge=False)
+        table.add_column("key", style="bold cyan", no_wrap=True)
+        table.add_column("action")
+        seen: set[str] = set()
+        for binding in PacificaTui.BINDINGS:
+            if not isinstance(binding, Binding) or not binding.description:
+                continue
+            if binding.action in seen:
+                continue
+            seen.add(binding.action)
+            table.add_row(binding.key, binding.description)
+        return table
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
 class PortPicker(ModalScreen[str | None]):
     """Pick a serial port (or auto-detect). Dismisses with the path / '' / None."""
 
@@ -649,14 +1183,25 @@ class PacificaTui(App[None]):
     #main { width: 1fr; }
     .panel-title { color: $accent; text-style: bold; margin-top: 1; }
     .hint { color: $text-muted; text-style: italic; height: auto; }
-    .action, #btn-stop, #btn-clear, #btn-disconnect { width: 100%; }
+    /* Compact action rows: the sidebar carries the whole command surface. */
+    Button.narrow {
+        width: 100%;
+        height: 1;
+        min-height: 1;
+        border: none;
+        margin: 0;
+        padding: 0 1;
+    }
+    #btn-stop, #btn-clear { width: 100%; }
     #status { height: 1; padding: 0 1; background: $panel; }
     #log { min-width: 20; height: 1fr; }
-    /* Live values grow at the bottom when a watch is running (the table sizes
+    /* Live values grow at the bottom when a watch/monitor runs (the table sizes
        itself to its rows). Deliberately not a tab: a hidden RichLog has no width
        and would wrap output at min_width, and stored lines never reflow. */
     #table { height: auto; max-height: 12; margin-top: 1; }
-    PortPicker, PromptDialog, ConfirmDialog { align: center middle; }
+    PortPicker, PromptDialog, ConfirmDialog, FormDialog, HelpScreen {
+        align: center middle;
+    }
     #dialog {
         width: 76;
         max-width: 94%;
@@ -668,25 +1213,51 @@ class PacificaTui(App[None]):
     }
     #port-list { height: auto; max-height: 14; }
     #dialog-question { margin: 1 0; }
-    #dialog-buttons { height: auto; align-horizontal: right; }
+    #dialog-error { height: auto; }
+    .field-label { color: $text-muted; margin-top: 1; height: auto; }
+    .field-row { height: auto; }
+    #dialog-buttons { height: auto; align-horizontal: right; margin-top: 1; }
     #dialog-buttons Button { width: auto; min-width: 16; margin-left: 2; }
+    #help-table { height: auto; }
     """
 
     BINDINGS = [
+        # connection
         Binding("c", "connect", "Connect"),
-        Binding("p", "ports", "Port"),
-        Binding("ctrl+d", "disconnect", "Disconnect"),
+        Binding("p", "ports", "Choose port"),
+        Binding("ctrl+d", "disconnect", "Disconnect", show=False),
+        # adapter reads
         Binding("i", "info", "Info"),
+        Binding("v", "vin", "VIN"),
+        Binding("l", "live", "Live PIDs"),
+        Binding("g", "generic_dtc", "OBD DTCs"),
         Binding("m", "modules", "Modules"),
-        Binding("d", "dtcs", "DTCs"),
-        Binding("n", "module_info", "Module info"),
+        Binding("d", "dtcs", "UDS DTCs"),
+        Binding("n", "module_info", "Module info", show=False),
         Binding("r", "read_did", "Read DID"),
-        Binding("w", "watch", "Watch"),
-        Binding("t", "readiness", "Readiness"),
-        Binding("f", "freeze", "Freeze"),
-        Binding("x", "raw", "Raw cmd"),
+        Binding("t", "readiness", "Readiness", show=False),
+        Binding("f", "freeze", "Freeze frame", show=False),
+        Binding("a", "scan", "Scan"),
+        Binding("x", "raw", "Raw command"),
+        # live data + long running
+        Binding("w", "watch", "Watch PIDs"),
+        Binding("o", "monitor", "Monitor DIDs", show=False),
+        Binding("C", "capture", "Capture", show=False),
+        # offline / local database
+        Binding("M", "module_map", "Module map", show=False),
+        Binding("V", "vehicles", "Vehicles", show=False),
+        Binding("H", "history", "History", show=False),
+        Binding("S", "show", "Show VIN", show=False),
+        Binding("b", "seedkey", "Seed→key brute", show=False),
+        # guarded writes
+        Binding("e", "security", "Security 0x27", show=False),
+        Binding("W", "write_did", "Write DID 0x2E", show=False),
+        Binding("R", "routine", "Routine 0x31", show=False),
+        # housekeeping
         Binding("s", "stop", "Stop"),
         Binding("ctrl+l", "clear_log", "Clear", show=False),
+        Binding("question_mark", "help", "Help"),
+        Binding("f1", "help", "Help", show=False),
         Binding("q", "quit", "Quit"),
     ]
 
@@ -706,8 +1277,9 @@ class PacificaTui(App[None]):
         self._busy: str | None = None
         self._closed = False
         self._shutdown_done = False
-        # Live-watch state (UI thread only).
-        self._watching = False
+        # Live table state (UI thread only).
+        self._live = False
+        self._live_label = ""
         self._samples = 0
         self._log_view: RichLog | None = None
         self._table: DataTable | None = None
@@ -719,9 +1291,9 @@ class PacificaTui(App[None]):
         with Horizontal(id="body"):
             with VerticalScroll(id="sidebar"):
                 yield Static("Connection", classes="panel-title")
-                yield Button("Connect", id="btn-connect", variant="success", classes="action")
-                yield Button("Choose port…", id="btn-port", classes="action")
-                yield Button("Disconnect", id="btn-disconnect", classes="action")
+                yield Button("Connect", id="btn-connect", variant="success", classes="narrow")
+                yield Button("Choose port…", id="btn-port", classes="narrow")
+                yield Button("Disconnect", id="btn-disconnect", classes="narrow")
                 yield Static("Bus / scan range", classes="panel-title")
                 yield Select(
                     [
@@ -737,24 +1309,46 @@ class PacificaTui(App[None]):
                 yield Label("DTC/scan range (hex)", classes="hint")
                 yield Switch(value=False, id="identify")
                 yield Label("Identify modules (VIN / part no.)", classes="hint")
-                yield Static("Module / DIDs", classes="panel-title")
+                yield Static("Module / DIDs / vehicle", classes="panel-title")
                 yield Input(placeholder="module 7E0 (blank = scan)", id="module")
                 yield Input(placeholder="DIDs F190,F187", id="dids")
+                yield Input(placeholder="VIN (show / tag stored data)", id="vin")
                 yield Static("Live data", classes="panel-title")
                 yield Input(value=",".join(DEFAULT_WATCH), id="pids")
                 yield Input(value="0.5", placeholder="interval seconds", id="interval")
-                yield Static("Actions", classes="panel-title")
-                yield Button("Info", id="btn-info", classes="action")
-                yield Button("Modules", id="btn-modules", classes="action")
-                yield Button("DTCs (all modules)", id="btn-dtcs", classes="action")
-                yield Button("Module info (F186-F191)", id="btn-modinfo", classes="action")
-                yield Button("Read DID", id="btn-readdid", classes="action")
-                yield Button("Watch live PIDs", id="btn-watch", classes="action")
-                yield Button("Readiness", id="btn-readiness", classes="action")
-                yield Button("Freeze frame", id="btn-freeze", classes="action")
-                yield Button("Raw command…", id="btn-raw", classes="action")
+                yield Static("Reads", classes="panel-title")
+                yield Button("Info", id="btn-info", classes="narrow")
+                yield Button("VIN", id="btn-vin", classes="narrow")
+                yield Button("Live PIDs (all supported)", id="btn-live", classes="narrow")
+                yield Button("OBD DTCs (03/07/0A)", id="btn-generic-dtc", classes="narrow")
+                yield Button("Modules (discovery)", id="btn-modules", classes="narrow")
+                yield Button("UDS DTCs (all modules)", id="btn-dtcs", classes="narrow")
+                yield Button("Module info (F186-F191)", id="btn-modinfo", classes="narrow")
+                yield Button("Read DID", id="btn-readdid", classes="narrow")
+                yield Button("Readiness", id="btn-readiness", classes="narrow")
+                yield Button("Freeze frame", id="btn-freeze", classes="narrow")
+                yield Button("Scan (VIN + DTCs + PIDs)", id="btn-scan", classes="narrow")
+                yield Button("Raw command…", id="btn-raw", classes="narrow")
+                yield Static("Live / long-running", classes="panel-title")
+                yield Button("Watch live PIDs", id="btn-watch", classes="narrow")
+                yield Button("Monitor UDS DIDs…", id="btn-monitor", classes="narrow")
+                yield Button("Capture snapshot…", id="btn-capture", classes="narrow")
+                yield Static("Local database / offline", classes="panel-title")
+                yield Button("Module map", id="btn-modmap", classes="narrow")
+                yield Button("Vehicles", id="btn-vehicles", classes="narrow")
+                yield Button("History", id="btn-history", classes="narrow")
+                yield Button("Show stored VIN", id="btn-show", classes="narrow")
+                yield Button("Seed→key brute…", id="btn-seedkey", classes="narrow")
+                yield Static("Guarded writes", classes="panel-title")
+                yield Button("Security access 0x27…", id="btn-security", variant="error",
+                             classes="narrow")
+                yield Button("Write DID 0x2E…", id="btn-write-did", variant="error",
+                             classes="narrow")
+                yield Button("Routine 0x31…", id="btn-routine", variant="error", classes="narrow")
+                yield Static("—", classes="panel-title")
                 yield Button("Stop / cancel", id="btn-stop", variant="warning")
                 yield Button("Clear output", id="btn-clear")
+                yield Button("Help / keys", id="btn-help", classes="narrow")
             with Vertical(id="main"):
                 yield RichLog(
                     id="log", markup=False, wrap=True, min_width=20, max_lines=MAX_LOG_LINES
@@ -771,8 +1365,13 @@ class PacificaTui(App[None]):
             Text("pacifica-obd TUI — press c to connect, then pick an action.", style="bold")
         )
         self._line(
-            "Keys: c connect · p port · i info · m modules · d DTCs · n module info · "
-            "r read DID · w watch · t readiness · f freeze · x raw · s stop",
+            "Keys: c connect · p port · i info · v VIN · l live · g OBD DTCs · m modules · "
+            "d UDS DTCs · r read DID · w watch · o monitor · C capture · x raw · ? help",
+            "dim",
+        )
+        self._line(
+            "Offline (no adapter): M module map · V vehicles · H history · S show · "
+            "b seed→key.  Guarded writes: e security · W write DID · R routine.",
             "dim",
         )
         self._refresh_status()
@@ -863,13 +1462,15 @@ class PacificaTui(App[None]):
         text.append(bus_text)
         text.append("   ")
         text.append(state, style=style)
-        if self._watching:
+        if self._live:
             text.append("  ● live", style="bold magenta")
         self._status_view.update(text)
 
     def _set_busy(self, label: str | None) -> None:
         try:
-            widgets = list(self.query(".action"))
+            # Only the narrow action buttons: Stop must stay clickable, and the
+            # status bar keeps showing what is running.
+            widgets = list(self.query("#sidebar .narrow"))
         except Exception:  # noqa: BLE001 - the DOM is gone during teardown
             return
         for widget in widgets:
@@ -960,15 +1561,21 @@ class PacificaTui(App[None]):
         finally:
             self._lock.release()
 
-    def _guarded(self, label: str, body: Callable[[Elm327], None]) -> None:
-        """Worker entry point: hold the adapter, run `body`, report failures."""
+    def _guarded(
+        self, label: str, body: Callable[[Elm327 | None], None], require_adapter: bool = True
+    ) -> None:
+        """Worker entry point: hold the adapter, run `body`, report failures.
+
+        Offline operations pass ``require_adapter=False`` and ignore the handle;
+        they still run under the same lock so the busy state stays truthful.
+        """
         try:
-            with self._exclusive(label) as elm:
-                if elm is None:
-                    return
+            with self._exclusive(label, require_adapter=require_adapter) as elm:
                 body(elm)
         except _Refused:
             return  # already explained to the user by _exclusive
+        except AdapterError as exc:
+            self._post(self._log_err, f"{label}: {exc}")
         except Elm327Error as exc:
             self._post(self._log_err, f"{label}: {exc}")
         except Exception as exc:  # noqa: BLE001 - never let a driver error kill the UI
@@ -978,17 +1585,23 @@ class PacificaTui(App[None]):
         """Warning line for worker threads (marshalled to the UI thread)."""
         self._post(self._line, "warning: " + message, "yellow")
 
-    def _start(self, label: str, body: Callable[[Elm327], None]) -> None:
+    def _start(
+        self, label: str, body: Callable[[Elm327 | None], None], *, require_adapter: bool = True
+    ) -> None:
         if self._closed:
             return
         self.run_worker(
-            partial(self._guarded, label, body),
+            partial(self._guarded, label, body, require_adapter),
             name=label,
             description=label,
             group="adapter",
             thread=True,
             exit_on_error=False,
         )
+
+    def _start_offline(self, label: str, body: Callable[[], None]) -> None:
+        """Run work that needs no adapter (local DB, plugin files)."""
+        self._start(label, lambda _elm: body(), require_adapter=False)
 
     # -- actions: connection ----------------------------------------------
     def action_connect(self) -> None:
@@ -1109,7 +1722,23 @@ class PacificaTui(App[None]):
     # -- actions: reads ----------------------------------------------------
     def action_info(self) -> None:
         """Adapter identity, protocol, voltage and VIN."""
-        self._start("Info", self._do_info)
+        self._start("Info", partial(self._do_info, self._single_bus()))
+
+    def action_vin(self) -> None:
+        """Read the VIN (mode 09 02)."""
+        self._start("VIN", partial(self._do_vin, self._single_bus()))
+
+    def action_live(self) -> None:
+        """Dump the current value of every supported OBD-II PID."""
+        self._start("Live", partial(self._do_live, self._single_bus()))
+
+    def action_generic_dtc(self) -> None:
+        """Stored/pending/permanent codes via plain OBD-II (modes 03/07/0A)."""
+        self._start("OBD DTCs", partial(self._do_generic_dtc, self._single_bus()))
+
+    def action_scan(self) -> None:
+        """One-shot VIN + stored DTCs + supported-PID count."""
+        self._start("Scan", partial(self._do_scan, self._single_bus()))
 
     def action_modules(self) -> None:
         """Probe a CAN bus for UDS-responding modules."""
@@ -1162,12 +1791,12 @@ class PacificaTui(App[None]):
 
     def action_readiness(self) -> None:
         """Readiness / I-M monitors (mode 01 PID 01)."""
-        bus = self._buses_for_pcm()
+        bus = self._single_bus()
         self._start("Readiness", partial(self._do_readiness, bus))
 
     def action_freeze(self) -> None:
         """Show the freeze-frame snapshot stored behind a DTC (mode 02)."""
-        bus = self._buses_for_pcm()
+        bus = self._single_bus()
         self._start("Freeze frame", partial(self._do_freeze, bus))
 
     def action_raw(self) -> None:
@@ -1225,9 +1854,9 @@ class PacificaTui(App[None]):
 
     def action_watch(self) -> None:
         """Start/stop live PID polling."""
-        if self._watching:
+        if self._live:
             self._cancel.set()
-            self.notify("Stopping the live watch…", markup=False)
+            self.notify("Stopping the live view…", markup=False)
             return
         pids = _parse_pids(self._input("pids"))
         if pids is None:
@@ -1237,7 +1866,454 @@ class PacificaTui(App[None]):
         if interval is None:
             self._log_err("Interval must be a number between 0.2 and 10 seconds.")
             return
-        self._start("Watch", partial(self._do_watch, pids, interval, self._buses_for_pcm()))
+        self._start("Watch", partial(self._do_watch, pids, interval, self._single_bus()))
+
+    def action_monitor(self) -> None:
+        """Start/stop polling UDS DIDs on modules (stored as samples)."""
+        if self._live:
+            self._cancel.set()
+            self.notify("Stopping the monitor…", markup=False)
+            return
+        ok, module = self._module_input(required=False)
+        if not ok:
+            return
+        dids = _parse_dids(self._input("dids"))
+        if dids is None:
+            self._log_err("Monitor DIDs must be 4 hex digits each, e.g. F190,F187.")
+            return
+        interval = _parse_interval(self._input("interval"))
+        if interval is None:
+            self._log_err("Interval must be a number between 0.2 and 10 seconds.")
+            return
+        rng = _parse_range(self._input("range"))
+        if module is None and rng is None:
+            self._log_err("Scan range must look like 700-7FF (hex, 11-bit, start <= end).")
+            return
+        start, end = rng if rng is not None else (0x700, 0x7FF)
+        vin = _parse_vin_field(self._input("vin"))
+        self._start(
+            "Monitor",
+            partial(self._do_monitor, self._single_bus(), module, dids, interval, start, end, vin),
+        )
+
+    def action_capture(self) -> None:
+        """Full snapshot (modules + DTCs + ID block) stored in the local DB."""
+        bus = self._bus()
+        rng = _parse_range(self._input("range"))
+        if rng is None:
+            self._log_err("Scan range must look like 700-7FF (hex, 11-bit, start <= end).")
+            return
+        start, end = rng
+        vin = _parse_vin_field(self._input("vin"))
+        if vin is not None and not looks_like_vin(vin):
+            self._log_warn(f"{vin!r} does not look like a 17-character VIN; tagging anyway.")
+        self._start("Capture", partial(self._do_capture, bus, start, end, vin))
+
+    # -- offline / local database -----------------------------------------
+    def action_module_map(self) -> None:
+        """Known module addresses (built-in profiles + optional ECU database)."""
+        self.push_screen(
+            PromptDialog(
+                "External ECU database path (optional)",
+                # default_db() only builds a Path: no filesystem or SQLite work
+                # happens on the event loop just to show the placeholder.
+                placeholder=str(default_db() or ""),
+                hint="Blank or missing file: the built-in profile map is still shown.",
+            ),
+            self._module_map_path,
+        )
+
+    def _module_map_path(self, path: str | None) -> None:
+        parsed = _parse_path(path) if path else None
+        self._start_offline("Module map", partial(self._do_module_map, parsed))
+
+    def action_vehicles(self) -> None:
+        """Vehicles with stored records (no adapter needed)."""
+        self._start_offline("Vehicles", self._do_vehicles)
+
+    def action_history(self) -> None:
+        """Stored vehicles and recent sessions (no adapter needed)."""
+        self._start_offline("History", self._do_history)
+
+    def action_show(self) -> None:
+        """Everything stored for the Vehicle VIN field (no adapter needed)."""
+        vin = _parse_vin_field(self._input("vin"))
+        if vin is None:
+            self._log_err("Enter the VIN to show in the Vehicle / VIN field.")
+            return
+        self._start_offline("Show", partial(self._do_show, vin))
+
+    def action_seedkey(self) -> None:
+        """Recover a short per-ECU secret from observed seed/key pairs."""
+        self._open_form(
+            FormDialog(
+                "Seed→key recovery",
+                [
+                    Field("pairs", "Seed:key pairs (hex)", placeholder="1234:ABCD,5678:EF01",
+                          hint="Comma-separated observations of the same ECU."),
+                    Field("algorithm", "Algorithm file", placeholder="~/my_algorithm.py",
+                          hint="Python file exposing algorithm(seed, secret) -> key."),
+                    Field("width", "Secret width (bytes)", value="2",
+                          hint=f"1..{MAX_BRUTE_WIDTH}; width 3 takes a few seconds. "
+                               "Use the CLI for width 4 (it can run for hours)."),
+                ],
+                validate=self._validate_seedkey,
+            ),
+            self._seedkey_run,
+        )
+
+    def _validate_seedkey(self, values: dict) -> str | None:
+        pairs = str(values.get("pairs", "")).strip()
+        if not pairs:
+            return "Give at least one SEED:KEY observation."
+        algorithm = _parse_path(str(values.get("algorithm", "")))
+        if algorithm is None:
+            return "Point at a Python file exposing algorithm(seed, secret) -> key."
+        try:
+            width = int(str(values.get("width", "2")).strip() or "2")
+        except ValueError:
+            return "Width must be a number (bytes)."
+        if not 1 <= width <= MAX_BRUTE_WIDTH:
+            return (
+                f"Width must be 1..{MAX_BRUTE_WIDTH} in the TUI. A 4-byte secret is "
+                f"2**32 candidates: run 'pacifica-obd seedkey-brute --width 4' instead."
+            )
+        return None
+
+    def _seedkey_run(self, values: dict | None) -> None:
+        if not values:
+            return
+        self._start_offline(
+            "Seed→key",
+            partial(
+                self._do_seedkey,
+                str(values.get("pairs", "")),
+                _parse_path(str(values.get("algorithm", ""))) or "",
+                int(str(values.get("width", "2")).strip() or "2"),
+            ),
+        )
+
+    # -- guarded writes ----------------------------------------------------
+    def action_security(self) -> None:
+        """UDS 0x27: dump a seed, optionally send a key from a provider file."""
+        self._open_form(
+            FormDialog(
+                "Security access (UDS 0x27)",
+                [
+                    Field("module", "Module request ID", placeholder="7E0",
+                          hint="The ECU must answer an extended session or we refuse."),
+                    Field("level", "Security level (odd)", value="1"),
+                    Field("provider", "Key provider file (optional)",
+                          placeholder="~/my_provider.py",
+                          hint="Python file exposing key_for(seed, **ctx) -> int."),
+                    Field("unlock", "Send the key (unlock)", value="0", kind="switch"),
+                ],
+                hint="Dumping a seed is a read. Sending a key is a write and will ask again.",
+                validate=self._validate_security,
+                submit_label="Continue",
+            ),
+            self._security_review,
+        )
+
+    def _validate_security(self, values: dict) -> str | None:
+        if _parse_module_id(str(values.get("module", ""))) is None:
+            return "Module must be an 11-bit hex request ID (e.g. 7E0)."
+        try:
+            level = int(str(values.get("level", "1")).strip() or "1")
+        except ValueError:
+            return "Level must be a number."
+        if not 1 <= level <= 0x7D or level % 2 == 0:
+            return "Level must be an odd number in 1..125 (0x7D)."
+        if bool(values.get("unlock")) and _parse_path(str(values.get("provider", ""))) is None:
+            return "Unlocking needs a key provider file."
+        return None
+
+    def _security_review(self, values: dict | None) -> None:
+        if not values:
+            return
+        # The bus is captured here, on the UI thread, so the confirmation and the
+        # request it describes cannot disagree.
+        bus = self._single_bus()
+        module = _parse_module_id(str(values.get("module", ""))) or ""
+        level = int(str(values.get("level", "1")).strip() or "1")
+        provider = _parse_path(str(values.get("provider", "")))
+        if not bool(values.get("unlock")):
+            self._start("Security", partial(self._do_security_seed, bus, module, level))
+            return
+        self._start(
+            "Security", partial(self._do_security_key_request, bus, module, level, provider)
+        )
+
+    def _do_security_seed(self, bus: str, module: str, level: int, elm: Elm327) -> None:
+        """Read the security seed (0x27) without sending any key."""
+        wait = _probe_wait()
+        self._post(
+            self._section,
+            f"Security access 0x27 level {level:02X} — {module} on {_bus_label(bus)}",
+        )
+        rid, resp = _addressed_session(elm, bus, module, wait)
+        result = security_access(elm, level, seedkey=None, wait=wait, expect_header=resp)
+        self._post(
+            self._write_table,
+            "Security seed",
+            ["Item", "Value"],
+            [
+                ("Module", rid),
+                ("Bus", _bus_label(bus)),
+                ("Level", "0x%02X" % level),
+                ("Status", result["status"]),
+                ("Seed", result.get("seed") or "—"),
+                ("Raw", result.get("raw") or "—"),
+            ],
+        )
+        if result.get("unlocked"):
+            self._post(self._line, "Already unlocked (the ECU returned a zero seed).", "green")
+        elif not result.get("seed"):
+            self._post(self._line, "No usable seed; nothing was sent.", "yellow")
+        else:
+            self._post(
+                self._line,
+                "Seed dumped only; no key provider was used, so the ECU stays locked.",
+                "dim",
+            )
+
+    def _do_security_key_request(
+        self, bus: str, module: str, level: int, provider_path: str | None, elm: Elm327
+    ) -> None:
+        """Read the seed and compute the key, then hand the exact request to the UI."""
+        wait = _probe_wait()
+        self._post(
+            self._section,
+            f"Security access 0x27 level {level:02X} — {module} on {_bus_label(bus)}",
+        )
+        seedkey = None
+        if provider_path is not None:
+            try:
+                seedkey = load_provider(provider_path)
+            except SeedKeyError as exc:
+                self._post(self._log_err, str(exc))
+                return
+        rid, resp = _addressed_session(elm, bus, module, wait)
+        result = security_access(elm, level, seedkey=None, wait=wait, expect_header=resp)
+        seed = result.get("seed")
+        self._post(
+            self._write_table,
+            "Security seed",
+            ["Item", "Value"],
+            [
+                ("Module", rid),
+                ("Bus", _bus_label(bus)),
+                ("Level", "0x%02X" % level),
+                ("Status", result["status"]),
+                ("Seed", seed or "—"),
+            ],
+        )
+        if result.get("unlocked"):
+            self._post(self._line, "Already unlocked (the ECU returned a zero seed).", "green")
+            return
+        if not seed or len(seed) % 2 or result["status"] not in ("ok", "no_key_provider"):
+            # "no_key_provider" is normal here: the seed was requested without one.
+            self._post(
+                self._line,
+                f"No usable seed ({result['status']}); the key was not sent.",
+                "yellow",
+            )
+            return
+        if seedkey is None:
+            return
+        try:
+            key = seedkey(int(seed, 16))
+        except Exception as exc:  # noqa: BLE001 - a broken provider must never send a key
+            self._post(self._log_err, f"Key provider failed: {exc}")
+            return
+        width = len(seed)
+        if type(key) is not int or key < 0 or key >= (1 << (4 * width)):
+            self._post(
+                self._log_err, "The provider returned a key of the wrong width; nothing sent."
+            )
+            return
+        self._post(self._security_confirm_key, bus, module, level, seed, "%0*X" % (width, key))
+
+    def _security_confirm_key(
+        self, bus: str, module: str, level: int, seed: str, key_hex: str
+    ) -> None:
+        """Show the exact key request (UI thread) and ask before sending it."""
+        request = "27%02X%s" % (level + 1, key_hex)
+        self._write(_write_warning())
+        self._line(
+            f"Request under review: 0x27 level {level + 1:02X} key {key_hex} for seed {seed} "
+            f"on module {module} ({_bus_label(bus)}) — wire: {request}",
+            "yellow",
+        )
+        self._open_confirm(
+            f"Send {request} to module {module} on {_bus_label(bus)}?",
+            "A wrong key can lock the ECU; the Security Gateway usually blocks writes on "
+            "2018+ vehicles. The seed is read again first, and the key is only sent if it "
+            "is unchanged.",
+            lambda yes: self._start(
+                "Security",
+                partial(self._do_security_send_key, bus, module, level, seed, key_hex),
+            )
+            if yes
+            else self._line("Security unlock cancelled; the ECU stays locked.", "yellow"),
+        )
+
+    def _do_security_send_key(
+        self, bus: str, module: str, level: int, seed: str, key_hex: str, elm: Elm327
+    ) -> None:
+        """Send the reviewed key — only if the ECU still presents the same seed."""
+        wait = _probe_wait()
+        self._post(
+            self._section,
+            f"Security unlock 0x27 level {level:02X} — {module} on {_bus_label(bus)}",
+        )
+
+        def reviewed_key(current_seed: int) -> int | None:
+            # Send the key that was shown to the user, and only for the seed they
+            # saw: None makes the library stop without sending anything, so a
+            # changed seed invalidates the confirmation instead of sending a key.
+            if "%0*X" % (len(seed), current_seed) != seed:
+                return None
+            return int(key_hex, 16)
+
+        rid, resp = _addressed_session(elm, bus, module, wait)
+        result = security_access(elm, level, seedkey=reviewed_key, wait=wait, expect_header=resp)
+        self._post(
+            self._write_table,
+            "Security unlock result",
+            ["Item", "Value"],
+            [
+                ("Module", rid),
+                ("Level", "0x%02X" % level),
+                ("Status", result["status"]),
+                ("Seed now", result.get("seed") or "—"),
+                ("Unlocked", "yes" if result.get("unlocked") else "no"),
+                ("Raw", result.get("raw") or "—"),
+            ],
+        )
+        if result["unlocked"]:
+            self._post(self._line, "Security access granted.", "bold green")
+        elif result["status"] == "no_key_provider":
+            self._post(
+                self._line,
+                "The seed changed since the review, so no key was sent; run it again.",
+                "yellow",
+            )
+
+    def action_write_did(self) -> None:
+        """UDS 0x2E WriteDataByIdentifier (guarded)."""
+        self._open_form(
+            FormDialog(
+                "Write data identifier (UDS 0x2E)",
+                [
+                    Field("module", "Module request ID", placeholder="7E0",
+                          hint="The ECU must answer an extended session or we refuse."),
+                    Field("did", "DID (4 hex)", placeholder="F190"),
+                    Field("data", "Data (even-length hex)", placeholder="01"),
+                ],
+                hint="Writes module configuration. Irreversible from this tool.",
+                validate=self._validate_write_did,
+                submit_label="Review",
+            ),
+            self._write_did_confirm,
+        )
+
+    def _validate_write_did(self, values: dict) -> str | None:
+        if _parse_module_id(str(values.get("module", ""))) is None:
+            return "Module must be an 11-bit hex request ID (e.g. 7E0)."
+        if _parse_dids(str(values.get("did", ""))) is None:
+            return "DID must be 4 hex digits, e.g. F190."
+        if _parse_hex_payload(str(values.get("data", ""))) is None:
+            return "Data must be non-empty, even-length hex, e.g. 01."
+        return None
+
+    def _write_did_confirm(self, values: dict | None) -> None:
+        if not values:
+            return
+        bus = self._single_bus()
+        module = _parse_module_id(str(values.get("module", ""))) or ""
+        did = _parse_dids(str(values.get("did", ""))) or [0]
+        data = _parse_hex_payload(str(values.get("data", ""))) or ""
+        request = f"2E{did[0]:04X}{data}"
+        self._warn_write_preview(
+            f"0x2E {did[0]:04X} = {data} on module {module} ({_bus_label(bus)})", request
+        )
+        self._open_confirm(
+            f"Send {request} to module {module} on {_bus_label(bus)}?",
+            "A write can change module configuration. The Security Gateway will usually "
+            "block it without a bypass, and this tool cannot undo it.",
+            lambda yes: self._start(
+                "Write DID", partial(self._do_write_did, bus, module, did[0], data)
+            )
+            if yes
+            else self._line("Write DID cancelled.", "yellow"),
+        )
+
+    def action_routine(self) -> None:
+        """UDS 0x31 RoutineControl (guarded)."""
+        self._open_form(
+            FormDialog(
+                "Routine control (UDS 0x31)",
+                [
+                    Field("module", "Module request ID", placeholder="7E0",
+                          hint="The ECU must answer an extended session or we refuse."),
+                    Field("rid", "Routine ID (4 hex)", placeholder="0203"),
+                    Field("sub", "Sub-function", value="1", kind="select",
+                          options=(("1 start", "1"), ("2 stop", "2"), ("3 request results", "3"))),
+                    Field("data", "Data (optional hex)", placeholder="",
+                          hint="Blank is fine; some routines take no data."),
+                ],
+                hint="Routines can activate actuators or calibrations.",
+                validate=self._validate_routine,
+                submit_label="Review",
+            ),
+            self._routine_confirm,
+        )
+
+    def _validate_routine(self, values: dict) -> str | None:
+        if _parse_module_id(str(values.get("module", ""))) is None:
+            return "Module must be an 11-bit hex request ID (e.g. 7E0)."
+        if _parse_dids(str(values.get("rid", ""))) is None:
+            return "Routine ID must be 4 hex digits, e.g. 0203."
+        if _parse_hex_payload(str(values.get("data", "")), allow_empty=True) is None:
+            return "Data must be even-length hex, or blank."
+        return None
+
+    def _routine_confirm(self, values: dict | None) -> None:
+        if not values:
+            return
+        bus = self._single_bus()
+        module = _parse_module_id(str(values.get("module", ""))) or ""
+        rid = (_parse_dids(str(values.get("rid", ""))) or [0])[0]
+        sub = int(str(values.get("sub", "1")))
+        data = _parse_hex_payload(str(values.get("data", "")), allow_empty=True) or ""
+        request = f"31{sub:02X}{rid:04X}{data}"
+        self._warn_write_preview(
+            f"0x31 sub {sub} routine {rid:04X} data '{data}' on module {module} "
+            f"({_bus_label(bus)})",
+            request,
+        )
+        self._open_confirm(
+            f"Send {request} to module {module} on {_bus_label(bus)}?",
+            "A routine can activate actuators or change calibrations. The Security Gateway "
+            "will usually block it without a bypass, and this tool cannot undo it.",
+            lambda yes: self._start(
+                "Routine", partial(self._do_routine, bus, module, rid, sub, data)
+            )
+            if yes
+            else self._line("Routine cancelled.", "yellow"),
+        )
+
+    def _warn_write_preview(self, description: str, request: str) -> None:
+        """Log the CLI's write warning plus the exact request under review."""
+        self._write(_write_warning())
+        self._line(f"Request under review: {description} — wire: {request}", "yellow")
+
+    def action_help(self) -> None:
+        """Show every action and key."""
+        if isinstance(self.screen, HelpScreen):
+            return
+        self.push_screen(HelpScreen())
 
     def action_stop(self) -> None:
         """Ask the running operation to stop after its current request."""
@@ -1258,10 +2334,26 @@ class PacificaTui(App[None]):
     def _bus(self) -> str:
         return str(self.query_one("#bus", Select).value)
 
-    def _buses_for_pcm(self) -> str:
-        """Readiness/freeze frame are mode 01/02 reads aimed at the PCM (CAN-C)."""
+    def _single_bus(self) -> str:
+        """Bus for single-ECU work; "both" collapses to CAN-C (the PCM bus)."""
         bus = self._bus()
         return "can-c" if bus == "both" else bus
+
+    def _open_form(
+        self, dialog: FormDialog, callback: Callable[[dict | None], None]
+    ) -> None:
+        """Push a form once (a stray second key press must not stack dialogs)."""
+        if isinstance(self.screen, FormDialog):
+            return
+        self.push_screen(dialog, callback)
+
+    def _open_confirm(
+        self, question: str, detail: str, callback: Callable[[bool], None]
+    ) -> None:
+        """Push a confirmation once."""
+        if isinstance(self.screen, ConfirmDialog):
+            return
+        self.push_screen(ConfirmDialog(question, detail), callback)
 
     def _module_input(self, *, required: bool) -> tuple[bool, str | None]:
         """Validate the Module field.
@@ -1291,16 +2383,31 @@ class PacificaTui(App[None]):
             "btn-port": self.action_ports,
             "btn-disconnect": self.action_disconnect,
             "btn-info": self.action_info,
+            "btn-vin": self.action_vin,
+            "btn-live": self.action_live,
+            "btn-generic-dtc": self.action_generic_dtc,
             "btn-modules": self.action_modules,
             "btn-dtcs": self.action_dtcs,
             "btn-modinfo": self.action_module_info,
             "btn-readdid": self.action_read_did,
-            "btn-watch": self.action_watch,
             "btn-readiness": self.action_readiness,
             "btn-freeze": self.action_freeze,
+            "btn-scan": self.action_scan,
             "btn-raw": self.action_raw,
+            "btn-watch": self.action_watch,
+            "btn-monitor": self.action_monitor,
+            "btn-capture": self.action_capture,
+            "btn-modmap": self.action_module_map,
+            "btn-vehicles": self.action_vehicles,
+            "btn-history": self.action_history,
+            "btn-show": self.action_show,
+            "btn-seedkey": self.action_seedkey,
+            "btn-security": self.action_security,
+            "btn-write-did": self.action_write_did,
+            "btn-routine": self.action_routine,
             "btn-stop": self.action_stop,
             "btn-clear": self.action_clear_log,
+            "btn-help": self.action_help,
         }.get(event.button.id or "")
         if handler is not None:
             handler()
@@ -1313,19 +2420,14 @@ class PacificaTui(App[None]):
     # operation bodies — these run on a worker thread with the adapter lock
     # and must only touch the UI through self._post(...)
     # ===================================================================== #
-    def _do_info(self, elm: Elm327) -> None:
-        bus = self._buses_for_pcm()
+    def _do_info(self, bus: str, elm: Elm327) -> None:
         self._post(self._section, "Adapter / vehicle info")
         _prepare_bus(elm, bus, self._warn)
         wait = _probe_wait()
         adapter = (elm.cmd("ATI") or [""])[0].strip()
         voltage = _parse_voltage(elm.cmd("ATRV"))
         protocol = _protocol_label(current_protocol(elm))
-        vin = None
-        elm.cmd("ATSH 7E0")
-        payload = _payload_after(elm.cmd("0902", wait=wait), "4902")
-        if payload is not None:
-            vin = _decode_vin("4902" + payload.hex().upper())
+        vin = _read_vin(elm, wait)
         rows = [
             ("Adapter", adapter or self._version or "—"),
             ("Protocol now", protocol),
@@ -1333,6 +2435,122 @@ class PacificaTui(App[None]):
             ("VIN (09 02)", vin or "not reported"),
         ]
         self._post(self._write_table, "Connection info", ["Item", "Value"], rows)
+
+    def _do_vin(self, bus: str, elm: Elm327) -> None:
+        self._post(self._section, f"VIN — {_bus_label(bus)}")
+        _prepare_bus(elm, bus, self._warn)
+        wait = _probe_wait()
+        vin = _read_vin(elm, wait)
+        source = "mode 09 02"
+        if not looks_like_vin(vin):
+            self._post(
+                self._line,
+                "Mode 09 02 gave no usable VIN; trying UDS F190 on the known modules…",
+                "dim",
+            )
+            uds_vin = _read_uds_vin(elm, wait, self._cancel, self._warn)
+            if uds_vin:
+                vin, source = uds_vin, "UDS F190"
+        if vin is None:
+            self._post(
+                self._line,
+                "No VIN returned (mode 09 02 unserved and no UDS F190 reply).",
+                "yellow",
+            )
+            return
+        self._post(self._write, Text(f"VIN: {vin}  ({source})", style="bold green"))
+        self._post(
+            self._line,
+            f"{len(vin)} characters; looks like a VIN: {looks_like_vin(vin)}",
+            "dim",
+        )
+
+    def _do_generic_dtc(self, bus: str, elm: Elm327) -> None:
+        """Stored/pending/permanent codes with plain OBD-II services."""
+        wait = _probe_wait()
+        self._post(self._section, f"Generic OBD-II DTCs — {_bus_label(bus)}")
+        _prepare_bus(elm, bus, self._warn)
+        rows: list[tuple[str, ...]] = []
+        total = 0
+        for mode, label in _GENERIC_DTC_MODES:
+            if self._cancel.is_set():
+                self._post(self._line, "Cancelled.", "yellow")
+                break
+            payload = _payload_after(elm.cmd(mode, wait=wait), "%02X" % (int(mode, 16) + 0x40))
+            if payload is None:
+                rows.append((label, "—", "no response"))
+                continue
+            codes = _decode_generic_dtcs(payload)
+            if not codes:
+                rows.append((label, "—", "none"))
+                continue
+            for code in codes:
+                total += 1
+                rows.append((label, code, _dtc_description(code)))
+        self._post(
+            self._write_table,
+            "Generic DTCs (modes 03/07/0A)",
+            ["Service", "Code", "Description"],
+            rows,
+        )
+        self._post(self._line, f"{total} code(s) reported.", "bold red" if total else "green")
+
+    def _do_live(self, bus: str, elm: Elm327) -> None:
+        """Dump the current value of every PID the vehicle says it supports."""
+        wait = _probe_wait()
+        self._post(self._section, f"Live values — all supported PIDs ({_bus_label(bus)})")
+        _prepare_bus(elm, bus, self._warn)
+        supported = _supported_pids(elm, wait, self._cancel)
+        self._post(self._line, f"{len(supported)} supported PID(s); querying…", "dim")
+        rows: list[tuple[str, ...]] = []
+        voltage = _parse_voltage(elm.cmd("ATRV"))
+        if voltage is not None:
+            rows.append(("ELM_VOLTAGE", "ATRV", f"{voltage:.1f}", "V"))
+        for pid in supported:
+            if self._cancel.is_set():
+                self._post(self._line, "Cancelled.", "yellow")
+                break
+            request = "01%02X" % pid
+            payload = _payload_after(elm.cmd(request, wait=wait), "41%02X" % pid)
+            known = _PID_BY_CODE.get(pid)
+            if payload is None:
+                rows.append(("%02X" % pid, request, "no response", ""))
+                continue
+            if known is None:
+                rows.append(("%02X" % pid, request, payload.hex().upper(), ""))
+                continue
+            name, needed, decoder, unit = known
+            if len(payload) < needed:
+                rows.append((name, request, payload.hex().upper(), unit))
+                continue
+            try:
+                rows.append((name, request, f"{decoder(payload):g}", unit))
+            except (IndexError, ValueError, ZeroDivisionError):
+                rows.append((name, request, payload.hex().upper(), unit))
+        self._post(self._write_table, "Live PID dump", ["PID", "Request", "Value", "Unit"], rows)
+
+    def _do_scan(self, bus: str, elm: Elm327) -> None:
+        """One-shot VIN + stored DTCs + supported-PID count (the CLI's scan)."""
+        wait = _probe_wait()
+        self._post(self._section, f"Scan — {_bus_label(bus)}")
+        _prepare_bus(elm, bus, self._warn)
+        vin = _read_vin(elm, wait)
+        payload = _payload_after(elm.cmd("03", wait=wait), "43")
+        codes = _decode_generic_dtcs(payload) if payload is not None else []
+        supported = _supported_pids(elm, wait, self._cancel)
+        rows = [
+            ("VIN", vin or "—"),
+            ("Stored DTCs (mode 03)", str(len(codes))),
+            ("Supported OBD-II PIDs", str(len(supported))),
+        ]
+        self._post(self._write_table, "Scan summary", ["Item", "Value"], rows)
+        if codes:
+            self._post(
+                self._write_table,
+                "Stored codes",
+                ["Code", "Description"],
+                [(code, _dtc_description(code)) for code in codes],
+            )
 
     def _do_modules(self, bus: str, start: int, end: int, identify: bool, elm: Elm327) -> None:
         wait = _probe_wait()
@@ -1344,7 +2562,9 @@ class PacificaTui(App[None]):
                 break
             _prepare_bus(elm, name, self._warn)
             self._post(self._line, f"Probing {_BUS_LABELS[name]} {start:03X}-{end:03X}…", "dim")
-            for entry in _probe_modules(elm, start, end, "1003", wait, self._cancel, self._warn):
+            for entry in _probe_modules_multi(
+                    elm, start, end, ("1003", "22F190"), wait, self._cancel, self._warn
+                ):
                 if self._cancel.is_set():
                     self._post(self._line, "Cancelled.", "yellow")
                     break
@@ -1352,7 +2572,7 @@ class PacificaTui(App[None]):
                 self._post(self._line, f"  {rid} → {response_id} ({entry['kind']})", "dim")
                 extra = ""
                 if identify and entry["kind"] != "other":
-                    elm.cmd("ATSH " + rid)
+                    _address(elm, rid, self._warn)
                     vin_record = _read_did(elm, 0xF190, wait, expect_header=response_id)
                     part_record = _read_did(elm, 0xF187, wait, expect_header=response_id)
                     extra = _did_ascii(vin_record) or _did_ascii(part_record) or ""
@@ -1381,8 +2601,9 @@ class PacificaTui(App[None]):
             else:
                 self._post(self._line, f"Probing {_BUS_LABELS[name]} {start:03X}-{end:03X}…", "dim")
                 targets = []
-                for entry in _probe_modules(
-                    elm, start, end, "1003", wait, self._cancel, self._warn
+                for entry in _probe_modules_multi(
+                    elm, start, end, ("1003", "22F190"), wait, self._cancel,
+                    self._warn,
                 ):
                     if self._cancel.is_set():
                         break
@@ -1396,11 +2617,14 @@ class PacificaTui(App[None]):
                 rid = target["request_id"]
                 expect = target["expect"]
                 modules += 1
-                if not _acknowledged(elm.cmd("ATSH " + rid)):
+                if not _address(elm, rid, self._warn):
                     incomplete += 1
                     rows.append((name, rid, "—", "header rejected"))
                     continue
-                elm.cmd("1003", wait=wait)  # extended session, as in the CLI
+                learned = _enter_session(elm, rid, wait)  # extended session, as in the CLI
+                # Prefer the independent profile mapping: a stray reply to the
+                # session request must not decide who this module is.
+                expect = expect or _known_response_id(rid) or learned
                 header, uds = _parse_uds_frame(elm.cmd("1902FF", wait=wait))
                 if header is None or uds is None:
                     incomplete += 1
@@ -1463,8 +2687,9 @@ class PacificaTui(App[None]):
                 request_ids: list[tuple[str, str | None]] = [(module, None)]
             else:
                 request_ids = []
-                for entry in _probe_modules(
-                    elm, start, end, "1003", wait, self._cancel, self._warn
+                for entry in _probe_modules_multi(
+                    elm, start, end, ("1003", "22F190"), wait, self._cancel,
+                    self._warn,
                 ):
                     if self._cancel.is_set():
                         break
@@ -1473,24 +2698,18 @@ class PacificaTui(App[None]):
             for rid, probed_from in request_ids:
                 if self._cancel.is_set():
                     break
-                # Drop a filter left over from the previous module, and make sure
-                # the adapter really did acknowledge the new header/filter: a
-                # rejected ATCRA/ATSH silently returns another module's data.
-                if not _acknowledged(elm.cmd("ATCRA")):
-                    self._warn("'ATCRA' was not acknowledged; a stale ECU filter may mask modules")
-                if not _acknowledged(elm.cmd("ATSH " + rid)):
-                    self._warn(f"'ATSH {rid}' was not acknowledged; skipping this module")
+                if not _address(elm, rid, self._warn):
                     continue
                 learned = _enter_session(elm, rid, wait)
+                # The probe/table response ID is the independent expectation; what
+                # the session claimed is only a fallback, so an unrelated ECU's
+                # reply cannot be displayed under this module.
+                expect = probed_from or _known_response_id(rid) or learned
                 self._post(
                     self._line, f"{rid}: {'in session' if learned else 'no response'}", "dim"
                 )
                 if probed_from and learned and learned != probed_from:
-                    # The probe answered from `probed_from`; if the session
-                    # answered from somewhere else, trust the earlier reply so a
-                    # wrong ECU cannot masquerade as this module.
                     self._warn(f"{rid}: session answered from {learned}, expected {probed_from}")
-                expect = probed_from or learned
                 first = True
                 for did in _INFO_DIDS:
                     if self._cancel.is_set():
@@ -1522,10 +2741,12 @@ class PacificaTui(App[None]):
                 self._post(self._line, "Cancelled.", "yellow")
                 break
             _prepare_bus(elm, name, self._warn)
-            if not _acknowledged(elm.cmd("ATSH " + module)):
-                self._warn(f"'ATSH {module}' was not acknowledged; skipped on this bus")
+            if not _address(elm, module, self._warn):
                 continue
-            expect = _enter_session(elm, module, wait)
+            learned = _enter_session(elm, module, wait)
+            # The profile mapping is independent knowledge and outranks a stray
+            # reply to the session request.
+            expect = _known_response_id(module) or learned
             for did in dids:
                 if self._cancel.is_set():
                     break
@@ -1613,6 +2834,9 @@ class PacificaTui(App[None]):
 
     def _do_raw(self, command: str, elm: Elm327) -> None:
         self._post(self._section, f"Raw command — {command}")
+        # A leftover manual flow-control header from a UDS read would silently
+        # change what a raw request does, so start from automatic flow control.
+        reset_flow_control(elm)
         lines = elm.cmd(command, wait=_probe_wait())
         # Track raw-CAN framing from what the adapter actually did: only an
         # acknowledged ATCAF1 restores auto-formatting, and a rejected or silent
@@ -1635,7 +2859,12 @@ class PacificaTui(App[None]):
 
     def _do_watch(self, pids: list[str], interval: float, bus: str, elm: Elm327) -> None:
         wait = _probe_wait()
-        self._post(self._watch_started, pids)
+        self._post(
+            self._live_start,
+            "Watch",
+            [("PID", "pid"), ("Value", "value"), ("Unit", "unit")],
+            {pid: (pid, "…", "") for pid in pids},
+        )
         self._post(
             self._line,
             f"Polling {', '.join(pids)} every {interval:g}s on {_BUS_LABELS[bus]} — "
@@ -1646,24 +2875,25 @@ class PacificaTui(App[None]):
             _prepare_bus(elm, bus, self._warn)
             while not self._cancel.is_set() and not self._closed:
                 started = time.monotonic()
-                values: dict[str, tuple[str, str]] = {}
+                values: dict[str, dict[str, str]] = {}
                 for pid in pids:
                     if self._cancel.is_set() or self._closed:
                         break
                     if pid == _VOLTAGE_KEY:
                         volts = _parse_voltage(elm.cmd("ATRV"))
-                        values[pid] = (f"{volts:.1f}" if volts is not None else "—", "V")
+                        values[pid] = {"value": f"{volts:.1f}" if volts is not None else "—"}
                         continue
-                    request, needed, decoder, unit = _PIDS[pid]
-                    payload = _payload_after(elm.cmd(request, wait=wait), "41" + request[2:])
+                    code, needed, decoder, unit = _PIDS[pid]
+                    request = "01%02X" % code
+                    payload = _payload_after(elm.cmd(request, wait=wait), "41%02X" % code)
                     if payload is None or len(payload) < needed:
-                        values[pid] = ("—", unit)
+                        values[pid] = {"value": "—", "unit": unit}
                         continue
                     try:
-                        values[pid] = (f"{decoder(payload):g}", unit)
+                        values[pid] = {"value": f"{decoder(payload):g}", "unit": unit}
                     except (IndexError, ValueError, ZeroDivisionError):
-                        values[pid] = ("err", unit)
-                self._post(self._watch_sample, values)
+                        values[pid] = {"value": "err", "unit": unit}
+                self._post(self._live_sample, values)
                 deadline = started + interval
                 while (
                     not self._cancel.is_set()
@@ -1672,38 +2902,615 @@ class PacificaTui(App[None]):
                 ):
                     time.sleep(0.05)  # keep Stop responsive
         finally:
-            self._post(self._watch_finished)
+            self._post(self._live_finished, "Watch")
 
-    # -- live-watch UI callbacks (UI thread) -------------------------------
-    def _watch_started(self, pids: list[str]) -> None:
-        self._watching = True
+    def _do_monitor(
+        self,
+        bus: str,
+        module: str | None,
+        dids: list[int],
+        interval: float,
+        start: int,
+        end: int,
+        vin: str | None,
+        elm: Elm327,
+    ) -> None:
+        """Poll UDS DIDs on one or many modules, storing every sample."""
+        wait = _probe_wait()
+        store = _open_writable_store()
+        session = (
+            store.start_session("monitor", {"bus": bus, "dids": len(dids)}, self._port)
+            if store is not None
+            else None
+        )
+        self._post(self._section, f"Monitor UDS DIDs — {_bus_label(bus)}")
+        if store is None:
+            self._post(
+                self._line,
+                "Local logging is off/unavailable: samples will not be stored.",
+                "yellow",
+            )
+        status = "ok"
+        try:
+            _prepare_bus(elm, bus, self._warn)
+            if module is not None:
+                # An explicit module still gets its independently known response
+                # ID where the profile tables have one, so a stray reply from
+                # another ECU cannot be stored under this module.
+                pairs = [(module, _known_response_id(module))]
+            else:
+                self._post(self._line, f"Probing {_bus_label(bus)} {start:03X}-{end:03X}…", "dim")
+                pairs = [
+                    (entry["request_id"], entry["response_id"])
+                    for entry in _probe_modules_multi(
+                        elm, start, end, ("1003", "22F190"), wait, self._cancel,
+                        self._warn,
+                    )
+                ]
+            if not pairs:
+                self._post(self._line, "No modules responded.", "yellow")
+                return
+            rows = {
+                f"{rid}:{did:04X}": (rid, "%04X" % did, "…") for rid, _ in pairs for did in dids
+            }
+            self._post(
+                self._live_start,
+                "Monitor",
+                [("Module", "module"), ("DID", "did"), ("Value", "value")],
+                rows,
+            )
+            self._post(
+                self._line,
+                f"Polling {len(pairs)} module(s) x {len(dids)} DID(s) every {interval:g}s — "
+                "press o or Stop to end.",
+                "dim",
+            )
+            while not self._cancel.is_set() and not self._closed:
+                started = time.monotonic()
+                values: dict[str, dict[str, str]] = {}
+                for rid, probed_from in pairs:
+                    if self._cancel.is_set() or self._closed:
+                        break
+                    if not _address(elm, rid, self._warn):
+                        for did in dids:
+                            values[f"{rid}:{did:04X}"] = {"value": "header rejected"}
+                        continue
+                    learned = _enter_session(elm, rid, wait)  # sessions expire
+                    expect = probed_from or _known_response_id(rid) or learned
+                    if expect is None:
+                        # Without a known responder we cannot attribute an answer.
+                        for did in dids:
+                            values[f"{rid}:{did:04X}"] = {"value": "no session"}
+                        continue
+                    for did in dids:
+                        if self._cancel.is_set() or self._closed:
+                            break
+                        record = _read_did(elm, did, wait, expect_header=expect)
+                        shown = record.get("hex") or _did_value(record)
+                        values[f"{rid}:{did:04X}"] = {"value": shown}
+                        if store is not None:
+                            number = None
+                            data_hex = record.get("hex")
+                            if record["status"] == "ok" and data_hex and len(data_hex) <= 4:
+                                try:
+                                    number = int(data_hex, 16)
+                                except ValueError:
+                                    number = None
+                            store.add_sample(
+                                session, vin, bus, rid, record["did"], record.get("name"), number,
+                                record.get("ascii") or record.get("hex"), None, record["status"],
+                                record.get("raw"),
+                            )
+                self._post(self._live_sample, values)
+                deadline = started + interval
+                while (
+                    not self._cancel.is_set()
+                    and not self._closed
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.05)
+        except Exception:
+            status = "error"
+            raise
+        finally:
+            if status == "ok" and self._cancel.is_set():
+                # Discovery/probing can return early on cancel; without this the
+                # session would be recorded as a clean run.
+                status = "cancelled"
+            self._post(self._live_finished, "Monitor")
+            if store is not None:
+                if vin:
+                    store.upsert_vehicle(vin, year=year_from_vin(vin))
+                store.finish_session(session, status, vin)
+                self._post(
+                    self._line, f"Samples stored in {store.db_file} ({status}).", "dim"
+                )
+                store.close()
+
+    # -- operation bodies: capture, offline views, guarded writes ----------
+    def _do_capture(self, bus: str, start: int, end: int, vin: str | None, elm: Elm327) -> None:
+        """Full snapshot: module discovery + DTCs + ID block, stored locally."""
+        wait = _probe_wait()
+        store = _open_writable_store()
+        session = (
+            store.start_session("capture", {"bus": bus, "start": start, "end": end}, self._port)
+            if store is not None
+            else None
+        )
+        self._post(self._section, f"Capture — {_bus_label(bus)}")
+        if store is None:
+            self._post(
+                self._line, "Local logging is off/unavailable: nothing will be stored.", "yellow"
+            )
+        modules = dtc_count = readings = 0
+        discovered = False
+        status = "ok"
+        try:
+            for name in _buses_for(bus):
+                if self._cancel.is_set():
+                    self._post(self._line, "Cancelled.", "yellow")
+                    break
+                _prepare_bus(elm, name, self._warn)
+                self._post(
+                    self._line, f"Capturing {_BUS_LABELS[name]} {start:03X}-{end:03X}…", "dim"
+                )
+                for entry in _probe_modules_multi(
+                    elm, start, end, ("1003", "22F190"), wait, self._cancel,
+                    self._warn,
+                ):
+                    if self._cancel.is_set():
+                        break
+                    rid = entry["request_id"]
+                    expect = entry["response_id"]
+                    modules += 1
+                    if not _address(elm, rid, self._warn):
+                        continue
+                    _enter_session(elm, rid, wait)  # enter extended session
+                    header, uds = _parse_uds_frame(elm.cmd("1902FF", wait=wait))
+                    dtcs: list[dict] = []
+                    if header is None or uds is None:
+                        dtc_status = "no_response"
+                    elif header != expect:
+                        dtc_status = f"wrong responder ({header})"
+                    else:
+                        dtc_status = _classify_dtc_response(uds)
+                        if dtc_status == "ok":
+                            dtcs = _parse_dtcs(uds)
+                    dtc_count += len(dtcs)
+                    if store is not None:
+                        store.add_dtcs(session, vin, name, rid, dtcs, uds)
+                        # Record how the read went, so an unavailable module is
+                        # not stored as a clean "no DTCs" module.
+                        store.event(
+                            session, "dtc-read", rid,
+                            {"status": dtc_status, "count": len(dtcs)},
+                        )
+                    module_vin = None
+                    part = None
+                    for did in _INFO_DIDS:
+                        if self._cancel.is_set():
+                            break
+                        record = _read_did(elm, did, wait, expect_header=expect)
+                        readings += 1
+                        if (
+                            did == 0xF190
+                            and record["status"] == "ok"
+                            and looks_like_vin(record.get("ascii"))
+                        ):
+                            module_vin = record["ascii"]
+                            if vin is None:
+                                vin = module_vin
+                                discovered = True
+                                if store is not None:
+                                    store.upsert_vehicle(vin, year=year_from_vin(vin))
+                                    store.backfill_vin(session, vin)
+                            elif module_vin != vin:
+                                self._post(
+                                    self._line,
+                                    f"VIN mismatch: {rid} reports {module_vin}, keeping {vin}.",
+                                    "yellow",
+                                )
+                        elif did == 0xF187 and record["status"] == "ok":
+                            part = record.get("ascii") or record.get("hex")
+                        if store is not None:
+                            store.add_reading(
+                                session, vin, name, rid, record["did"], record.get("name"),
+                                record.get("hex"), record.get("ascii"), record["status"],
+                                record.get("raw"), category="module-info",
+                            )
+                    if store is not None:
+                        store.add_module(
+                            session,
+                            vin,
+                            name,
+                            {
+                                "request_id": rid,
+                                "response_id": expect,
+                                "kind": entry.get("kind"),
+                                "vin": module_vin,
+                                "part_number": part,
+                            },
+                        )
+                    detail = (
+                        f"  {rid}: {len(dtcs)} DTC(s)"
+                        if dtc_status == "ok"
+                        else f"  {rid}: DTCs {dtc_status}"
+                    )
+                    if module_vin:
+                        detail += f", VIN {module_vin}"
+                    if part:
+                        detail += f", part {part}"
+                    self._post(self._line, detail, "dim")
+        except Exception:
+            status = "error"
+            raise
+        finally:
+            if status == "ok" and self._cancel.is_set():
+                status = "cancelled"  # a Stop press must not look like a clean run
+            if store is not None:
+                if vin:
+                    store.upsert_vehicle(vin, year=year_from_vin(vin))
+                store.finish_session(session, status, vin)
+                store.close()  # one connection per run, not one per capture
+        if discovered:
+            self._post(self._adopt_discovered_vin, vin)
+        self._post(
+            self._write_table,
+            "Capture summary",
+            ["Item", "Value"],
+            [
+                ("VIN", vin or "—"),
+                ("Modules", str(modules)),
+                ("DTCs", str(dtc_count)),
+                ("ID readings", str(readings)),
+                ("Session", status),
+                ("Stored", str(store.db_file) if store is not None else "not stored"),
+            ],
+        )
+
+    def _adopt_discovered_vin(self, vin: str | None) -> None:
+        """Put a VIN discovered by capture into the Vehicle field (UI thread)."""
+        if vin:
+            self.query_one("#vin", Input).value = vin
+
+    def _do_module_map(self, ecu_db: str | None) -> None:
+        """Built-in module addresses plus an optional external ECU database map."""
+        self._post(self._section, "Module map")
+        rows: list[tuple[str, ...]] = []
+        for bus in ("can-c", "can-ihs"):
+            for name, request, response in module_addresses(bus):
+                rows.append((bus, name, "%03X" % request, "%03X" % response, "profile"))
+        db = EcuDatabase(path=ecu_db)
+        try:
+            if db.available:
+                for row in db.pn_modules():
+                    rows.append(
+                        (
+                            row.get("bus") or "",
+                            row.get("name") or row.get("ecu") or "",
+                            ("%03X" % row["request"]) if row.get("request") is not None else "",
+                            ("%03X" % row["response"]) if row.get("response") is not None else "",
+                            "ecu-db",
+                        )
+                    )
+                self._post(self._line, f"External ECU database: {db.path}", "dim")
+            else:
+                self._post(
+                    self._line,
+                    "No external ECU database; showing the built-in map only "
+                    "(set PACIFICA_OBD_ECU_DB or give a path).",
+                    "dim",
+                )
+        finally:
+            db.close()
+        self._post(
+            self._write_table,
+            "Known modules",
+            ["Bus", "Module", "Request", "Response", "Source"],
+            rows,
+        )
+
+    def _do_vehicles(self) -> None:
+        """Vehicles with stored records (read-only, no adapter)."""
+        self._post(self._section, "Stored vehicles")
+        store = _open_readonly_store()
+        if store is None:
+            self._post(self._line, "No local database found.", "yellow")
+            return
+        try:
+            vehicles = store.vehicles()
+            self._post(self._line, f"Database: {store.db_file}", "dim")
+        finally:
+            store.close()
+        rows = [
+            (
+                vehicle.get("vin") or "",
+                vehicle.get("make") or "",
+                vehicle.get("model") or "",
+                str(vehicle.get("year") or ""),
+                vehicle.get("powertrain") or "",
+                vehicle.get("last_seen") or "",
+            )
+            for vehicle in vehicles
+        ]
+        self._post(
+            self._write_table,
+            "Vehicles",
+            ["VIN", "Make", "Model", "Year", "Powertrain", "Last seen"],
+            rows,
+        )
+
+    def _do_history(self) -> None:
+        """Stored vehicles and recent sessions (read-only, no adapter)."""
+        self._post(self._section, "History")
+        store = _open_readonly_store()
+        if store is None:
+            self._post(self._line, "No local database found.", "yellow")
+            return
+        try:
+            vehicles = store.vehicles()
+            sessions = store.sessions(limit=25)
+            self._post(self._line, f"Database: {store.db_file}", "dim")
+        finally:
+            store.close()
+        self._post(
+            self._write_table,
+            "Vehicles",
+            ["VIN", "Make", "Model", "Year", "Last seen"],
+            [
+                (
+                    vehicle.get("vin") or "",
+                    vehicle.get("make") or "",
+                    vehicle.get("model") or "",
+                    str(vehicle.get("year") or ""),
+                    vehicle.get("last_seen") or "",
+                )
+                for vehicle in vehicles
+            ],
+        )
+        self._post(
+            self._write_table,
+            "Recent sessions (25)",
+            ["#", "Started", "Command", "Status", "VIN"],
+            [
+                (
+                    str(session.get("id") or ""),
+                    session.get("started_at") or "",
+                    session.get("command") or "",
+                    session.get("status") or "",
+                    session.get("vin") or "",
+                )
+                for session in sessions
+            ],
+        )
+
+    def _do_show(self, vin: str) -> None:
+        """Everything stored for one VIN (read-only, no adapter)."""
+        self._post(self._section, f"Stored data for {vin}")
+        store = _open_readonly_store()
+        if store is None:
+            self._post(self._line, "No local database found.", "yellow")
+            return
+        try:
+            summary = store.vehicle_summary(vin)
+        finally:
+            store.close()
+        if not any(summary.get(key) for key in ("modules", "dtcs", "readings", "samples")):
+            self._post(self._line, f"Nothing stored for {vin}.", "yellow")
+            return
+        self._post(
+            self._write,
+            Text(
+                f"{len(summary['modules'])} module rows · {len(summary['dtcs'])} DTC rows · "
+                f"{len(summary['readings'])} readings · {len(summary['samples'])} samples",
+                style="bold",
+            ),
+        )
+        self._post(
+            self._write_table,
+            "Stored DTCs",
+            ["When", "Module", "Code", "Failure", "Status"],
+            [
+                (
+                    row.get("ts") or "",
+                    row.get("module") or "",
+                    row.get("code") or "",
+                    row.get("failure_type") or "",
+                    row.get("status") or "",
+                )
+                for row in summary["dtcs"]
+            ],
+        )
+        self._post(
+            self._write_table,
+            "Stored modules",
+            ["When", "Bus", "Request", "Response", "Kind", "VIN", "Part"],
+            [
+                (
+                    row.get("ts") or "",
+                    row.get("bus") or "",
+                    row.get("request_id") or "",
+                    row.get("response_id") or "",
+                    row.get("kind") or "",
+                    row.get("vin_read") or "",
+                    row.get("part_number") or "",
+                )
+                for row in summary["modules"][:50]
+            ],
+        )
+        self._post(
+            self._write_table,
+            "Stored readings",
+            ["When", "Module", "DID", "Name", "ASCII", "Hex"],
+            [
+                (
+                    row.get("ts") or "",
+                    row.get("module") or "",
+                    row.get("did") or "",
+                    row.get("name") or "",
+                    row.get("value_ascii") or "",
+                    row.get("value_hex") or "",
+                )
+                for row in summary["readings"][:100]
+            ],
+        )
+        samples = summary["samples"][:50]
+        self._post(
+            self._write_table,
+            f"Stored samples (latest {len(samples)} of {len(summary['samples'])})",
+            ["When", "Module", "DID", "Value", "Status"],
+            [
+                (
+                    row.get("ts") or "",
+                    row.get("module") or "",
+                    row.get("did") or "",
+                    row.get("value_text")
+                    or ("" if row.get("value_num") is None else str(row.get("value_num"))),
+                    row.get("status") or "",
+                )
+                for row in samples
+            ],
+        )
+
+    def _do_seedkey(self, pairs_text: str, algorithm_path: str, width: int) -> None:
+        """Recover the per-ECU secret consistent with the observed pairs."""
+        self._post(self._section, "Seed→key recovery")
+        self._post(
+            self._line,
+            f"Searching {width}-byte secrets consistent with the pairs "
+            f"(up to {1 << (8 * width):,} candidates, {BRUTE_BUDGET_SECONDS:g}s budget). "
+            "Stop cancels it.",
+            "dim",
+        )
+        try:
+            result = _run_brute_subprocess(
+                algorithm_path, pairs_text, width, self._cancel, BRUTE_BUDGET_SECONDS
+            )
+        except _SearchAborted:
+            self._post(
+                self._line,
+                "Search stopped (Stop pressed or the budget ran out). Narrow the width, "
+                "use a faster algorithm, or run it in the CLI.",
+                "yellow",
+            )
+            return
+        if "error" in result:
+            self._post(self._log_err, f"Recovery failed: {result['error']}")
+            return
+        matches = result.get("matches") or []
+        if not matches:
+            self._post(self._line, "No secret consistent with those pairs.", "yellow")
+            return
+        if len(matches) > 1:
+            self._post(
+                self._line,
+                "Ambiguous: several secrets fit; supply more observations (distinct seeds).",
+                "yellow",
+            )
+            return
+        secret = "%0*X" % (width * 2, int(matches[0]))
+        self._post(
+            self._write, Text(f"Recovered {width}-byte secret: {secret}", style="bold green")
+        )
+        self._post(
+            self._line,
+            "That is a candidate, not a proof: matching pairs do not confirm the algorithm family.",
+            "dim",
+        )
+
+    def _do_write_did(self, bus: str, module: str, did: int, data: str, elm: Elm327) -> None:
+        """UDS 0x2E WriteDataByIdentifier (already confirmed by the caller)."""
+        wait = _probe_wait()
+        self._post(
+            self._section, f"Write DID 0x2E {did:04X} — {module} on {_bus_label(bus)}"
+        )
+        self._post(self._write, _write_warning())
+        rid, resp = _addressed_session(elm, bus, module, wait)
+        result = uds_write_did(elm, did, data, wait=wait, expect_header=resp)
+        self._post(
+            self._write_table,
+            "Write DID result",
+            ["Item", "Value"],
+            [
+                ("Module", rid),
+                ("Bus", _bus_label(bus)),
+                ("DID", result["did"]),
+                ("Data", data),
+                ("Status", result["status"]),
+                ("Raw", result.get("raw") or "—"),
+            ],
+        )
+
+    def _do_routine(
+        self, bus: str, module: str, rid: int, sub: int, data: str, elm: Elm327
+    ) -> None:
+        """UDS 0x31 RoutineControl (already confirmed by the caller)."""
+        wait = _probe_wait()
+        self._post(
+            self._section,
+            f"Routine 0x31 {rid:04X} sub {sub} — {module} on {_bus_label(bus)}",
+        )
+        self._post(self._write, _write_warning())
+        module_rid, resp = _addressed_session(elm, bus, module, wait)
+        result = routine_control(elm, rid, sub=sub, data_hex=data, wait=wait, expect_header=resp)
+        self._post(
+            self._write_table,
+            "Routine result",
+            ["Item", "Value"],
+            [
+                ("Module", module_rid),
+                ("Bus", _bus_label(bus)),
+                ("Routine", result["rid"]),
+                ("Sub-function", str(result["sub"])),
+                ("Data", data or "—"),
+                ("Status", result["status"]),
+                ("Raw", result.get("raw") or "—"),
+            ],
+        )
+
+    # -- live table UI callbacks (UI thread) -------------------------------
+    def _live_start(
+        self, label: str, columns: list[tuple[str, str]], rows: dict[str, tuple[str, ...]]
+    ) -> None:
+        self._live = True
+        self._live_label = label
         self._samples = 0
         table = self._table
         if table is not None:
             table.clear(columns=True)
-            table.add_columns(("PID", "pid"), ("Value", "value"), ("Unit", "unit"))
-            for pid in pids:
-                table.add_row(pid, "…", "", key=pid)
-        self.query_one("#btn-watch", Button).label = "Stop live watch"
+            table.add_columns(*columns)
+            for key, cells in rows.items():
+                table.add_row(*cells, key=key)
+        self._live_button_label(label, active=True)
         self._refresh_status()
 
-    def _watch_sample(self, values: dict[str, tuple[str, str]]) -> None:
+    def _live_sample(self, values: dict[str, dict[str, str]]) -> None:
         table = self._table
         if table is not None:
-            for pid, (value, unit) in values.items():
+            for key, cells in values.items():
                 try:
-                    table.update_cell(pid, "value", value)
-                    table.update_cell(pid, "unit", unit)
-                except Exception:  # noqa: BLE001 - row was rebuilt under us
+                    for column, value in cells.items():
+                        table.update_cell(key, column, value)
+                except Exception:  # noqa: BLE001 - the row set was rebuilt under us
                     pass
         self._samples += 1
         self._refresh_status()
 
-    def _watch_finished(self) -> None:
-        self._watching = False
-        self.query_one("#btn-watch", Button).label = "Watch live PIDs"
+    def _live_finished(self, label: str) -> None:
+        self._live = False
+        self._live_button_label(label, active=False)
         self._refresh_status()
-        self._line(f"Live watch stopped after {self._samples} sample(s).", "dim")
+        self._line(f"{label} stopped after {self._samples} sample(s).", "dim")
+
+    def _live_button_label(self, label: str, *, active: bool) -> None:
+        """Keep the Watch/Monitor button honest about which one is running."""
+        try:
+            watch = self.query_one("#btn-watch", Button)
+            monitor = self.query_one("#btn-monitor", Button)
+        except Exception:  # noqa: BLE001 - DOM gone during teardown
+            return
+        watch.label = "Stop live watch" if (active and label == "Watch") else "Watch live PIDs"
+        monitor.label = "Stop monitor" if (active and label == "Monitor") else "Monitor UDS DIDs…"
 
     # -- lifecycle ---------------------------------------------------------
     def _begin_shutdown(self) -> None:

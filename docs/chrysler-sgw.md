@@ -12,7 +12,7 @@ OBD‑II side.
   (clearing codes, adaptations, activations, configuration) generally requires a
   **12+8 SGW bypass cable**.
 - **Configuration/coding is not part of OBD‑II at all.** It needs a
-  manufacturer-aware tool: **AlfaOBD** or **Appcar DiagFCA** (Windows; your USB
+  manufacturer-aware tool: **Appcar DiagFCA** (Windows; your USB
   vLinker FS works) or **JScan** (mobile-only, Bluetooth adapter).
 - Full module programming / "proxy alignment" is dealer **wiTECH** territory.
 
@@ -32,7 +32,7 @@ Chrysler‑licensed devices, so third‑party tools cannot *write* through it.
 | Action | SGW bypass needed? |
 |---|---|
 | Read generic DTCs (PCM/TCM) via OBD‑II | **No** |
-| Read DTCs from *all* modules (ABS, BCM, SRS…) via AlfaOBD/Appcar/JScan | Usually **no** (reads pass through) |
+| Read DTCs from *all* modules (ABS, BCM, SRS…) via Appcar/JScan | Usually **no** (reads pass through) |
 | Clear codes | **Yes** (per JScan docs, writes are blocked) |
 | Live data | No for reads; **yes** for activations/controls |
 | Adaptations / configuration (BCM settings, lighting, locks, TPMS…) | **Yes** |
@@ -48,29 +48,28 @@ Chrysler‑licensed devices, so third‑party tools cannot *write* through it.
   Autel, Z Automotive, 4D Tech, generic. An **extension cable** makes it far
   easier to reach — the Pacifica's SGW is often deep behind the dash.
 - **OBD adapter:**
-  - USB **vLinker FS** → works with **Windows** AlfaOBD / Appcar DiagFCA.
+  - USB **vLinker FS** → works with **Windows** Appcar DiagFCA.
   - **JScan** is mobile-only → needs a **Bluetooth** adapter (vLinker MC+/FD+,
     OBDLink MX+, Vgate iCar Pro BLE).
-- A Windows laptop (AlfaOBD also runs on Android).
+- A Windows laptop.
 
 ## Software options
 
 | Tool | Platform | USB vLinker FS | Strengths | Limits |
 |---|---|---|---|---|
-| **AlfaOBD** | Windows / Android | ✅ (Windows) | All-module codes, clears, many adaptations, tests | Not a full BCM reflash |
 | **Appcar DiagFCA** | Windows | ✅ | 500+ editable BCM parameters, module tests | Paid; Windows only |
 | **JScan** | iOS / Android | ❌ (BT only) | All modules, adaptations, activations | Mobile only; needs BT adapter |
 | **wiTECH** | Windows (dealer) | — | Full programming, proxy alignment | Dealer/licensed |
 
-## Procedure outline (AlfaOBD + USB vLinker FS)
+## Procedure outline (Appcar DiagFCA + USB vLinker FS)
 
 1. Ignition **OFF**. Locate the SGW, unplug its two connectors, and plug them
    into the bypass cable (adapter then connects to the bypass).
 2. Connect the vLinker FS.
 3. Ignition **ON** (engine off is fine for most reads/adaptations).
-4. In AlfaOBD: pick the vehicle, connect, then read codes / modules.
-5. **Before changing anything:** record the current configuration (AlfaOBD has
-   trace/restore; JScan has Trace & Restore). Change one thing at a time.
+4. In the tool: pick the vehicle, connect, then read codes / modules.
+5. **Before changing anything:** record the current configuration (Appcar DiagFCA
+   and JScan both have trace/restore). Change one thing at a time.
 
 ## Risks
 

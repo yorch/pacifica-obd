@@ -41,8 +41,8 @@ _COMMON_CAN_IHS = [
 # PHEV-only modules (HCP/EAC are hybrid, not on the gas vans).
 _PHEV_CAN_C = ["BPCM", "OBCM", "AHCP", "HCP", "EAC", "IDCM", "EBBM"]
 
-# Real request/response CAN IDs (AlfaOBD ECUUnits; docs/fca-modules.md §4).
-# Most modules use request - 0x280; only 0x7E0-0x7E7 use request + 8.
+# Real request/response CAN IDs from vehicle-observed ECU tables. Most modules
+# use request - 0x280; only 0x7E0-0x7E7 use request + 8.
 MODULE_ADDRESSES: dict[str, list[tuple[str, int, int]]] = {
     "can-c": [
         ("PCM", 0x7E0, 0x7E8),

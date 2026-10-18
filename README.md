@@ -94,11 +94,11 @@ load, throttle, intake temp, MAF, fuel level, etc.), and clearing codes.
 
 **Not covered:** Chrysler-specific modules (BCM, ABS, airbag, HVAC, TPMS,
 programming/coding). Those need a manufacturer-aware tool — for Chrysler/Jeep/
-Dodge/RAM look at **JScan** or **AlfaOBD**, not FORScan (FORScan is Ford/Mazda
+Dodge/RAM look at **JScan**, not FORScan (FORScan is Ford/Mazda
 only). See [`docs/chrysler-sgw.md`](docs/chrysler-sgw.md) for the 2021 Pacifica
-Security Gateway, the 12+8 bypass cable, and the AlfaOBD / Appcar / JScan path.
+Security Gateway, the 12+8 bypass cable, and the Appcar / JScan path.
 [`docs/enhanced-diagnostics.md`](docs/enhanced-diagnostics.md) investigates how
-to grow this project toward AlfaOBD-class UDS support.
+to grow this project toward manufacturer-aware UDS support.
 
 ## Layout
 
@@ -109,7 +109,7 @@ src/pacifica_obd/
   elm.py        raw ELM327/STN transport (for UDS work)
 docs/
   chrysler-sgw.md          SGW + bypass + tool path
-  enhanced-diagnostics.md  AlfaOBD-class plan
+  enhanced-diagnostics.md  manufacturer-aware diagnostics plan
 ```
 
 ## Local storage

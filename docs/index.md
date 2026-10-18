@@ -31,10 +31,10 @@ uv run pacifica-obd scan      # VIN + stored codes + supported PIDs
 | VIN, stored and pending codes, readiness monitors, live data, freeze frame | ✅ | Generic OBD-II: `scan`, `dtc`, `readiness`, `watch`, `freeze` |
 | Codes from the other modules that answer on CAN-C / CAN-IHS | ✅ read-only | `dtc-all` — raw codes and status flags, **no text descriptions** |
 | Part, software and hardware numbers per module | ✅ read-only | `module-info`, `read-did` (`F187`–`F191`) |
-| Which modules should exist, and at which addresses | ✅ read-only | `module-map` (plus an optional read-only AlfaOBD database) |
+| Which modules should exist, and at which addresses | ✅ read-only | `module-map` (plus an optional read-only external ECU database) |
 | Clear engine codes | ⚠️ | `dtc --clear` sends mode `04`. The Security Gateway may refuse it, and it erases freeze frames and readiness history |
 | Write a DID (`2E`) or run a routine (`31`) | ⚠️ experimental | Guarded behind `--confirm`, not reversible by this tool, usually refused by the SGW |
-| Coding, adaptations, module programming | ❌ | Beyond those primitives. Use AlfaOBD / Appcar DiagFCA / JScan / dealer wiTECH, with an SGW bypass |
+| Coding, adaptations, module programming | ❌ | Beyond those primitives. Use Appcar DiagFCA / JScan / dealer wiTECH, with an SGW bypass |
 
 ## What it does
 
@@ -107,9 +107,9 @@ uv run pacifica-obd scan      # VIN + stored codes + supported PIDs
     ---
 
     What the SGW is, what it blocks on a 2021, when a 12+8 bypass cable is
-    needed, and where AlfaOBD / Appcar / JScan / wiTECH fit.
+    needed, and where Appcar / JScan / wiTECH fit.
 
--   **[Enhanced (AlfaOBD-class) diagnostics](enhanced-diagnostics.md)**
+-   **[Enhanced (manufacturer-aware) diagnostics](enhanced-diagnostics.md)**
 
     ---
 

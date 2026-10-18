@@ -31,9 +31,8 @@ P0–P6), [`chrysler-sgw.md`](chrysler-sgw.md) (Security Gateway).
   controller family, and no public year-by-year DID matrix.
 - **FORScan is irrelevant here** — it explicitly supports only Ford, Mazda,
   Lincoln and Mercury ("Vehicles other than Ford, Mazda, Lincoln, Mercury are not
-  supported!"). The Stellantis reference tools are **AlfaOBD**, **Appcar
-  DiagFCA**, and **JScan** ([FORScan](https://forscan.org/home.html),
-  [AlfaOBD](https://www.alfaobd.com/supported_cars.html),
+  supported!"). The Stellantis reference tools are **Appcar
+  DiagFCA** and **JScan** ([FORScan](https://forscan.org/home.html),
   [Appcar](https://appcar-diagfca.com/en/supported-vehicles/chrysler-pacifica),
   [JScan](https://jscan.net/fca-security-gateway-module-basic-info-and-location/)).
 - **The vehicle half is already the right shape**: `profiles.py` has `RU_GAS` /
@@ -69,10 +68,10 @@ its own profile ([Wikipedia](https://en.wikipedia.org/wiki/Chrysler_Pacifica_(mi
 ### Milestones that matter diagnostically
 
 - **MY2018 — Security Gateway (SGW).** FCA introduced the SGW "in some models in
-  the 2018 model year and all models 2019 going forward"; AlfaOBD dates it to
-  MY2018. Appcar: "Most FCA vehicle starting from the 2018 model year (produced
-  from the summer 2017) have a Security Gateway Module." ([JScan](https://jscan.net/fca-security-gateway-module-basic-info-and-location/),
-  [AlfaOBD](https://www.alfaobd.com), [Appcar](https://appcar-diagfca.com/en/how-it-works/))
+  the 2018 model year and all models 2019 going forward". Appcar: "Most FCA
+  vehicle starting from the 2018 model year (produced from the summer 2017) have
+  a Security Gateway Module." ([JScan](https://jscan.net/fca-security-gateway-module-basic-info-and-location/),
+  [Appcar](https://appcar-diagfca.com/en/how-it-works/))
 - **MY2020 — AWD** for gas models (not PHEV).
 - **MY2021 — facelift / Uconnect 5, and an architecture change.** New exterior,
   **Android-based Uconnect 5** with a 10.1" display, and a dedicated
@@ -99,7 +98,6 @@ marketing coverage, not guarantees for every controller:
 | Tool | Published Pacifica coverage |
 |---|---|
 | **Appcar DiagFCA** | Chrysler Pacifica **2017–2026** (RU), separate "Hybrid LAN Network" ECU group |
-| **AlfaOBD** | `CHRYSLER PACIFICA (RU) 2016+`, recommended adapter OBDLink MX+ / EX |
 | **JScan** | Chrysler **Pacifica RU 2017+**; SGW bypass describes it as `RU 2017+` |
 
 ## 2. Support matrix by model year and powertrain
@@ -150,10 +148,8 @@ treats writes as a separate, deliberate project; keep that.
 | (CAN-CH) | — | 12 / 13 | needs a *gray* cross-adapter | not used on RU |
 
 Appcar documents the pin/rate mapping and states that STN1170/2120/2230/2231
-interfaces support CAN-IHS natively; AlfaOBD's pin table names pins 3/11 "CAN
-Middle speed" and 6/14 "CAN High speed"
-([Appcar](https://appcar-diagfca.com/en/how-it-works/),
-[AlfaOBD](https://www.alfaobd.com/androidhelp.html)).
+interfaces support CAN-IHS natively (pins 3/11 "CAN Middle speed" and 6/14
+"CAN High speed") ([Appcar](https://appcar-diagfca.com/en/how-it-works/)).
 
 **Caveat found on the vehicle side:** the two buses are physically star-wired,
 and the *star connector* itself is a known failure point on 2017–2018 vans
@@ -269,9 +265,9 @@ and modules. Beyond that:
   `abs / eps / srs / fwdRadar / combinationMeter / hybrid / engine /
   transmission` ([values.py](https://github.com/commaai/opendbc/blob/master/opendbc/car/chrysler/values.py)).
   `F132` is a useful, cheap cross-check to add.
-- The **live-data / adaptation DID map** (the bulk of AlfaOBD's value) is
-  **not public**. `enhanced-diagnostics.md` §7 already flags the reverse-engineered
-  `fca-ecu-diagnostics` dataset as a lead (repos now 404).
+- The **live-data / adaptation DID map** (the bulk of a manufacturer-aware
+  tool's value) is **not public**. `enhanced-diagnostics.md` §7 already flags the
+  reverse-engineered `fca-ecu-diagnostics` dataset as a lead (repos now 404).
 
 So: identification reads are portable and testable; proprietary DID semantics
 are per-ECU and must remain a loadable, replaceable database.
@@ -308,14 +304,15 @@ No verified public RU year-by-year matrix exists. What we know:
   Pacifica **and 2020 and newer Chrysler Voyager**", confirming the Voyager
   carries the SGW too ([OBD Genie video](https://www.youtube.com/watch?v=wq_q_32UXhE),
   [AE Tools](https://knowledgebase.aetools.us/how-to-get-past-the-gateway-on-chrysler-vehicles-using-autel)).
-- **AlfaOBD warns that no SGW bypass exists** for some newest vehicles (Jeep GC
-  WL, 2025/26 Ram, Tonale). Worth re-checking if the intent ever expands beyond RU.
+- **Some vendors warn that no SGW bypass exists** for their newest vehicles
+  (Jeep GC WL, 2025/26 Ram, Tonale). Worth re-checking if the intent ever expands
+  beyond RU.
 
 ### 3.7 CAN FD
 
 **No evidence that any RU minivan needs CAN FD.** Appcar's continued 2017–2026
-two-bus/ELM-STN coverage and AlfaOBD's continued pin-based coverage both imply
-classic CAN. The plan's own note stands: the STN1170 cannot reach a CAN-FD-only
+two-bus/ELM-STN coverage and the vendor tools' continued pin-based coverage both
+imply classic CAN. The plan's own note stands: the STN1170 cannot reach a CAN-FD-only
 module, and that would be a hard hardware wall, not a software one. Treat CAN FD
 as a **profile-level flag to assert `false`** for RU, so that a future
 non-classic vehicle fails loudly instead of mysteriously.
@@ -325,14 +322,12 @@ non-classic vehicle fails loudly instead of mysteriously.
 | Tool | Stellantis? | Notes |
 |---|---|---|
 | **FORScan** | **No** | "Vehicles other than Ford, Mazda, Lincoln, Mercury are not supported!" |
-| **AlfaOBD** | Yes | Windows/Android; SGW bypass (hardware only) |
 | **Appcar DiagFCA** | Yes | Windows; 500+ BCM parameters, routines |
 | **JScan** | Yes | Mobile only, needs a BLE adapter |
 | **wiTECH** | Dealer | Programming / proxy alignment |
 
 An open, read-only, data-driven UDS scanner for these vans has real space:
-AlfaOBD/Appcar are the only capable options and both are closed, Windows-first
-and SGW-bypass-centric.
+the capable tools are all closed, Windows/mobile-first and SGW-bypass-centric.
 
 ## 4. What must be data (not code)
 
@@ -857,7 +852,7 @@ For each responder, record:
 
 ### Ground truth
 
-- [ ] Scan the same vehicle with **AlfaOBD** or **Appcar DiagFCA** on the same day
+- [ ] Scan the same vehicle with **Appcar DiagFCA** on the same day
       and diff the module list against ours. Any module they see and we do not is
       a bug in our map, our addressing rule, or our probe.
 - [ ] Save the resolved profile (§5.6) alongside the diff as evidence.
@@ -909,7 +904,8 @@ For each responder, record:
 - **BCM, RFH, ESM, SCCM, OCM, PTS, and the whole CAN-IHS set** have no public
   request/response IDs. All are `addr: null` today. This is discovery work.
 - **No public year-by-year DID matrix.** Year-specific DIDs, especially live data
-  and adaptations, remain the gap that keeps this tool behind AlfaOBD.
+  and adaptations, remain the gap that keeps this tool behind manufacturer-aware
+  tools.
 - **VIN → platform mapping is assumed, not verified.** `2C4` (Windsor) is
   plausible for all three nameplates but has not been confirmed against a VIN
   decoder, and Voyager/Grand Caravan may use different WMI/VDS patterns.
@@ -928,9 +924,6 @@ For each responder, record:
 - Chrysler Pacifica (minivan) — RU platform, Voyager & Grand Caravan badging, 2021 refresh (Uconnect 5), 2027 refresh: <https://en.wikipedia.org/wiki/Chrysler_Pacifica_(minivan)>
 - Appcar DiagFCA — Chrysler Pacifica (RU) 2017–2026: full module list, CAN-C/CAN-IHS, 2018+ SGW, hybrid LAN grouping: <https://appcar-diagfca.com/en/supported-vehicles/chrysler-pacifica/>
 - Appcar DiagFCA — How it works: SGW since MY2018, CAN-C pins 6/14, CAN-IHS pins 3/11, STN1170/2120/2230/2231 support both buses: <https://appcar-diagfca.com/en/how-it-works/>
-- AlfaOBD — supported vehicles (`CHRYSLER PACIFICA (RU) 2016+`, OBDLink MX+/EX): <https://www.alfaobd.com/supported_cars.html>
-- AlfaOBD — SGW from MY2018; STN11xx/21xx for HS 6/14 + MS 3/11: <https://www.alfaobd.com>
-- AlfaOBD — OBD socket pin table (3/11 "CAN Middle speed", 6/14 "CAN High speed"): <https://www.alfaobd.com/androidhelp.html>
 - JScan — FCA Security Gateway: introduced 2018, "some models in the 2018 model year and all models 2019 going forward"; bypass needed for writes only: <https://jscan.net/fca-security-gateway-module-basic-info-and-location/>
 - FCA / Stellantis — Uconnect 5 press release: "The Atlantis architecture replaces Powernet as the next generation of FCA core in-vehicle electronics communication"; debut on the 2021 Pacifica: <https://www.prnewswire.com/news-releases/fcas-all-new-uconnect-5-global-platform-is-the-most-advanced-uconnect-system-ever-powerful-personalized-connected-and-easy-to-use-300993133.html>
 - Stellantis Media — Uconnect 5 "What's New" (Atlantis vs Powernet wording): <https://media.fcanorthamerica.com/newsrelease.do?id=21511&mid=102>

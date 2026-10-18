@@ -112,10 +112,11 @@ def _dtc_table(dtcs: list[dict]) -> str:
         ftb = f"-{_esc(dtc['failure_type'])}" if dtc.get("failure_type") else ""
         rows.append(
             f"<tr><td class='dtc'>{_esc(dtc.get('code'))}{ftb}</td>"
+            f"<td>{_esc(dtc.get('description'))}</td>"
             f"<td class='mono'>{_esc(dtc.get('status'))}</td><td>{chips}</td></tr>"
         )
     return (
-        "<table><thead><tr><th>Code</th><th>Status</th><th>Flags</th></tr></thead>"
+        "<table><thead><tr><th>Code</th><th>Description</th><th>Status</th><th>Flags</th></tr></thead>"
         "<tbody>" + "".join(rows) + "</tbody></table>"
     )
 

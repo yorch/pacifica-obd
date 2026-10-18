@@ -1,13 +1,13 @@
-# Enhanced (AlfaOBD-class) diagnostics — how it works and how we'd add it
+# Enhanced (manufacturer-aware) diagnostics — how it works and how we'd add it
 
 This document maps out what it would take to grow `pacifica-obd` from *generic
 OBD‑II* into *manufacturer-aware FCA/Stellantis diagnostics* — the class of
-things AlfaOBD and Appcar DiagFCA do. It is an investigation + plan, not a claim
-that all of it is safe or easy.
+things proprietary manufacturer-aware tools do. It is an investigation + plan,
+not a claim that all of it is safe or easy.
 
-## 1. How AlfaOBD actually works
+## 1. How manufacturer-aware tools actually work
 
-AlfaOBD is not magic; it is a stack:
+These tools are not magic; they are a stack:
 
 | Layer | What it does | Standard |
 |---|---|---|
@@ -57,7 +57,7 @@ module's own CAN ID pair.
    by scanning (send `10 03` / `22 F1 90` across an ID range), partly needs the
    FCA database.
 2. **DID / RID database** — which 0x22 identifiers mean what, and which 0x31
-   routines exist. This is the bulk of AlfaOBD's value.
+   routines exist. This is the bulk of their value.
 3. **Seed→key algorithms** for protected writes (0x27). Reverse-engineered
    per-ECU generators exist (see §7), but using them is the risky part.
 4. **SGW bypass** for any write.
@@ -96,7 +96,8 @@ Two implementation strategies:
 
 - **A — leverage the adapter's ISO‑TP** (recommended first): `ATSP6`, `ATSH <req>`,
   `ATCAF1`, `ATCRA <resp>`; send the UDS payload as hex and read the response.
-  This is exactly how AlfaOBD drives an ELM327 and needs no extra libraries.
+  This is exactly how a manufacturer-aware tool drives an ELM327 and needs no
+  extra libraries.
 - **B — standards stack**: `udsoncan` (MIT) + `can-isotp` + a custom
   `python-can` bus that tunnels frames through `elm.py`. Cleaner for large
   multi-frame DIDs, more moving parts.
@@ -110,7 +111,8 @@ Start with A; move to B if multi-frame handling gets painful.
   database). The repo is currently 404, so treat it as a lead to re-derive or
   mirror, not a dependency.
 - **FCA seed→key generators** — `grantUser/seedkey-fca-stellantis` (≈374 per‑ECU
-  generators recovered from AlfaOBD bytecode). Also currently 404. Same caveat.
+  generators recovered from a proprietary FCA diagnostic app's bytecode). Also
+  currently 404. Same caveat.
 - **`grantUser/obd2-pids`** — large JSON PID database (Mode 01 + Mode 22), useful
   for DID/formula scaffolding.
 - **NHTSA public scan reports** — module lists and bus assignments (used in §3).

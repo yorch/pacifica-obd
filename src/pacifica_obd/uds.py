@@ -171,13 +171,16 @@ def probe_ids_multi(elm, start: int, end: int, probes, wait: float, receive_id=N
         for rid in range(start, end + 1):
             if rid in known:
                 continue
-            elm.cmd("ATSH %03X" % rid)
-            if receive_id is not None:
-                try:
-                    elm.cmd("ATCRA %03X" % receive_id(rid))
-                except Exception:  # noqa: BLE001 - no mapping (e.g. broadcast)
-                    elm.cmd("ATAR")
-            header, uds = parse_uds_frame(elm.cmd(probe, wait=wait))
+            try:
+                elm.cmd("ATSH %03X" % rid)
+                if receive_id is not None:
+                    try:
+                        elm.cmd("ATCRA %03X" % receive_id(rid))
+                    except Exception:  # noqa: BLE001 - no mapping (e.g. broadcast)
+                        elm.cmd("ATAR")
+                header, uds = parse_uds_frame(elm.cmd(probe, wait=wait))
+            except Exception:  # noqa: BLE001 - adapter gone/locked: stop, keep what we have
+                return
             if header is None:
                 continue
             if uds.startswith("%02X" % (service + 0x40)):

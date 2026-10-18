@@ -1,10 +1,11 @@
-"""Optional read-only access to the AlfaOBD SQLite database.
+"""Optional read-only access to an external ECU database.
 
-The database carries FCA/Stellantis module addresses, DIDs, adaptations and more
-(see docs/fca-modules.md). We open it strictly read-only and degrade to a no-op
-when it is missing, so nothing here is ever required for the core tool to work.
+An external ECU database can carry FCA/Stellantis module addresses, DIDs,
+adaptations and more. It is entirely optional: the user points at one (there is
+no built-in default), we open it strictly read-only, and degrade to a no-op when
+it is missing, so nothing here is ever required for the core tool to work.
 
-Override the path with ``PACIFICA_OBD_ALFAOBD_DB``.
+Override the path with ``PACIFICA_OBD_ECU_DB``.
 """
 
 from __future__ import annotations
@@ -13,15 +14,16 @@ import os
 import sqlite3
 from pathlib import Path
 
-# inittype -> bus is inferred (docs/fca-modules.md §4.4): 7 ~= CAN-C, 9 ~= CAN-IHS.
+# inittype -> bus is inferred from the database's ECU table: 7 ~= CAN-C, 9 ~= CAN-IHS.
 _INITTYPE_BUS = {7: "can-c", 9: "can-ihs"}
 
 
-def default_db() -> Path:
-    override = os.environ.get("PACIFICA_OBD_ALFAOBD_DB")
+def default_db() -> Path | None:
+    """Path from ``PACIFICA_OBD_ECU_DB``, or None when unset (the feature is opt-in)."""
+    override = os.environ.get("PACIFICA_OBD_ECU_DB")
     if override:
         return Path(override).expanduser()
-    return Path.home() / "temp" / "alfa-obd" / "scratchpad" / "db" / "alfaobd_plain.db"
+    return None
 
 
 def _hex_to_int(text) -> int | None:
@@ -33,12 +35,14 @@ def _hex_to_int(text) -> int | None:
         return None
 
 
-class AlfaDatabase:
-    """Read-only view of the AlfaOBD database (no-op if unavailable)."""
+class EcuDatabase:
+    """Read-only view of an external ECU database (no-op if unavailable)."""
 
     def __init__(self, path: Path | str | None = None):
         self.path = Path(path) if path else default_db()
         self._conn: sqlite3.Connection | None = None
+        if self.path is None:
+            return
         try:
             if not self.path.exists():
                 return

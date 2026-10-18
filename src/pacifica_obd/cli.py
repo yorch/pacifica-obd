@@ -44,7 +44,7 @@ from pacifica_obd.adapter import (
     restore_protocol,
 )
 from pacifica_obd.elm import Elm327, Elm327Error
-from pacifica_obd.database import AlfaDatabase
+from pacifica_obd.database import EcuDatabase
 from pacifica_obd.profiles import (
     DEFAULT_PROFILE,
     addresses as module_addresses,
@@ -334,11 +334,13 @@ def cmd_info(args: argparse.Namespace) -> None:
 
 
 def _read_uds_vin(args: argparse.Namespace) -> str | None:
-    """Read the VIN over UDS F190 from the known module addresses (best effort).
+    """Read the VIN over UDS F190 from the bundled module list (best effort).
 
     Some vehicles — e.g. the Pacifica Hybrid — do not serve mode 09 02 at all,
     but return the VIN from F190 on their powertrain/body modules.
     """
+    from pacifica_obd import pacifica_data
+
     timeout_ms = getattr(args, "timeout_ms", 100)
     wait = max(0.25, timeout_ms / 1000 + 0.15)
     try:
@@ -347,13 +349,20 @@ def _read_uds_vin(args: argparse.Namespace) -> str | None:
         return None
     try:
         for bus in ("can-c", "can-ihs"):
+            rows = [row for row in pacifica_data.modules() if (row.get("bus") or "") == bus]
+            if not rows:
+                continue
             configure_bus(elm, bus, timeout_ms)
-            for _name, request, _response in module_addresses(bus, powertrain="phev"):
+            for row in rows:
+                try:
+                    request = int(str(row.get("request")), 16)
+                except (TypeError, ValueError):
+                    continue
                 rid = "%03X" % request
                 elm.cmd("ATSH " + rid)
                 try:
-                    elm.cmd("ATCRA %03X" % module_response_id(request))
-                except ValueError:
+                    elm.cmd("ATCRA %03X" % int(str(row.get("response")), 16))
+                except (TypeError, ValueError):
                     pass
                 expect = _enter_session(elm, rid, wait)
                 record = _read_did(elm, 0xF190, wait, expect_header=expect)
@@ -841,6 +850,25 @@ def cmd_modules(args: argparse.Namespace) -> None:
 # --------------------------------------------------------------------------- #
 # all-module DTC read (UDS 0x19 0x02)
 # --------------------------------------------------------------------------- #
+def _dtc_description(code: str | None) -> str | None:
+    """Short description for a decoded DTC (e.g. 'P0AA1') from the bundled dataset."""
+    if not code or len(code) < 2 or code[0].upper() not in "PCBU":
+        return None
+    try:
+        from pacifica_obd import pacifica_data
+
+        return pacifica_data.dtc_text("%04X" % int(code[1:], 16))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _enrich_dtcs(dtcs: list[dict]) -> list[dict]:
+    for dtc in dtcs:
+        if dtc.get("description") is None:
+            dtc["description"] = _dtc_description(dtc.get("code"))
+    return dtcs
+
+
 def cmd_dtc_all(args: argparse.Namespace) -> None:
     """Read DTCs (UDS 0x19) from every responding module on one or both buses."""
     start, end = args.start, args.end
@@ -880,7 +908,7 @@ def cmd_dtc_all(args: argparse.Namespace) -> None:
                     record = {
                         "bus": bus, "request_id": rid, "response_id": header,
                         "status": classification, "raw": uds,
-                        "dtcs": _parse_dtcs(uds) if classification == "ok" else [],
+                        "dtcs": _enrich_dtcs(_parse_dtcs(uds)) if classification == "ok" else [],
                     }
                 results.append(record)  # keep every target in the report
                 if _store(args):
@@ -918,6 +946,7 @@ def cmd_dtc_all(args: argparse.Namespace) -> None:
     table.add_column("Bus")
     table.add_column("Module")
     table.add_column("Code", style="bold red")
+    table.add_column("Description")
     table.add_column("Flags")
     for record in results:
         label = record["request_id"]
@@ -927,6 +956,7 @@ def cmd_dtc_all(args: argparse.Namespace) -> None:
                     record["bus"],
                     label,
                     f"{dtc['code']}-{dtc['failure_type']}",
+                    dtc.get("description") or "",
                     ", ".join(dtc["flags"]),
                 )
                 label = ""  # only label the first row of each module
@@ -938,7 +968,7 @@ def cmd_dtc_all(args: argparse.Namespace) -> None:
                 "no_response": "no response",
                 "ok": "no DTCs",
             }[record["status"]]
-            table.add_row(record["bus"], label, "—", note)
+            table.add_row(record["bus"], label, "—", note, "")
     console.print(table)
     console.print(f"[dim]{total} DTC(s) across {len(results)} module(s).[/dim]")
 
@@ -1367,27 +1397,36 @@ _WRITE_WARNING = (
 
 
 def cmd_module_map(args: argparse.Namespace) -> None:
-    """Show known module addresses (built-in profiles + optional AlfaOBD DB)."""
-    data: dict = {"profiles": {}, "alfaobd": None}
-    for bus in ("can-c", "can-ihs"):
-        data["profiles"][bus] = [
-            {"module": name, "request": "%03X" % request, "response": "%03X" % response}
-            for name, request, response in module_addresses(bus)
-        ]
+    """Show known module addresses (bundled dataset + optional external ECU DB)."""
+    from pacifica_obd import pacifica_data
 
-    db = AlfaDatabase(path=getattr(args, "alfa_db", None))
+    def _id3(value) -> str:
+        if value is None:
+            return ""
+        return str(value).replace("0x", "").replace("0X", "").upper()
+
+    data: dict = {"bundled": {}, "external": None}
+    for row in pacifica_data.modules():
+        bus = row.get("bus") or "?"
+        data["bundled"].setdefault(bus, []).append(
+            {
+                "module": row.get("name"), "ecu": row.get("ecu"),
+                "powertrain": row.get("powertrain"),
+                "request": _id3(row.get("request")), "response": _id3(row.get("response")),
+            }
+        )
+    for rows in data["bundled"].values():
+        rows.sort(key=lambda item: (item["request"], str(item["module"])))
+
+    db = EcuDatabase(path=getattr(args, "ecu_db", None))
     try:
         if db.available:
-            data["alfaobd"] = {
+            data["external"] = {
                 "path": str(db.path),
                 "modules": [
-                    {
-                        "ecu": row["ecu"],
-                        "name": row["name"],
-                        "bus": row["bus"],
-                        "request": None if row["request"] is None else "%03X" % row["request"],
-                        "response": None if row["response"] is None else "%03X" % row["response"],
-                    }
+                    {"ecu": row["ecu"], "name": row["name"], "bus": row["bus"],
+                     "request": _id3(None if row["request"] is None else "%03X" % row["request"]),
+                     "response": _id3(None if row["response"] is None else "%03X" % row["response"])}
                     for row in db.pn_modules()
                 ],
             }
@@ -1398,27 +1437,25 @@ def cmd_module_map(args: argparse.Namespace) -> None:
         jdump(data)
         return
 
-    for bus, rows in data["profiles"].items():
-        table = Table(title=f"Known modules on {bus}")
-        for column in ("Module", "Request", "Response"):
+    total = sum(len(rows) for rows in data["bundled"].values())
+    console.print(f"[dim]Bundled dataset: {total} module(s)[/dim]")
+    for bus, rows in sorted(data["bundled"].items()):
+        table = Table(title=f"Modules on {bus} ({len(rows)})")
+        for column in ("Module", "Request", "Response", "Powertrain"):
             table.add_column(column)
         for row in rows:
-            table.add_row(row["module"], row["request"], row["response"])
+            table.add_row(row["module"] or "", row["request"], row["response"],
+                          row["powertrain"] or "")
         console.print(table)
 
-    if data["alfaobd"]:
-        table = Table(title=f"AlfaOBD PowerNet modules — {data['alfaobd']['path']}")
+    if data["external"]:
+        table = Table(title=f"External ECU database — {data['external']['path']}")
         for column in ("ECU", "Name", "Bus", "Request", "Response"):
             table.add_column(column)
-        for row in data["alfaobd"]["modules"]:
+        for row in data["external"]["modules"]:
             table.add_row(row["ecu"] or "", row["name"] or "", row["bus"] or "",
-                          row["request"] or "", row["response"] or "")
+                          row["request"], row["response"])
         console.print(table)
-    else:
-        console.print(
-            "[dim]AlfaOBD DB not found; set PACIFICA_OBD_ALFAOBD_DB (or --alfa-db) "
-            "for the full ECU map.[/dim]"
-        )
 
 
 def _require_confirm(args: argparse.Namespace, action: str) -> None:
@@ -1595,6 +1632,7 @@ def build_vehicle_dump(args: argparse.Namespace) -> dict:
         "modules": [],
         "readings": [],
         "totals": {},
+        "aborted": None,
     }
     vin = normalize_vin(getattr(args, "vin", None))
 
@@ -1672,7 +1710,7 @@ def build_vehicle_dump(args: argparse.Namespace) -> dict:
                     expect = _enter_session(elm, rid, wait)
                     _, dtc_uds = _parse_uds_frame(elm.cmd("1902FF", wait=wait), prefer_header=expect)
                     dtcs = (
-                        _parse_dtcs(dtc_uds)
+                        _enrich_dtcs(_parse_dtcs(dtc_uds))
                         if dtc_uds and _classify_dtc_response(dtc_uds) == "ok" else []
                     )
                     identification = {}
@@ -1914,7 +1952,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_monitor.set_defaults(func=cmd_monitor)
 
     p_map = sub.add_parser("module-map", help="show known module addresses (read-only)")
-    p_map.add_argument("--alfa-db", metavar="PATH", help="path to the AlfaOBD SQLite DB (optional)")
+    p_map.add_argument("--ecu-db", metavar="PATH",
+                       help="path to an optional external ECU database")
     p_map.set_defaults(func=cmd_module_map)
 
     p_sec = sub.add_parser("security", help="request a UDS 0x27 security seed from a module")

@@ -36,8 +36,8 @@ src/pacifica_obd/
   store.py    SQLite + JSONL persistence (Store)
   tui.py      interactive Textual UI (run())
 docs/
-  chrysler-sgw.md          SGW, 12+8 bypass, AlfaOBD/Appcar/JScan path
-  enhanced-diagnostics.md  roadmap P0–P6 toward AlfaOBD-class UDS
+  chrysler-sgw.md          SGW, 12+8 bypass, Appcar/JScan path
+  enhanced-diagnostics.md  roadmap P0–P6 toward manufacturer-aware UDS
   vehicle-support.md       cross-year/hybrid support matrix + profile design
 ```
 
@@ -82,11 +82,13 @@ docs/
 - **Powertrain detection:** if a hybrid-only module answers (HCP `0x7E2` or
   BPCM `0x7E7`), it is a Pacifica **PHEV** — `profiles.detect_powertrain()`
   uses this because the VIN cannot tell gas from hybrid.
-- **Flow control is mandatory for non-standard address pairs.** Before reading a
-  module, set ISO-TP flow control to the responder (`configure_flow_control()`:
-  `ATFCSM1` + `ATFCSH <resp>` + `ATFCSD 3000`). Without it, every `-0x280` and
-  CAN-IHS multi-frame reply (e.g. the 20-byte VIN) never completes and looks
-  like "no response" — on a real Pacifica Hybrid this hid 21 of 25 modules.
+- **Non-standard address pairs need a receive filter, not manual flow control.**
+  Before reading a module, point the adapter's receive filter at the responder
+  (`ATCRA <resp>`; the TUI's `_address()` does this from the profile mapping).
+  Do **not** call `configure_flow_control()` on a read path: on this adapter it
+  switches the STN to an indexed frame format that breaks multi-frame parsing,
+  so reads that worked then return "no response". Leave ISO-TP flow control in
+  the adapter's automatic mode on reads.
 - **`09 02` (mode-09 VIN) may be unserved.** Read the VIN via UDS `22 F190`
   instead; the `vin` command falls back automatically.
 - **Probe more than one service in discovery** (`1003` and `22F190`): many

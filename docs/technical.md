@@ -14,7 +14,7 @@ front ends        cli.py (argparse + Rich)      tui.py (Textual)
 domain logic      uds.py      models.py     profiles.py     database.py
                   └─ ISO-TP reassembly, DTC decode, DID reads, typed models,
                      vehicle profiles + the addressing rule, and optional
-                     read-only access to an extracted AlfaOBD database
+                     read-only access to an external ECU database
                         │
 device layer      adapter.py    elm.py
                   └─ port discovery, bus presets, protocol snapshot/restore,
@@ -39,7 +39,7 @@ manufacturer-specific.
 | `models.py` | Typed domain objects (`Vehicle`, `Module`, `Dtc`, `Reading`, `CaptureResult`) | Know about argparse or SQL |
 | `profiles.py` | Data-driven `VehicleProfile` (years, powertrain, module buses, identification DIDs) and the addressing rule in `response_id()` | Assume one vehicle; hardcode what belongs in data |
 | `elm.py` | The raw AT/ST command channel (`Elm327`) | Interpret UDS semantics |
-| `database.py` | Optional **read-only** view of an extracted AlfaOBD SQLite database (FCA module/DID data); a no-op when absent | Write to it, or be required for the core tool to work |
+| `database.py` | Optional **read-only** view of an external ECU SQLite database (FCA module/DID data); a no-op when absent | Write to it, or be required for the core tool to work |
 | `store.py` | SQLite schema + JSONL log, local to the user | Crash a command: any failure degrades to a no-op |
 | `tui.py` | Textual UI, worker threads, single-adapter locking | Block the event loop or own protocol logic |
 
@@ -185,7 +185,8 @@ captures are deliberately not committed to the repository.
   run without `--confirm` and print a warning that they are not reversible by this
   tool. `security` (`27`) only requests a seed: no seed→key provider is shipped, so
   the ECU is left locked. Adaptations, coding and module programming remain out of
-  scope — that is the domain of AlfaOBD / Appcar DiagFCA / JScan / dealer wiTECH.
+  scope — that is the domain of manufacturer-aware tools (Appcar DiagFCA, JScan)
+  and dealer wiTECH.
 - **No adapter EEPROM writes** (see buses, above), and the protocol is always
   restored before the port closes — including on the interactive `tui` exit path.
 - **One owner of the adapter at a time.** The CLI is synchronous; the TUI holds a
