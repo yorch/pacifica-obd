@@ -138,18 +138,53 @@ def redact_text(text, extra_keys=()) -> str:
     return out
 
 
+_LITERALS: tuple[str, ...] = ()
+
+
+def set_logging_literals(values) -> None:
+    """Register the configured key values so the log filter masks them too.
+
+    A key with an unusual shape (a passphrase, a proxy token) does not match the
+    key-shape patterns, so only the literal value can catch it.
+    """
+    global _LITERALS
+    _LITERALS = tuple(sorted({str(v) for v in values if v}, key=len, reverse=True))
+
+
+def _scrub(value: str) -> str:
+    """Mask key literals *and* VIN-shaped text (including its hex form) in logs."""
+    try:
+        from pacifica_obd.web.ai import redact
+
+        return redact.scrub(value, keys=_LITERALS)
+    except Exception:  # noqa: BLE001 - logging must never raise
+        return redact_text(value, _LITERALS)
+
+
 class _RedactingFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         try:
             if isinstance(record.msg, str):
-                record.msg = redact_text(record.msg)
+                record.msg = _scrub(record.msg)
             if record.args:
                 if isinstance(record.args, dict):
-                    record.args = {k: redact_text(v) if isinstance(v, str) else v
+                    record.args = {k: _scrub(v) if isinstance(v, str) else v
                                    for k, v in record.args.items()}
                 else:
-                    record.args = tuple(redact_text(a) if isinstance(a, str) else a
+                    record.args = tuple(_scrub(a) if isinstance(a, str) else a
                                         for a in record.args)
+            # An exception's text is formatted separately from msg/args: the
+            # traceback comes from exc_info, which no formatter scrubs. Format it
+            # here, scrub it, and hand the clean text on (exc_text wins over
+            # exc_info in logging.Formatter).
+            if record.exc_info:
+                record.exc_text = _scrub(
+                    logging.Formatter().formatException(record.exc_info))
+                record.exc_info = None
+            elif isinstance(record.exc_text, str):
+                record.exc_text = _scrub(record.exc_text)
+            if isinstance(record.stack_info, str):
+                record.stack_info = _scrub(record.stack_info)
         except Exception:  # noqa: BLE001 - logging must never raise
             pass
         return True
@@ -158,7 +193,7 @@ class _RedactingFilter(logging.Filter):
 _FILTER: _RedactingFilter | None = None
 
 
-def install_logging_filter() -> logging.Filter:
+def install_logging_filter(store: "KeyStore | None" = None) -> logging.Filter:
     """Attach the redacting filter to the root logger (and its handlers) once.
 
     The root logger alone is not enough: a record logged by a child logger still
@@ -168,6 +203,11 @@ def install_logging_filter() -> logging.Filter:
     global _FILTER
     if _FILTER is None:
         _FILTER = _RedactingFilter()
+    try:
+        key_store = store if store is not None else KeyStore()
+        set_logging_literals(key_store.literals())
+    except Exception:  # noqa: BLE001 - an unreadable key file must not break boot
+        pass
     root = logging.getLogger()
     if _FILTER not in root.filters:
         root.addFilter(_FILTER)
@@ -231,9 +271,20 @@ class KeyStore:
             return {"configured": False, "hint": None, "source": None}
         return {"configured": True, "hint": _hint(value), "source": "file"}
 
+    def literals(self) -> tuple[str, ...]:
+        """Every configured key value (file *and* environment), for redaction."""
+        values = [v for v in self._keys.values() if v]
+        for names in _ENV_KEYS.values():
+            for name in names:
+                value = self._env.get(name)
+                if value:
+                    values.append(value)
+        # longest first, so a key that contains another is masked whole
+        return tuple(sorted(set(values), key=len, reverse=True))
+
     def redactor(self):
         """A ``str -> str`` that also masks this store's literal keys."""
-        literals = tuple(self._keys.values())
+        literals = self.literals()
 
         def _redact(value):
             return redact_text(value, literals)

@@ -144,28 +144,36 @@ _RETRYABLE = {408, 409, 425, 429, 500, 502, 503, 504, 529}
 
 
 def map_http_error(status: int, body: str, *, retry_after: int | None = None) -> ProviderError:
-    """Map an HTTP status + body onto a typed :class:`ProviderError`."""
-    text = (body or "").strip()
-    if len(text) > 400:
-        text = text[:400] + "…"
+    """Map an HTTP status onto a typed :class:`ProviderError`.
+
+    The provider's response body is **never** used as the public message: it is
+    attacker-influenced in the sense that it is arbitrary text the user's key was
+    sent alongside, and it routinely echoes the credential or the request (a 500
+    can quote the whole payload, VIN included). A short readable class of error
+    is enough for the user; the body stays out of the event stream, the logs and
+    the transcript.
+    """
     if status in (401, 403):
         return ProviderError("auth", "the provider rejected the key or permissions",
                              status=status)
     if status == 429:
-        return ProviderError("rate_limit", text or "rate limited",
+        return ProviderError("rate_limit", "the provider is rate limiting requests",
                              retry_after_s=retry_after, status=status)
     if status == 404:
-        return ProviderError("bad_request", text or "unknown model or path", status=status)
+        return ProviderError("bad_request", "the provider has no such model or path",
+                             status=status)
     if status in (400, 422):
-        lowered = text.lower()
+        lowered = (body or "").lower()
         if "context" in lowered and ("length" in lowered or "token" in lowered):
-            return ProviderError("context_length", text, status=status)
-        return ProviderError("bad_request", text or "the provider rejected the request",
+            return ProviderError("context_length",
+                                 "the request exceeded the model's context window",
+                                 status=status)
+        return ProviderError("bad_request", "the provider rejected the request",
                              status=status)
     if status in _RETRYABLE or status >= 500:
-        return ProviderError("unavailable", text or f"provider error {status}",
+        return ProviderError("unavailable", f"the provider failed (HTTP {status})",
                              retry_after_s=retry_after, status=status)
-    return ProviderError("internal", text or f"provider error {status}", status=status)
+    return ProviderError("internal", f"provider error {status}", status=status)
 
 
 def estimate_tokens(text: str) -> int:

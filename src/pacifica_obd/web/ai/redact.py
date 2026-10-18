@@ -19,6 +19,7 @@ import hmac
 import json
 import os
 import re
+from typing import Iterable
 
 __all__ = [
     "FIELD_LIMIT",
@@ -30,6 +31,8 @@ __all__ = [
     "fence",
     "looks_like_injection",
     "redact_secrets",
+    "scrub",
+    "StreamRedactor",
 ]
 
 FIELD_LIMIT = 4096
@@ -91,14 +94,44 @@ def pseudonym(vin: str) -> str:
 
 
 def redact_vin(text, vin: str | None = None, *, enabled: bool = True) -> str:
-    """Replace the VIN with ``<VIN:redacted>`` (or a pseudonym) when enabled."""
+    """Replace the VIN with ``<VIN:redacted>`` (or a pseudonym) when enabled.
+
+    The hex encoding is replaced too: a stored F190 reading carries the VIN both
+    as ASCII and as bytes, and leaving the bytes behind hands it over in a
+    trivially reversible form.
+    """
     value = "" if text is None else str(text)
     if not enabled or not vin:
         return value
-    return value.replace(str(vin), f"<VIN:redacted {pseudonym(vin)}>")
+    marker = f"<VIN:redacted {pseudonym(vin)}>"
+    for form in {str(vin), str(vin).upper(), str(vin).lower()}:
+        value = value.replace(form, marker)
+    encoded = str(vin).encode("utf-8", "replace").hex()
+    for form in {encoded, encoded.upper(), encoded.lower()}:
+        value = value.replace(form, marker)
+    return value
 
 
 _VIN_LIKE = re.compile(r"\b[A-HJ-NPR-Z0-9]{17}\b")
+# An F190 payload is a run of hex bytes; it has to be decoded and inspected,
+# because the VIN inside it is otherwise perfectly readable to the model.
+_HEX_RUN = re.compile(r"\b[0-9A-Fa-f]{20,}\b")
+
+
+def _redact_hex_encoded_vin(text: str) -> str:
+    def replace(match: re.Match) -> str:
+        run = match.group()
+        if len(run) % 2:
+            return run
+        try:
+            decoded = bytes.fromhex(run).decode("latin-1")
+        except ValueError:
+            return run
+        found = _VIN_LIKE.search(decoded)
+        if not found:
+            return run
+        return f"<VIN:redacted {pseudonym(found.group())}>"
+    return _HEX_RUN.sub(replace, text)
 
 
 def redact_vin_text(text, *, enabled: bool = True) -> str:
@@ -106,7 +139,66 @@ def redact_vin_text(text, *, enabled: bool = True) -> str:
     value = "" if text is None else str(text)
     if not enabled:
         return value
-    return _VIN_LIKE.sub(lambda match: f"<VIN:redacted {pseudonym(match.group())}>", value)
+    value = _VIN_LIKE.sub(lambda match: f"<VIN:redacted {pseudonym(match.group())}>", value)
+    return _redact_hex_encoded_vin(value)
+
+
+def scrub(text, *, keys: Iterable[str] = (), vin: str | None = None,
+          enabled: bool = True) -> str:
+    """One place that strips every secret this app knows about from free text.
+
+    Literal keys first (a key with an unusual shape still coincides with itself),
+    then the VIN in both of its encodings, then the VIN shape, and finally the
+    key-shape patterns. Used on every outgoing SSE field, so an error string, a
+    tool payload or a streamed token cannot carry a secret out of the process.
+    """
+    value = "" if text is None else str(text)
+    for key in keys:
+        if key and len(str(key)) >= 6:
+            value = value.replace(str(key), "sk-…redacted")
+    value = redact_vin(value, vin, enabled=enabled)
+    value = redact_vin_text(value, enabled=enabled)
+    try:
+        from pacifica_obd.web.ai.keys import redact_text as _redact_text
+
+        value = _redact_text(value)
+    except Exception:  # noqa: BLE001 - never let redaction break a response
+        pass
+    return value
+
+
+class StreamRedactor:
+    """Redact a token stream without ever emitting half a secret.
+
+    A provider can split a VIN or a key across two SSE chunks, so releasing each
+    chunk as it arrives would leak it. Simply holding back the last N characters
+    is not enough (a secret that does not end at the buffer edge can still be cut).
+    Instead this holds back the tail *up to the last whitespace*, and a VIN or a
+    key never contains whitespace, so a release can never split one.
+    """
+
+    def __init__(self, scrubber, hold: int = 24, hard_limit: int = 8192):
+        self._scrub = scrubber
+        self._hold = max(0, int(hold))
+        self._hard_limit = max(self._hold + 1, int(hard_limit))
+        self._buffer = ""
+
+    def feed(self, chunk: str) -> str:
+        self._buffer += chunk or ""
+        if len(self._buffer) <= self._hold:
+            return ""
+        limit = len(self._buffer) - self._hold
+        boundary = max(self._buffer.rfind(ws, 0, limit) for ws in (" ", "\n", "\t"))
+        if boundary < 0:
+            if len(self._buffer) < self._hard_limit:
+                return ""          # a single long token: keep buffering
+            boundary = limit - 1   # safety valve: unbounded input, release anyway
+        release, self._buffer = self._buffer[:boundary + 1], self._buffer[boundary + 1:]
+        return self._scrub(release)
+
+    def flush(self) -> str:
+        release, self._buffer = self._scrub(self._buffer), ""
+        return release
 
 
 def redact_secrets(text, redactor=None) -> str:

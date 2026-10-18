@@ -26,7 +26,6 @@ from typing import AsyncIterator
 from pacifica_obd.web.ai import redact as redaction
 from pacifica_obd.web.ai import tools as tool_registry
 from pacifica_obd.web.ai.config import AIConfig, estimate_cost
-from pacifica_obd.web.ai.keys import redact_text
 from pacifica_obd.web.ai.prompts import SYSTEM_PROMPT, validate_citations
 from pacifica_obd.web.ai.providers import (
     ChatRequest,
@@ -128,8 +127,24 @@ class ChatEngine:
         self._clock = clock
         self.used_live_reads = 0
         self.fence = Fence(nonce=_nonce())
+        # Everything that leaves the engine passes through this: a provider error
+        # body, a tool payload, or a streamed token can each carry a key or the
+        # VIN. Literal keys come from the key store; the VIN is scrubbed by shape
+        # and in its hex (F190) form.
+        self._keys: tuple[str, ...] = ()
+        try:
+            from pacifica_obd.web.ai.keys import KeyStore
+
+            self._keys = KeyStore().literals()
+        except Exception:  # noqa: BLE001 - an unreadable key file must not break chat
+            self._keys = ()
+        self._redact_vin = bool(getattr(config, "redact_vin", True))
 
     # -- helpers -----------------------------------------------------------
+    def _scrub(self, text) -> str:
+        """One exit gate for every string this engine emits or stores."""
+        return redaction.scrub(text, keys=self._keys, enabled=self._redact_vin)
+
     def _system(self, context_pack: str | None) -> str:
         # The system prompt stays static, trusted text. The evidence pack is
         # *data* and is therefore delivered as a user-role message, never as part
@@ -159,6 +174,7 @@ class ChatEngine:
 
         while rounds < self.max_rounds:
             rounds += 1
+            stream_redactor = redaction.StreamRedactor(self._scrub)
             if cancel is not None and cancel.is_set():
                 yield {"event": "done", "data": {"reason": "cancelled", **self.meter.snapshot()}}
                 return
@@ -201,7 +217,9 @@ class ChatEngine:
                     if isinstance(event, Token):
                         answer_parts.append(event.text)
                         assistant_text.append(event.text)
-                        yield {"event": "token", "data": {"text": event.text}}
+                        chunk = stream_redactor.feed(event.text)
+                        if chunk:
+                            yield {"event": "token", "data": {"text": chunk}}
                     elif isinstance(event, ToolCall):
                         tool_calls.append(event)
                     elif isinstance(event, Usage):
@@ -209,7 +227,7 @@ class ChatEngine:
                         self.meter.add(event)
                     elif isinstance(event, ProviderError):
                         yield {"event": "error", "data": {
-                            **event.as_dict(), "message": redact_text(event.message)}}
+                            **event.as_dict(), "message": self._scrub(event.message)}}
                         yield {"event": "done", "data": {"reason": "error",
                                                          **self.meter.snapshot()}}
                         return
@@ -223,15 +241,22 @@ class ChatEngine:
                 raise
             except ProviderError as exc:
                 yield {"event": "error", "data": {
-                    **exc.as_dict(), "message": redact_text(exc.message)}}
+                    **exc.as_dict(), "message": self._scrub(exc.message)}}
                 yield {"event": "done", "data": {"reason": "error", **self.meter.snapshot()}}
                 return
             except Exception as exc:  # noqa: BLE001 - never leak a raw traceback
                 yield {"event": "error", "data": {
-                    "code": "internal", "message": redact_text(str(exc))[:300],
+                    "code": "internal", "message": self._scrub(str(exc))[:300],
                     "retry_after_s": None}}
                 yield {"event": "done", "data": {"reason": "error", **self.meter.snapshot()}}
                 return
+
+            # Release the held-back tail of this round *before* any non-token
+            # event, so a short answer still arrives as a token (and before the
+            # usage counter) rather than being reordered behind it.
+            tail = stream_redactor.flush()
+            if tail:
+                yield {"event": "token", "data": {"text": tail}}
 
             if usage is not None:
                 yield {"event": "usage", "data": self.meter.snapshot()}
@@ -256,12 +281,15 @@ class ChatEngine:
                                                         for call in handled)))
                 for call in handled:
                     calls_made += 1
+                    safe_args = {k: self._scrub(v) if isinstance(v, str) else v
+                                 for k, v in (call.args or {}).items()}
                     yield {"event": "tool_call", "data": {
-                        "id": call.id, "name": call.name, "args": call.args}}
+                        "id": call.id, "name": call.name, "args": safe_args}}
                     result = await self._dispatch(call)
+                    summary = result.get("summary") or result.get("error") or ""
                     yield {"event": "tool_result", "data": {
                         "id": call.id, "name": call.name,
-                        "summary": result.get("summary") or result.get("error") or "",
+                        "summary": self._scrub(summary),
                         "untrusted": True, "source": result.get("source")}}
                     history.append(Message(
                         role="tool", content=self._fenced(call.name, result),
@@ -310,11 +338,10 @@ class ChatEngine:
                    "error": result.get("error"), "summary": result.get("summary"),
                    "untrusted": True}
         raw = json.dumps(payload, ensure_ascii=True, default=str, sort_keys=True)
-        # VIN redaction is applied to the whole serialised payload, so a VIN in a
-        # stored session, a sample or an F190 reading is masked too — not only in
-        # the two handlers that redact explicitly.
-        raw = redaction.redact_vin_text(raw, enabled=bool(
-            getattr(self.config, "redact_vin", True)))
+        # One exit gate for untrusted payloads too: VIN redaction covers the ASCII
+        # and the hex (F190) form, and a configured key literal can never ride out
+        # inside bus data that merely echoes it back.
+        raw = self._scrub(raw)
         text = redaction.fence(source, name, raw, nonce=self.fence.nonce,
                                limit=self.fence.limit)
         if redaction.looks_like_injection(raw[:2000]):
