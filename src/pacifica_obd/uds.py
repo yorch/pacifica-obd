@@ -8,6 +8,7 @@ identifiers through any object exposing ``cmd(command, wait=...) -> list[str]``
 
 from __future__ import annotations
 
+import inspect
 import re
 
 # ST/ELM protocol presets: 33 = ISO 15765 11-bit 500k (HS/CAN-C),
@@ -365,11 +366,32 @@ def _result(header, uds, **extra) -> dict:
     return base
 
 
+def _seed_ctx(func, level: int, width: int | None) -> dict:
+    """Keyword context to hand a seed->key provider, filtered by its signature.
+
+    A provider may accept ``**kwargs``, a plain ``width``/``level`` keyword, or
+    neither (e.g. a narrow test stub); never pass it an argument it cannot take.
+    """
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return {}
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return {"level": level, "width": width}
+    ctx: dict = {}
+    for name, value in (("level", level), ("width", width)):
+        if name in params:
+            ctx[name] = value
+    return ctx
+
+
 def security_access(elm, level: int, seedkey=None, wait: float = 0.5,
                     expect_header: str | None = None) -> dict:
     """UDS 0x27: request a seed (odd level) and, if a provider allows, send a key.
 
-    `seedkey` is an optional callable seed_int -> key_int. Without it (or if it
+    `seedkey` is an optional callable ``key_int = seedkey(seed_int, **ctx)``.
+    ``ctx`` carries ``level`` and ``width`` (the seed's byte length) so a
+    provider can rebuild leading-zero seeds exactly. Without it (or if it
     returns None) we stop after the seed and report ``no_key_provider``.
     Responses are correlated to `expect_header` when given.
     """
@@ -403,8 +425,11 @@ def security_access(elm, level: int, seedkey=None, wait: float = 0.5,
     if seedkey is None:
         result["status"] = "no_key_provider"
         return result
+    # a provider that opts in can rebuild leading-zero seeds exactly
+    ctx = _seed_ctx(seedkey, level, len(seed_hex) // 2)
     try:
-        key = seedkey(int(seed_hex, 16))
+        seed_int = int(seed_hex, 16)
+        key = seedkey(seed_int, **ctx) if ctx else seedkey(seed_int)
     except Exception as exc:  # noqa: BLE001 - a broken provider must never send a key
         result["status"] = "key_error"
         result["error"] = str(exc)
@@ -412,7 +437,10 @@ def security_access(elm, level: int, seedkey=None, wait: float = 0.5,
     if key is None:
         result["status"] = "no_key_provider"
         return result
-    width = len(seed_hex)
+    # A provider may expose the key's length (e.g. an 8-byte seed with a 4-byte
+    # key); otherwise fall back to the seed length, as UDS classically assumes.
+    key_bytes = getattr(seedkey, "key_width", 0) or len(seed_hex) // 2
+    width = key_bytes * 2
     if type(key) is not int or key < 0 or key >= (1 << (4 * width)):
         result["status"] = "key_overflow"  # bool, str, negative or too wide
         return result

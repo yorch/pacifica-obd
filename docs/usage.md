@@ -387,25 +387,41 @@ also stored as a number, so `monitor` doubles as a poor-man's data logger.
 
 ## security
 
-Request a UDS `0x27` security seed from a module. This is the first half of
-security access: the tool asks for a seed and reports it. **No seed→key provider
-is configured**, so the ECU is left locked — nothing is unlocked by this command.
+Request a UDS `0x27` security seed from a module and, for the modules this
+project ships, compute the FCA/Stellantis PowerNet key **without an external
+provider file** (see [`fca-keys.md`](fca-keys.md)). The default is a **dry run**:
+it reads the seed and reports the algorithm it *would* use — it never sends a
+key. Sending a key needs `--unlock --confirm`.
 
 ```sh
-uv run pacifica-obd security --module 7E0
-uv run pacifica-obd security --module 7E0 --level 1 --json
+uv run pacifica-obd security --module 742 --device-id 11872 --level 1 --explain  # offline
+uv run pacifica-obd security --module 742 --device-id 11872 --level 1            # dry run
+uv run pacifica-obd security --module 742 --device-id 11872 --level 1 --unlock --confirm
+uv run pacifica-obd security --module 7E0 --json
 ```
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--module ID` | **required** | Request ID of the target module. |
 | `--level N` | `1` | Security level (odd = request seed). |
+| `--provider FILE` | — | Custom `key_for(seed, **ctx)`; overrides the built-in selector. |
+| `--ecu NAME` | from `--module` | ECU name for the built-in selector. |
+| `--device-id N`, `--variant N`, `--supplier CODE` | — | Discriminators for the built-in selector. |
+| `--explain` | off | Print the chosen algorithm + ids and exit (no adapter). |
+| `--unlock` | off | Also send the key. Needs `--confirm`. |
+| `--confirm` | off | **Required** with `--unlock`. |
 | `--bus`, `--timeout-ms` | `can-c`, `100` | Bus and per-request timeout. |
 
+The built-in selector picks exactly one algorithm or it **refuses**: an
+ambiguous or unmapped module exits `2` and never sends a key (a wrong key can
+lock a module). It uses a module's device id automatically only when the dataset
+pins a single one; otherwise pass `--device-id`/`--variant` (IPC `11872` is the
+MY2020+ PowerNet unit, `11871` the MY2017 one).
+
 `status` is one of `ok` (seed returned), `already_unlocked` (an all-zero seed),
-`no_key_provider` (seed returned, no key to send), `negative`, `unexpected` or
-`no_response`. Where FCA keeps its seed/key algorithms is out of scope for this
-tool: the `security` command only requests a seed, and no provider is shipped.
+`no_key_provider` (seed returned, no key sent — the dry run), `unlocked`,
+`rejected`, `negative`, `unexpected` or `no_response`. With `--json` the result
+also carries `algorithm` and `ids` when the built-in selector resolved one.
 
 ## write-did
 

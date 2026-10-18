@@ -113,9 +113,10 @@ Not included (deliberately):
   module set. The upstream source stores only parameter *names/units* for these
   ECUs; the formula-bearing tables it does have are for other market ECUs and do
   not key to any RU module, so they are omitted rather than guessed.
-- **No seed/key algorithm or constants.** `seed_key` only records that per-ECU
-  identifiers exist. Keying stays behind the project's pluggable provider model
-  (see `seedkey.py`).
+- **No seed/key algorithm or constants *in this dataset*.** `seed_key` records
+  that per-ECU identifiers exist; the built-in PowerNet seed→key algorithms and
+  their selector live in `pacifica_obd.fca_keys` (see `fca-keys.md`), and the
+  pluggable provider model (`seedkey.py`) remains for anything else.
 - **No long prose** — descriptions are truncated to short phrases.
 - Later RU model years that the upstream tagging does not carry a Pacifica flag
   for (some MY2021+ body rows are unflagged) are not matched by the heuristic;

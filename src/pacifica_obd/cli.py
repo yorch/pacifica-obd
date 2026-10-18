@@ -1496,21 +1496,112 @@ def _addr_and_session(elm, args, wait: float, require: bool = True) -> tuple[str
     return rid, None
 
 
+def _builtin_key_provider(args: argparse.Namespace):
+    """Resolve the built-in PowerNet provider for ``args.module``.
+
+    Returns ``(provider_or_None, info_or_None, ecu_or_None)``. ``provider`` is
+    None when the shipped selector cannot safely pick a single algorithm; the
+    caller reports ``info`` (whose candidate list explains the refusal) and must
+    never send a key in that case.
+    """
+    from pacifica_obd import fca_keys, pacifica_data
+
+    ecu = getattr(args, "ecu", None)
+    module_row = None
+    if args.module is not None:
+        for row in pacifica_data.modules():
+            req = row.get("request")
+            if req is None:
+                continue
+            try:
+                if int(str(req), 16) == args.module:
+                    module_row = row
+                    break
+            except ValueError:
+                continue
+    if ecu is None and module_row is not None:
+        ecu = module_row.get("ecu")
+    if ecu is None:
+        return None, None, None
+
+    device_id = getattr(args, "device_id", None)
+    if device_id is None and module_row is not None:
+        ids = module_row.get("device_ids") or []
+        if len(ids) == 1:  # only auto-resolve when the dataset pins one device
+            device_id = int(ids[0])
+    kwargs = dict(device_id=device_id, variant_id=getattr(args, "variant", None),
+                  supplier=getattr(args, "supplier", None))
+    info = fca_keys.explain(ecu, args.level, **kwargs)
+    if info["status"] != "resolved":
+        return None, info, ecu
+    return fca_keys.provider_for(ecu, args.level, **kwargs), info, ecu
+
+
+def _print_builtin_info(info) -> None:
+    """Print the built-in selector's choice, or why it refused."""
+    if info is None:
+        console.print("[dim]No built-in algorithm: module is not in the dataset.[/dim]")
+        return
+    if info["status"] == "resolved":
+        ids = ", ".join(f"{k}={v}" for k, v in info["ids"].items()) or "none"
+        console.print(f"algorithm: [cyan]{info['algorithm']}[/cyan] "
+                      f"({info['module']} level 0x{info['level']:02X}; {ids})")
+        return
+    console.print(f"[yellow]built-in selector {info['status']}: {info['reason']}[/yellow]")
+    for cand in info["candidates"]:
+        sels = ", ".join(f"{s['field']}={s['value']}" for s in cand["selectors"])
+        console.print(f"  {cand['algorithm']}  ({sels})", style="dim", markup=False)
+
+
 def cmd_security(args: argparse.Namespace) -> None:
     """Request a UDS security seed (0x27); optionally send a key from a provider."""
     if args.unlock and not args.confirm:
         err_console.print("[red]--unlock requires --confirm (a wrong key can lock the ECU).[/red]")
         sys.exit(2)
-    if args.unlock and not args.provider:
-        err_console.print("[red]--unlock requires --provider FILE.[/red]")
-        sys.exit(2)
+
     provider = None
+    builtin_info = None
     if args.provider:
         try:
             provider = load_provider(args.provider)
         except SeedKeyError as exc:
             err_console.print(f"[red]{exc}[/red]")
             sys.exit(2)
+    else:
+        provider, builtin_info, _ecu = _builtin_key_provider(args)
+
+    if args.explain:
+        if args.provider:
+            err_console.print("[dim]--provider overrides the built-in selector; "
+                              "--explain describes only the built-in choice.[/dim]")
+        if builtin_info is not None:
+            info = builtin_info
+        else:
+            info = {"status": "unmapped", "module": getattr(args, "ecu", None),
+                    "level": args.level, "ids": {},
+                    "reason": "module not in the bundled dataset", "candidates": []}
+        if args.json:
+            jdump(info)
+        else:
+            _print_builtin_info(info if builtin_info is not None else None)
+            if builtin_info is None:
+                console.print("[dim]Pass --ecu NAME (e.g. IPC_PN) to inspect a "
+                              "specific module.[/dim]")
+        return
+
+    if args.unlock and provider is None:
+        reason = ("Refusing --unlock: no single seed→key algorithm could be "
+                  "chosen; a wrong key can lock the module.")
+        if args.json:
+            jdump({"module": args.module, "level": args.level,
+                   "status": "refused", "reason": reason,
+                   "selector": builtin_info})
+        else:
+            if builtin_info is not None:
+                _print_builtin_info(builtin_info)
+            err_console.print(f"[red]{reason}[/red]")
+        sys.exit(2)
+
     seedkey = provider if args.unlock else None
 
     wait = max(0.25, args.timeout_ms / 1000 + 0.15)
@@ -1522,16 +1613,30 @@ def cmd_security(args: argparse.Namespace) -> None:
         err_console.print(f"[red]{exc}[/red]")
         sys.exit(2)
     result["module"] = rid
+    if builtin_info is not None:
+        result["selector"] = {"status": builtin_info["status"]}
+        if builtin_info["status"] == "resolved":
+            result["algorithm"] = builtin_info["algorithm"]
+            result["ids"] = builtin_info["ids"]
     if args.json:
         jdump(result)
         return
     console.print(f"[bold]Module {rid} · 0x27 level {args.level:02X}[/bold] -> {result['status']}")
     if result.get("seed"):
         console.print(f"seed: [yellow]{result['seed']}[/yellow]")
+    if builtin_info is not None:
+        _print_builtin_info(builtin_info)
     if result["unlocked"]:
         console.print("[green]Security access granted.[/green]")
+    elif args.unlock:
+        console.print("[dim]Key was rejected by the ECU; it is not left unlocked.[/dim]")
     elif result["status"] == "no_key_provider":
-        console.print("[dim]No seed→key provider; ECU left locked. Use --provider FILE --unlock.[/dim]")
+        if builtin_info is not None and builtin_info["status"] == "resolved":
+            console.print("[dim]Dry run: seed only. Re-run with --unlock --confirm "
+                          "to send the key.[/dim]")
+        else:
+            console.print("[dim]No seed→key provider; ECU left locked. "
+                          "Use --provider FILE or --unlock with a built-in module.[/dim]")
     if args.unlock and not result.get("unlocked"):
         sys.exit(3)
 
@@ -2021,6 +2126,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_sec.add_argument("--module", type=_can_id, required=True, help="request ID, e.g. 7E0")
     p_sec.add_argument("--level", type=int, default=1, help="security level (odd), default 1")
     p_sec.add_argument("--provider", metavar="FILE", help="Python file exposing key_for(seed, **ctx) -> int")
+    p_sec.add_argument("--ecu", metavar="NAME",
+                       help="ECU name for the built-in selector (default: from --module)")
+    p_sec.add_argument("--device-id", type=int, metavar="N",
+                       help="ECU device id for the built-in selector")
+    p_sec.add_argument("--variant", type=lambda s: int(str(s), 0), metavar="N",
+                       help="ECU variant id for the built-in selector (0x.. ok)")
+    p_sec.add_argument("--supplier", metavar="CODE",
+                       help="supplier/isocode for the built-in selector, e.g. 00C6")
+    p_sec.add_argument("--explain", action="store_true",
+                       help="print the built-in selector choice and exit (no adapter)")
     p_sec.add_argument("--unlock", action="store_true", help="also send the key (requires --confirm)")
     p_sec.add_argument("--confirm", action="store_true", help="acknowledge sending a key to the ECU")
     p_sec.add_argument("--bus", choices=["can-c", "can-ihs"], default="can-c")

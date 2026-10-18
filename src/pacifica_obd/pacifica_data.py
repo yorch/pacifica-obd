@@ -48,8 +48,9 @@ Schema
     short English description.
 
 ``seed_key``
-    Marker only: per-ECU identifiers exist, but no seed/key algorithm is
-    shipped (the project keeps a pluggable provider model elsewhere).
+    Marker: per-ECU identifiers exist, and the built-in PowerNet seed->key
+    algorithms plus their selector ship in :mod:`pacifica_obd.fca_keys` (an
+    external ``--provider FILE`` remains supported).
 
 Public API
 ----------

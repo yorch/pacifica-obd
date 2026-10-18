@@ -104,6 +104,7 @@ NAV: list[dict[str, Any]] = [
             ("FCA modules", "docs/fca-modules.md"),
             ("Vehicle assessment", "docs/vehicle-assessment.md"),
             ("FCA seed/key selector", "docs/fca-seedkey-selector.md"),
+            ("FCA built-in seed→key", "docs/fca-keys.md"),
         ],
     },
 ]

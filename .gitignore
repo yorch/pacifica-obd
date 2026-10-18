@@ -20,7 +20,3 @@ vehicle.xml
 vehicle.html
 vehicle-dump.*
 dumps/
-
-# Vendor-extraction tooling (names/parses a third-party app) — never commit.
-# A private copy is kept outside the repo; see AGENTS.md "Safety".
-tools/extract_seedkey.py

@@ -21563,7 +21563,7 @@
  },
  "seed_key": {
   "per_ecu_identifiers": true,
-  "algorithm_included": false,
-  "note": "Per-ECU identifiers exist (ecu/device_ids); no seed-key algorithm is shipped."
+  "algorithm_included": true,
+  "note": "Per-ECU identifiers exist (ecu/device_ids); built-in PowerNet seed->key algorithms and their selector ship in pacifica_obd.fca_keys (see docs/fca-keys.md)."
  }
 }
