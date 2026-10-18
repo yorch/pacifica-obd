@@ -28,6 +28,7 @@ const NAV = [
     { path: "/reports", label: "Reports", glyph: "⎙" },
   ]],
   ["SYSTEM", [
+    { path: "/raw", label: "Raw console", glyph: "»" },
     { path: "/settings", label: "Settings", glyph: "⚙" },
     { path: "/help", label: "Help", glyph: "?" },
   ]],
@@ -44,6 +45,7 @@ const VIEWS = {
   "/capture": () => import("./views/capture.js"),
   "/db": () => import("./views/db.js"),
   "/reports": () => import("./views/reports.js"),
+  "/raw": () => import("./views/raw.js"),
   "/settings": () => import("./views/settings.js"),
   "/help": () => import("./views/help.js"),
 };

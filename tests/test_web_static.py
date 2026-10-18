@@ -46,6 +46,7 @@ REQUIRED = [
     "js/views/capture.js",
     "js/views/db.js",
     "js/views/reports.js",
+    "js/views/raw.js",
     "js/views/settings.js",
     "js/views/help.js",
 ]

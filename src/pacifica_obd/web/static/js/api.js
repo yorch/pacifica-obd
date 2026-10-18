@@ -155,6 +155,10 @@ export const api = {
   routinePreview: (body) => post("/api/writes/routine", body),
   routineConfirm: (body) => post("/api/writes/routine/confirm", body),
 
+  rawAllowlist: (command) => get(`/api/raw/allowlist${command ? query({ command }) : ""}`),
+  raw: (body) => post("/api/raw", body),
+  rawConfirm: (body) => post("/api/raw/confirm", body),
+
   aiProviders: () => get("/api/ai/providers"),
   aiConfig: () => get("/api/ai/config"),
   aiSetConfig: (body) => put("/api/ai/config", body),

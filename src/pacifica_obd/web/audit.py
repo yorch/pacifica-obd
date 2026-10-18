@@ -21,6 +21,8 @@ KINDS = (
     "security-send",
     "security-seed",
     "security-refused",
+    "raw-preview",
+    "raw-send",
 )
 
 

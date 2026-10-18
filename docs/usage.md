@@ -491,6 +491,11 @@ quoted (or use `--header 7E0`).
     writes are refused, and with a bypass cable installed a mistake is *more*
     likely to be accepted by the vehicle, not less.
 
+For a guarded alternative, the web UI's **Raw console** (`#/raw`) sends one
+bounded command at a time and classifies it into read / confirm / deny tiers
+before anything reaches the adapter (see [Web UI](web-ui.md)); the CLI `raw`
+command above stays the expert escape hatch.
+
 ## history
 
 Stored vehicles plus the most recent sessions (command, status, VIN).
@@ -573,9 +578,23 @@ uv run --extra web pacifica-obd web
 Screens: Dashboard (`#/`), Live data (`#/live`), Modules & DTCs (`#/modules`),
 DIDs / module info (`#/dids`), Security 0x27 (`#/security`), Writes (`#/writes`),
 Assistant (`#/assistant`), Capture (`#/capture`), Database (`#/db`), Reports
-(`#/reports`), Settings (`#/settings`) and Help (`#/help`). It reaches parity
-with the CLI's read commands and adds gauges, a time-series chart with replay, a
-session comparison, CSV export and print-to-PDF reports.
+(`#/reports`), Raw console (`#/raw`), Settings (`#/settings`) and Help
+(`#/help`). It reaches parity with the CLI's read commands and adds gauges, a
+time-series chart with replay, a session comparison, CSV export and print-to-PDF
+reports.
+
+The **Raw console** (`#/raw`) is the one screen that sends an arbitrary command,
+but it is **not unfiltered**: one bounded command per submit (hex bytes or a
+single `AT…` command; a second smuggled command is refused) is classified into
+three tiers before anything is sent — **read** (sent immediately: OBD modes
+`01 03 07 09 0A`, UDS `10 19 22 23 24 2A 3E`, and a conservative AT allowlist),
+**confirm** (write mode only, a single-use token plus a typed acknowledgement
+naming the exact bytes) and **deny** (never sent: mode `04`, UDS
+`27 2E 31 2F 3D 34 35 36 37 11 14 28 85`, and the reset/EEPROM/monitor AT
+families). Every send is audited. The classifier lives in
+`src/pacifica_obd/raw_guard.py` and the tier table is served to the UI by
+`GET /api/raw/allowlist`. The CLI's `raw` command is unchanged and remains the
+expert escape hatch.
 
 The write surfaces are **structurally absent** unless `--allow-writes` is given:
 the routes are not registered, and a request to them returns `403 readonly`. In

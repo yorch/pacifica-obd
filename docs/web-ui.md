@@ -3,8 +3,9 @@
 Status: **stages 1 and 2 built.** Stage 1 is the read-only web UI (§1–§4, §6);
 stage 2 adds the guarded write surface (§3.7/§3.8), the `0x27` held-seed policy
 (§9.2) and the bring-your-own-key AI layer (§5), built to the owner decisions in
-§9. Sections §7/§8 and §9.1–§9.4 remain the design record. Nothing here changes
-the protocol layer or the safety rules in `AGENTS.md`.
+§9. **Stage 3 adds the Raw console (§3.14).** Sections §7/§8 and §9.1–§9.4 remain
+the design record. Nothing here changes the protocol layer or the safety rules in
+`AGENTS.md`.
 
 ## 0. Scope
 
@@ -733,19 +734,42 @@ button that cancels the current job. This mirrors the TUI's status line and
 
 ---
 
-### 3.14 Raw console — `#/raw`
+### 3.14 Raw console — `#/raw`  — **built (stage 3)**
 
-- **Purpose:** the `raw` command, but **not unfiltered**. A read-only SID
-  allowlist (`01 02 03 07 09 0A 19 22 3E`, plus `10 01` for session control) is
-  accepted in read-only mode; any other service, and any command that would
-  change persistence (`ATSP` — EEPROM write), is refused. `ATCAF0`/`ATCFC0`
-  (which break framed multi-frame parsing) require the guarded confirm (§4.5).
-- **Key interactions:** a request history with exact request/response lines,
-  the current `ATSH`/`ATCRA` context, and a "reset addressing" action. One
-  bounded command per submit; no multi-line injection.
-- **Endpoints:** `POST /api/raw` (mode + SID gated).
-- **States:** *Disabled* until connected; *Refused* with the reason for a
-  non-allowlisted SID; *Loading/Error* per command.
+- **Purpose:** the `raw` command, but **not unfiltered**. Every command is
+  classified *before it is sent* by one pure, dependency-free module
+  (`src/pacifica_obd/raw_guard.py`, shared so the CLI/TUI can adopt it later) into
+  one of three tiers:
+
+  | Tier | Sent when | Covers |
+  |---|---|---|
+  | **read** | immediately, no confirmation | OBD modes `01 03 07 09 0A`; UDS services `10 19 22 23 24 2A 3E`; a conservative AT allowlist (`ATI ATRV ATDP ATDPN ATSH ATCRA ATAR ATTP ATS1 ATS0 ATH1 ATH0 ATE0 ATE1 ATL1 ATL0 ATCAF0 ATCAF1 ATD`) |
+  | **confirm** | write mode + a single-use token + a typed acknowledgement equal to the exact bytes | any other service id, and any other `AT…` command |
+  | **deny** | never, in any mode | OBD `04`; UDS `27 2E 31 2F 3D 34 35 36 37 11 14 28 85`; AT `ATFCSM*/ATFCSH*/ATFCSD*`, `ATZ ATWS ATRST ATMA ATWM* ATSW* ATPPS* ATSP*` |
+
+  A deny carries the reason and, where one exists, a pointer to the screen that
+  *does* expose the operation (Security `0x27`, Guarded writes). The parser is
+  reject-first: a command containing `\r`, `\n`, `;` or a backtick, that is longer
+  than 64 characters, or that is not exactly one hex request or one `AT…` command
+  (a smuggled second command — `ATI 22F190`, `22F190;2E`, `ATI\r\n2E F1 90`) is
+  refused outright.
+- **Two bypasses closed after adversarial review.** `ATCAF0` is read-tier, but
+  with auto-formatting off the adapter sends the hex bytes literally, so the first
+  data byte becomes the ISO-TP PCI and `0104000000000000` would deliver service
+  `04` (clear DTCs) while classifying as a mode-01 read: every hex request
+  re-asserts `ATCAF1` first and refuses if the adapter does not confirm it. The
+  `ATWM`/`ATSW`/`ATPPS` deny families are matched as prefixes, so the
+  argument-bearing ELM forms (`ATWM112233`) cannot slip to the confirm tier.
+- **Key interactions:** a command input with a tier badge that updates as you
+  type (read = neutral, confirm = amber, deny = red with the reason and a pointer
+  link), an allowlist reference panel, a response area with the raw adapter lines
+  and the parsed frames, a session history, and the typed-confirm modal.
+- **Endpoints:** `POST /api/raw` (read tier sends; confirm tier previews and mints
+  a token; deny is a 4xx), `POST /api/raw/confirm` (token + typed ack only),
+  `GET /api/raw/allowlist` (the tiers as data; `?command=` also classifies).
+- **States:** *Read-only* (confirm refused while reads still work); *Refused* with
+  the reason for a deny; *Confirmed* via the modal; *Loading/Error* per command.
+- The CLI's `raw` command is **unchanged** — it stays the expert escape hatch.
 
 ### 3.15 Help — `#/help`
 
@@ -818,7 +842,7 @@ Legend: **R** = read-only, **W** = write/guarded, **S** = streaming.
 | POST | `/api/vin` | `vin` | mode 09 02 with UDS F190 fallback |
 | GET | `/api/status` | TUI status line | current bus, protocol, lock holder |
 | POST | `/api/bus` | TUI bus selector | `{bus:"can-c"|"can-ihs"|"both"}` |
-| POST | `/api/raw` | `raw` | `{commands:[...], header?, protocol?, headers?, no_auto_format?, no_flow_control?, allow_long?}` — **SID-allowlisted** in read-only mode; `ATSP` and other persistence-changing commands refused (§3.14) |
+| POST | `/api/raw` | `raw` | `{command, timeout_ms?}` — one bounded command, classified into read/confirm/deny (§3.14). Read tier sends; confirm tier previews and returns a `confirm_token`; deny is a 4xx. `GET /api/raw/allowlist` returns the tiers as data; `POST /api/raw/confirm` sends a reviewed confirm-tier command |
 
 **Generic OBD-II**
 
@@ -2352,3 +2376,76 @@ Real findings and their fixes:
 8. **"What will be sent" omitted the evidence pack; saved chats could not be
    deleted.** Fixed: the preview can include the pack (`?task=`) and a
    `DELETE /api/ai/conversations` endpoint plus a Settings button were added.
+
+---
+
+## How to run — stage 3 (Raw console)
+
+The Raw console (`#/raw`) appears under **System** in the nav rail. It works in
+the default read-only server; only its confirm tier needs a write-enabled server.
+
+```sh
+uv sync --extra web
+uv run pacifica-obd web --demo                 # read tier only
+uv run pacifica-obd web --demo --allow-writes  # confirm tier enabled too
+```
+
+Type one command — either hex bytes (`22F190`, `22 F1 90`) or one `AT…` command —
+and press **Send**. The tier badge updates as you type, from the same classifier
+the server uses (`GET /api/raw/allowlist?command=…`):
+
+* **read** — sent immediately. The response area shows the raw adapter lines and,
+  where the reply frames, the parsed `(response id, UDS payload)` pairs.
+* **confirm** — a preview shows the exact bytes and mints a single-use,
+  120 s token; **Confirm and send** opens the typed-confirm modal, which requires
+  typing the exact bytes. In read-only mode the confirm tier is refused.
+* **deny** — refused with the reason and, where one exists, a link to the screen
+  that exposes it (Security `0x27`, Guarded writes). Nothing reaches the adapter.
+
+The reference panel lists the whole tier table from `GET /api/raw/allowlist`, so
+the UI and the tests can never disagree about what is allowed. Every send (read
+and confirm) writes a `raw-send` event to the store's `events` table with the
+exact bytes and the outcome.
+
+### Tests
+
+```sh
+uv run python tests/test_raw_guard.py              # the full tier table + bypasses
+uv run --extra web python tests/test_web_raw.py    # HTTP: read/deny/confirm, audit, read-only
+```
+
+### Adversarial review (stage 3)
+
+One review (`codex exec … "aimed squarely at bypassing the tiers"`) against
+`raw_guard.py`, `routes/raw.py`, `confirm.py` and the app middleware. Real
+findings and fixes:
+
+1. **`ATCAF0` let a read-tier hex request carry a denied service** (critical).
+   With auto-formatting off the adapter sends the hex bytes literally, so the
+   first data byte is the ISO-TP PCI and `0104000000000000` delivers service `04`
+   (clear DTCs) while classifying as a mode-01 read. Fixed: every hex request
+   re-asserts `ATCAF1` and refuses if the adapter does not confirm it, so the
+   inherited-state variant is closed too.
+2. **Argument-bearing `ATWM`/`ATSW` reached the confirm tier** (high). The deny
+   families were matched exactly, so `ATWM112233`/`ATSW96` classified as confirm
+   and could be sent in write mode. Fixed: the deny families are matched as
+   prefixes, with regression cases.
+3. **The generation check ran before the adapter was acquired** (medium). A token
+   minted while the adapter was closed could be confirmed after it opened. Fixed:
+   the confirm-tier preview acquires the adapter and binds the token to *that*
+   generation, the confirmation acquires the adapter first and compares the
+   generation immediately before transmitting, and the generation field is
+   required.
+4. **A read could transmit after cancellation during adapter acquisition**
+   (medium). Fixed: the read path checks cancellation after `ctx.uds()` and
+   immediately before the send, matching the confirm path.
+5. **Acknowledged control characters** (low). The exact-byte acknowledgement
+   folded all whitespace, so `AT\r\nCFC0` passed. Fixed: control characters are
+   refused. Case/space folding is kept (as the module-id acknowledgement in
+   `writes.py` does); it cannot change the transmitted bytes, which are held
+   server-side.
+
+Also accepted: audit is best-effort, so the response now reports whether the
+`raw-send` event was stored (`audit.stored`). No parser smuggling, unicode or
+control-character bypass was found beyond the above, and the adapter is only ever
+reached inside a `BusWorker` job.

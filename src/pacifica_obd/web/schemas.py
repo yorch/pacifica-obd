@@ -163,6 +163,19 @@ class WriteConfirmRequest(BaseModel):
     acknowledgement: str = Field(min_length=1, max_length=32)
 
 
+# -- raw console (design §3.14) -------------------------------------------- #
+class RawCommandRequest(BaseModel):
+    command: str = Field(min_length=1, max_length=256)
+    timeout_ms: int = 100
+
+
+class RawConfirmRequest(BaseModel):
+    """Only the token and the typed acknowledgement (the exact command bytes)."""
+
+    confirm_token: str = Field(min_length=8, max_length=256)
+    acknowledgement: str = Field(min_length=1, max_length=256)
+
+
 # -- AI -------------------------------------------------------------------- #
 class AIConfigPatch(BaseModel):
     provider: str | None = None

@@ -49,6 +49,9 @@ class ConfirmEntry:
     created: float = 0.0
     ttl_s: float = DEFAULT_TTL_S
     used: bool = False
+    #: When set, the typed acknowledgement must equal this string instead of the
+    #: normalised module id (the raw console acknowledges the exact command bytes).
+    ack: str | None = None
 
     def expired(self, now: float) -> bool:
         return now - self.created >= self.ttl_s
@@ -66,6 +69,20 @@ def _normalise_module(value) -> str:
     return "%03X" % number
 
 
+def _normalise_ack(value) -> str:
+    """Canonicalise a typed acknowledgement: uppercase, whitespace removed.
+
+    Control characters are refused: a raw command is a single line, so an
+    acknowledgement containing ``\\r``/``\\n``/``\\x1b`` is never a real one and is
+    rejected rather than silently collapsed.
+    """
+    text = str(value)
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in text):
+        raise ConfirmError("acknowledgement",
+                           "the acknowledgement cannot contain control characters")
+    return "".join(text.split()).upper()
+
+
 class ConfirmTokenStore:
     """In-process, thread-safe store of previewed-but-not-yet-sent operations."""
 
@@ -81,16 +98,22 @@ class ConfirmTokenStore:
             return len(self._entries)
 
     def issue(self, *, kind: str, module, bus: str, request: str,
-              params: dict | None = None, ttl_s: float | None = None) -> ConfirmEntry:
+              params: dict | None = None, ttl_s: float | None = None,
+              ack: str | None = None) -> ConfirmEntry:
+        if ack is None:
+            ack_value, module_id = None, _normalise_module(module)
+        else:
+            ack_value, module_id = _normalise_ack(ack), str(module)
         entry = ConfirmEntry(
             token=secrets.token_urlsafe(32),
             kind=str(kind),
-            module=_normalise_module(module),
+            module=module_id,
             bus=str(bus),
             request=str(request).upper(),
             params=dict(params or {}),
             created=self._clock(),
             ttl_s=float(self.ttl_s if ttl_s is None else ttl_s),
+            ack=ack_value,
         )
         with self._lock:
             self._purge_locked()
@@ -127,10 +150,18 @@ class ConfirmTokenStore:
                     "mismatch",
                     f"token belongs to a {entry.kind!r} preview, not {kind!r}",
                 )
-            if _normalise_module(acknowledgement) != entry.module:
+            if entry.ack is not None:
+                matches = _normalise_ack(acknowledgement) == entry.ack
+            else:
+                try:
+                    matches = _normalise_module(acknowledgement) == entry.module
+                except ConfirmError:
+                    matches = False
+            if not matches:
+                expected = entry.ack if entry.ack is not None else entry.module
                 raise ConfirmError(
                     "acknowledgement",
-                    f"type the module id ({entry.module}) to confirm",
+                    f"type {expected} to confirm",
                 )
             burned = ConfirmEntry(**{**entry.__dict__, "used": True})
             self._entries[token] = burned

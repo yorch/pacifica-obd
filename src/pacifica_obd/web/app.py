@@ -46,7 +46,7 @@ READ_ONLY = True
 # Routes that can change a module or a stored secret, or spend money. They require
 # the custom header as well as a JSON body and a same-origin Origin (design §4.5).
 _WRITE_PREFIXES = ("/api/writes/", "/api/security/unlock", "/api/ai/keys/",
-                   "/api/ai/chat", "/api/ai/tasks/")
+                   "/api/ai/chat", "/api/ai/tasks/", "/api/raw")
 _WRITE_EXACT = ("/api/ai/keys", "/api/ai/config", "/api/ai/conversations")
 
 _CSP = (
@@ -268,6 +268,7 @@ def create_app(settings: Settings | None = None, *, worker: BusWorker | None = N
     from pacifica_obd.web.routes import db as db_routes
     from pacifica_obd.web.routes import live as live_routes
     from pacifica_obd.web.routes import obd as obd_routes
+    from pacifica_obd.web.routes import raw as raw_routes
     from pacifica_obd.web.routes import reports as report_routes
     from pacifica_obd.web.routes import security as security_routes
     from pacifica_obd.web.routes import settings as settings_routes
@@ -286,6 +287,9 @@ def create_app(settings: Settings | None = None, *, worker: BusWorker | None = N
     app.include_router(ai_routes.router, prefix="/api")
     # Security explain/seed/preview are reads of the bus; always available.
     app.include_router(security_routes.router, prefix="/api")
+    # The raw console is always available; its confirm tier is refused (403) in
+    # read-only mode inside the route, so the read tier keeps working.
+    app.include_router(raw_routes.router, prefix="/api")
 
     if settings.read_only:
         # Read-only: the write routes are not registered at all. A stray request
