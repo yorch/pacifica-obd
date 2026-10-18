@@ -35,6 +35,7 @@ __all__ = [
     "SecurityLease",
     "SendKeyDecision",
     "SecurityLeaseStore",
+    "SendRefused",
     "normalize_module",
     "normalize_seed",
     "key_request",
@@ -102,9 +103,15 @@ class SecurityLease:
     key_hex: str | None = None
     algorithm: str | None = None
     params: dict | None = None
+    #: Set by :meth:`SecurityLeaseStore.authorize`, at the moment of transmit.
+    authorized: bool = False
 
     def expired(self, now: float) -> bool:
         return now - self.created >= self.ttl_s
+
+
+class SendRefused(RuntimeError):
+    """The final pre-transmit authorisation refused. Nothing was sent."""
 
 
 @dataclass(frozen=True)
@@ -274,6 +281,55 @@ class SecurityLeaseStore:
                                re_read=True, lease=lease)
 
     # -- internals ---------------------------------------------------------
+    def authorize(self, token: str, *, module, level: int, bus: str | None = None,
+                  generation: str = "") -> SendKeyDecision:
+        """The **final** gate: re-validate immediately before the key is sent.
+
+        ``consume`` burns the lease and returns a positive decision, but the
+        caller then configures the bus and opens a diagnostic session — seconds
+        during which the lease can expire or be superseded by a newer seed
+        request. Without this check a positive decision would survive expiry and
+        the key would go out anyway (independent adversarial review finding).
+        A successful authorisation is itself single-use.
+        """
+        level = int(level)
+        want_module = normalize_module(module)
+        want_bus = str(bus) if bus else None
+        with self._lock:
+            self._purge_locked()  # drops anything past its TTL
+            lease = self._leases.get(token or "")
+            if lease is None:
+                return SendKeyDecision(False, "expired",
+                                       "the held seed expired before the key was sent")
+            if (lease.module != want_module or lease.level != level
+                    or lease.bus != want_bus):
+                return SendKeyDecision(False, "mismatch",
+                                       "the held seed is for a different target",
+                                       lease=lease)
+            if str(generation or "") != lease.generation:
+                return SendKeyDecision(
+                    False, "generation_mismatch",
+                    "the adapter connection changed before the key was sent", lease=lease)
+            lease_key = self._key(lease.module, lease.level, lease.bus)
+            if lease.epoch != self._epochs.get(lease_key, 0):
+                return SendKeyDecision(
+                    False, "superseded",
+                    "a newer seed request replaced this preview", lease=lease)
+            if not lease.used:
+                return SendKeyDecision(False, "not_consumed",
+                                       "this seed was never confirmed", lease=lease)
+            if lease.authorized:
+                return SendKeyDecision(False, "consumed",
+                                       "this seed already authorised a send", lease=lease)
+            if lease.expired(self._clock()):
+                return SendKeyDecision(False, "expired",
+                                       "the held seed expired before the key was sent",
+                                       lease=lease)
+            authorized = replace(lease, authorized=True)
+            self._leases[token] = authorized
+            return SendKeyDecision(True, "ok", "authorised at transmit",
+                                   seed=lease.seed, lease=authorized)
+
     def _purge_locked(self) -> None:
         now = self._clock()
         for token, lease in list(self._leases.items()):

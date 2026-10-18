@@ -761,16 +761,27 @@ def preview_security_key(adapter, *, bus: str, module, level: int,
 
 def send_security_key_guarded(adapter, *, bus: str, module, level: int,
                               key_hex: str, timeout_ms: int = 100,
-                              cancel: Cancel = None) -> dict:
+                              cancel: Cancel = None, authorize=None) -> dict:
     """Send a reviewed key once, on an extended session, to the verified responder.
 
     This never requests a seed: the held-seed policy makes the lease (checked by
     the caller) authoritative. Strict mode re-reads in the caller before this is
     reached.
+
+    ``authorize`` is called **after** the session is open and immediately before
+    the key is written: opening a session takes seconds, during which the lease
+    can expire or be superseded, so the caller's earlier ``consume`` is not
+    sufficient authorisation to transmit. If it refuses, nothing is sent and
+    :class:`~pacifica_obd.security.SendRefused` is raised.
     """
     rid, expected = require_extended_session(adapter, bus=bus, module=module,
                                              timeout_ms=timeout_ms, cancel=cancel)
     _ensure_live(cancel)  # do not transmit if the client/job went away
+    if authorize is not None:
+        decision = authorize()
+        if not getattr(decision, "send", False):
+            raise security_policy.SendRefused(
+                getattr(decision, "reason", "the held seed is no longer valid"))
     result = uds_send_security_key(adapter, int(level), key_hex,
                                    wait=read_wait(timeout_ms),
                                    expect_header=expected)

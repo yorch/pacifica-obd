@@ -23,7 +23,7 @@ import asyncio
 
 from fastapi import APIRouter, Request
 
-from pacifica_obd.security import SecurityLeaseStore
+from pacifica_obd.security import SecurityLeaseStore, SendRefused
 from pacifica_obd.web import audit, deps, errors, service
 from pacifica_obd.web.schemas import (
     SecurityPreviewRequest,
@@ -239,12 +239,29 @@ async def _unlock(request: Request, body: SecurityUnlockRequest):
             result = service.send_security_key_guarded(
                 adapter, bus=lease.bus, module=lease.module, level=lease.level,
                 key_hex=key_hex, timeout_ms=timeout_ms, cancel=ctx.cancel,
+                # Re-checked at the last instant: opening the session below can
+                # outlive the lease, and a stale positive decision must not send.
+                authorize=lambda: lease_store.authorize(
+                    body.confirm_token, module=lease.module, level=lease.level,
+                    bus=lease.bus,
+                    generation=str(getattr(ctx.worker.backend, "generation", 0))),
             )
+        except SendRefused as exc:
+            audit.record(ctx.store, session_id, "security-refused",
+                         f"{lease.module} 27{lease.level + 1:02X}",
+                         {"module": lease.module, "bus": lease.bus,
+                          "level": "%02X" % (lease.level + 1), "sent": False,
+                          "outcome": "refused_at_transmit", "reason": str(exc)[:200]})
+            ctx.close_session(session_id, "refused")
+            raise errors.ApiError("confirm_stale", "confirm", str(exc),
+                                  status="superseded") from exc
         except Exception as exc:  # noqa: BLE001 - audit the failure, then re-raise
+            # The failure may have happened before or during the write, so the
+            # audit says "unknown" rather than claiming the key went out.
             audit.record(ctx.store, session_id, "security-send",
                          f"{lease.module} 27{lease.level + 1:02X}",
                          {"module": lease.module, "bus": lease.bus,
-                          "level": "%02X" % (lease.level + 1), "sent": True,
+                          "level": "%02X" % (lease.level + 1), "sent": None,
                           "outcome": "error", "error": str(exc)[:200],
                           "key_bytes": len(key_hex) // 2})
             ctx.close_session(session_id, "error")
