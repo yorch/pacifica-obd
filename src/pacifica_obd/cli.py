@@ -174,10 +174,12 @@ def find_port(explicit: str | None) -> str | None:
     return ports[0]
 
 
-def connect(args: argparse.Namespace) -> obd.OBD:
+def connect(args: argparse.Namespace, *, exit_on_error: bool = True) -> obd.OBD:
     out = diag(args)
     port = find_port(args.port)
     if not port:
+        if not exit_on_error:
+            raise AdapterError("no serial port found (is the vLinker FS plugged in?)")
         out.print("[bold red]No serial port found.[/bold red]")
         out.print("Plug in the vLinker FS and check `ls /dev/cu.usb*`.")
         sys.exit(2)
@@ -192,6 +194,8 @@ def connect(args: argparse.Namespace) -> obd.OBD:
             check_voltage=args.check_voltage,
         )
     except Exception as exc:  # noqa: BLE001 - surface any driver error clearly
+        if not exit_on_error:
+            raise AdapterError(f"could not open {port}: {exc}") from exc
         out.print(f"[bold red]Could not open the port:[/bold red] {exc}")
         out.print("Is another app (FORScan, screen, …) holding it open?")
         sys.exit(2)
@@ -210,11 +214,17 @@ def connect(args: argparse.Namespace) -> obd.OBD:
 # --------------------------------------------------------------------------- #
 # raw-ELM (UDS) helpers
 # --------------------------------------------------------------------------- #
-def open_elm(args: argparse.Namespace) -> ElmAdapter:
-    """Open the adapter via the device layer (protocol snapshot/restore on close)."""
+def open_elm(args: argparse.Namespace, *, exit_on_error: bool = True) -> ElmAdapter:
+    """Open the adapter via the device layer (protocol snapshot/restore on close).
+
+    With ``exit_on_error=False`` the failure is raised as ``AdapterError`` so a
+    caller (e.g. the resumable ``dump``) can record it instead of exiting.
+    """
     try:
         return ElmAdapter(port=args.port, baudrate=args.baud, timeout=args.timeout)
     except AdapterError as exc:
+        if not exit_on_error:
+            raise
         err_console.print(f"[red]{exc}[/red]")
         sys.exit(2)
 
@@ -1637,8 +1647,15 @@ def build_vehicle_dump(args: argparse.Namespace) -> dict:
     vin = normalize_vin(getattr(args, "vin", None))
 
     if not args.no_generic:
-        conn = connect(args)
+        conn = None
         try:
+            conn = connect(args, exit_on_error=False)
+            dump["generic"] = {
+                "dtcs": {"stored": [], "pending": [], "permanent": []},
+                "readiness": {},
+                "live": {},
+                "supported_pids": 0,
+            }
             voltage = _obd_value(conn, obd.commands.ELM_VOLTAGE)
             dump["adapter"] = {
                 "port": conn.port_name(),
@@ -1660,6 +1677,9 @@ def build_vehicle_dump(args: argparse.Namespace) -> dict:
                 _codes(conn, obd.commands.GET_PERMANENT_DTC)
                 if hasattr(obd.commands, "GET_PERMANENT_DTC") else []
             )
+            dump["generic"]["dtcs"].update(
+                {"stored": stored, "pending": pending, "permanent": permanent}
+            )
 
             readiness: dict = {}
             status = conn.query(obd.commands.STATUS)
@@ -1677,6 +1697,7 @@ def build_vehicle_dump(args: argparse.Namespace) -> dict:
                     and not [n for n, v in available if not v.complete],
                     "monitors": [{"name": n, "complete": bool(v.complete)} for n, v in available],
                 }
+                dump["generic"]["readiness"] = readiness
 
             live = {}
             for name in DEFAULT_WATCH:
@@ -1684,6 +1705,12 @@ def build_vehicle_dump(args: argparse.Namespace) -> dict:
                 if command is not None:
                     live[name] = _obd_value(conn, command)
 
+            dump["generic"]["live"] = {
+                k: (None if v is None else str(v)) for k, v in live.items()
+            }
+            dump["generic"]["supported_pids"] = len(
+                [c for c in conn.supported_commands if not c.command.startswith(b"AT")]
+            )
             dump["generic"] = {
                 "dtcs": {"stored": stored, "pending": pending, "permanent": permanent},
                 "readiness": readiness,
@@ -1692,20 +1719,31 @@ def build_vehicle_dump(args: argparse.Namespace) -> dict:
                     [c for c in conn.supported_commands if not c.command.startswith(b"AT")]
                 ),
             }
+        except (AdapterError, Elm327Error) as exc:
+            dump["aborted"] = f"generic pass failed: {exc}"
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
         time.sleep(0.3)  # let the adapter settle before the UDS pass reopens it
 
     if not args.no_uds:
         buses = ["can-c", "can-ihs"] if args.bus == "both" else [args.bus]
         wait = max(0.25, args.timeout_ms / 1000 + 0.15)
-        elm = open_elm(args)
+        elm = None
         try:
+            elm = open_elm(args, exit_on_error=False)
             for bus in buses:
                 diag(args).print(f"[dim]Dumping {bus} (STP {_BUS_PROTOCOL[bus]})…[/dim]")
                 configure_bus(elm, bus, args.timeout_ms)
                 for target in _probe_ids_multi(elm, args.start, args.end, ("1003", "22F100", "22F190"), wait, receive_id=module_response_id):
                     rid = target["request_id"]
+                    module_record = {
+                        "bus": bus, "request_id": rid, "response_id": target.get("response_id"),
+                        "kind": target.get("kind"), "dtcs": [], "identification": {},
+                    }
+                    # Record the module before reading it so a mid-module failure
+                    # still keeps whatever was collected.
+                    dump["modules"].append(module_record)
                     elm.cmd("ATSH " + rid)
                     expect = _enter_session(elm, rid, wait)
                     _, dtc_uds = _parse_uds_frame(elm.cmd("1902FF", wait=wait), prefer_header=expect)
@@ -1713,7 +1751,8 @@ def build_vehicle_dump(args: argparse.Namespace) -> dict:
                         _enrich_dtcs(_parse_dtcs(dtc_uds))
                         if dtc_uds and _classify_dtc_response(dtc_uds) == "ok" else []
                     )
-                    identification = {}
+                    module_record["dtcs"] = dtcs
+                    identification = module_record["identification"]
                     for did in _INFO_DIDS:
                         record = _read_did(elm, did, wait, expect_header=expect)
                         identification[record["did"]] = {
@@ -1726,12 +1765,11 @@ def build_vehicle_dump(args: argparse.Namespace) -> dict:
                         )
                         if did == 0xF190 and record["status"] == "ok" and looks_like_vin(record.get("ascii")):
                             vin = vin or record["ascii"]
-                    dump["modules"].append(
-                        {"bus": bus, "request_id": rid, "response_id": target.get("response_id"),
-                         "kind": target.get("kind"), "dtcs": dtcs, "identification": identification}
-                    )
+        except (AdapterError, Elm327Error) as exc:
+            dump["aborted"] = f"uds pass failed: {exc}"
         finally:
-            elm.close()
+            if elm is not None:
+                elm.close()
 
     year = year_from_vin(vin)
     profile = resolve_profile(year=year) if vin else None
@@ -1760,7 +1798,20 @@ def cmd_dump(args: argparse.Namespace) -> None:
         err_console.print("[red]--end must be >= --start.[/red]")
         sys.exit(2)
     formats = [f.strip().lower() for f in args.formats.split(",") if f.strip()]
-    dump = build_vehicle_dump(args)
+    try:
+        dump = build_vehicle_dump(args)
+    except (AdapterError, Elm327Error) as exc:  # last-resort guard
+        err_console.print(f"[red]Adapter error during the dump: {exc}[/red]")
+        dump = {
+            "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "tool": {"name": "pacifica-obd", "version": _tool_version()},
+            "adapter": {}, "vehicle": {}, "generic": {}, "modules": [], "readings": [],
+            "totals": {"modules": 0, "dtcs": 0, "readings": 0}, "aborted": str(exc),
+        }
+    if dump.get("aborted"):
+        err_console.print(
+            f"[yellow]Partial dump — the adapter stopped mid-run: {dump['aborted']}[/yellow]"
+        )
 
     if args.out:
         out_dir = os.path.expanduser(args.out)
@@ -1798,7 +1849,14 @@ def cmd_dump(args: argparse.Namespace) -> None:
             store.add_dtcs(session, vin, "obd", "PCM", [code], None)
 
     if args.json:
-        jdump({"formats": formats, "files": [str(path) for path in paths], "totals": dump["totals"]})
+        jdump({
+            "formats": formats,
+            "files": [str(path) for path in paths],
+            "totals": dump["totals"],
+            "aborted": dump.get("aborted"),
+        })
+        if dump.get("aborted"):
+            sys.exit(3)
         return
     for path in paths:
         console.print(f"[green]wrote[/green] {path}")
@@ -1806,6 +1864,9 @@ def cmd_dump(args: argparse.Namespace) -> None:
         f"[dim]{dump['totals']['modules']} module(s), {dump['totals']['dtcs']} DTC(s), "
         f"{dump['totals']['readings']} reading(s)[/dim]"
     )
+    if dump.get("aborted"):
+        # Artifacts were written, but the scan did not finish: signal it to scripts.
+        sys.exit(3)
 
 
 # --------------------------------------------------------------------------- #

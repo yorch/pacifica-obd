@@ -60,7 +60,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from types import SimpleNamespace
 
 from obd.codes import DTC as _DTC_TEXT
 from rich.table import Table
@@ -98,7 +97,6 @@ from pacifica_obd.adapter import (
 from pacifica_obd.cli import (
     DEFAULT_BAUD,
     DEFAULT_WATCH,
-    _addr_and_session,
     _FREEZE_PIDS,
     _WRITE_WARNING,
 )
@@ -727,21 +725,28 @@ def _addressed_session(
 ) -> tuple[str, str]:
     """Configure the bus, address `module` and require an extended session.
 
-    Delegates to the CLI's guard, which refuses to return unless the ECU
-    answered ``5003`` — without that, a write could land on whatever ECU was
-    selected by the previous command. It then additionally requires the session
-    responder to match the independently known response address: otherwise a
-    stray ECU's session (and later its seed/acknowledgement) would be treated as
-    this module's, and a key could be sent to the wrong address.
+    Deliberately *not* ``cli._addr_and_session``: that helper leaves the receive
+    filter untouched (a filter left by an earlier read would hide this module's
+    session reply) and forces ISO-TP flow control into user-defined mode, which
+    switches the STN to an indexed frame format that breaks multi-frame parsing
+    (see AGENTS.md). The receive filter is pointed at the responder instead, and
+    the ECU must answer ``5003`` — without that, a write could land on whatever
+    ECU was selected by the previous command.
     """
-    args = SimpleNamespace(bus=bus, timeout_ms=timeout_ms, module=int(module, 16))
-    rid, header = _addr_and_session(elm, args, wait)
-    mapped = _known_response_id(rid)
-    if mapped is not None and header is not None and header != mapped:
-        raise AdapterError(
-            f"module {rid} answered from {header}, expected {mapped}; refusing"
-        )
-    return rid, header  # type: ignore[return-value]
+    configure_bus(elm, bus, timeout_ms)
+    reset_flow_control(elm)  # stay in the adapter's automatic mode
+    rid = _parse_module_id(module) or module
+    if not _address(elm, rid):
+        raise AdapterError(f"could not address module {rid}; refusing")
+    expected = _known_response_id(rid)
+    header, uds = _parse_uds_frame(elm.cmd("1003", wait=wait), prefer_header=expected)
+    if header is None or not (uds or "").startswith("5003"):
+        raise AdapterError(f"module {rid} did not enter an extended session; refusing")
+    if expected is not None and header != expected:
+        # A stray ECU answered: its session (and later its seed/ack) must not be
+        # treated as this module's, or a key could be sent to the wrong address.
+        raise AdapterError(f"module {rid} answered from {header}, expected {expected}; refusing")
+    return rid, header
 
 
 # --------------------------------------------------------------------------- #

@@ -14,8 +14,9 @@ raw ELM327/STN transport for manufacturer-specific UDS work.
 - Package manager: **uv**. Run anything via `uv run …`.
 - Install/sync: `uv sync`
 - Lint by hand (no configured linter): keep lines ≤ ~100 chars, no unused imports.
-- Tests are manual/CLI; there is no test suite yet (add one if you change the
-  protocol layer — see below).
+- Tests are manual/CLI; `tests/` holds standalone checks (no pytest needed):
+  `uv run python tests/test_dump_resilience.py`. Add one if you change the
+  protocol/CLI layer.
 
 ```sh
 uv run pacifica-obd --help

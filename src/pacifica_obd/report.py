@@ -144,6 +144,15 @@ def dump_to_html(dump: dict) -> str:
     vin = vehicle.get("vin")
     dtc_total = totals.get("dtcs", 0)
 
+    aborted = dump.get("aborted")
+    aborted_html = (
+        f'<div class="banner" style="border:1px solid #b45309;background:#fff7ed;'
+        f'color:#7c2d12;padding:.7rem 1rem;border-radius:.5rem;margin:1rem 0">'
+        f'<strong>Partial capture.</strong> The adapter stopped before the scan finished: '
+        f'{_esc(aborted)}</div>'
+        if aborted else ""
+    )
+
     cards = "".join(
         f'<div class="card"><div class="k">{_esc(k)}</div><div class="v">{_esc(v)}</div></div>'
         for k, v in (
@@ -225,6 +234,7 @@ def dump_to_html(dump: dict) -> str:
     · profile {_esc(vehicle.get('profile_id')) or 'n/a'} · generated {_esc(dump.get('generated_at'))}</div>
   <div class="cards">{cards}</div>
 </header>
+{aborted_html}
 
 <h2>Adapter</h2>{kv_table(adapter)}
 <h2>Vehicle</h2>{kv_table(vehicle)}

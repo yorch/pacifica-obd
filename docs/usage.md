@@ -49,6 +49,22 @@ file.
 | `0` | Success (an empty result is still success). |
 | `1` | Nothing to read: no local database yet (`history`, `show`, `vehicles`), or no module answered (`monitor`). |
 | `2` | Adapter/usage failure: no serial port, port busy, adapter rejected a command, bad arguments, or a guarded write attempted without `--confirm`. |
+| `3` | `dump` started but the adapter failed mid-scan. The files it had collected are still written and marked `aborted` (JSON field) / "Partial capture" (HTML banner). |
+
+### Partial captures
+
+`dump` collects the generic OBD‑II pass and the UDS pass separately and commits
+results as it goes. If the adapter drops mid‑scan (USB dropout, another app
+grabbing the port), the command:
+
+1. keeps everything already read (the module it was on included, with whatever
+   DTCs/DIDs it had returned),
+2. sets `"aborted"` in the JSON, shows a **Partial capture** banner in the HTML —
+   and the field is `null` when the scan completed,
+3. writes the files anyway, then exits `3`.
+
+So a dropout no longer discards a multi‑minute scan, and scripts can tell a
+partial result (`3`) from a complete one (`0`).
 
 ## Command map
 
