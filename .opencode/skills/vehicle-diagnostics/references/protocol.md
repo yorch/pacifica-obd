@@ -39,24 +39,36 @@ switch with `STP`, don't assume both are live. Configure framing with `ATH1`
 - Consecutive Frames: nibble `2`, sequence `1,2,3,…`; reject dupes/reorders.
 - Classic CAN carries ≤ 8 bytes per frame.
 
-## Flow control — the silent killer
+## Receive filter (ATCRA) — the silent killer
 
-Multi-frame replies (e.g. the 20-byte VIN) require the tester to send an
-ISO-TP **Flow Control** frame back to the responder. The adapter's automatic FC
-is not reliable for non-standard address pairs, so **set it explicitly per
-module**: `ATFCSM1`, `ATFCSH <responder_id>`, `ATFCSD 3000`.
+By default the adapter only accepts a reply whose address is `request + 8`.
+Most modules answer **elsewhere**: `request − 0x280` on CAN-C chassis and on
+CAN-IHS, and `+1` for the SGW. Their replies are **silently dropped**, so the
+module looks like "no response". Before probing or reading a module, set the
+receive address to the expected responder: **`ATCRA <resp_id>`**.
 
-Without this, a module that *does* answer looks like **"no response"** because
-its First Frame never completes. On a Pacifica Hybrid this hid **21 of 25
-modules**. `ATZ` clears the setting, so re-apply it for each module (and after
-any reset).
+Derive the responder: `7E0`–`7E7` → `+8`; otherwise `request − 0x280` (covers
+CAN-C chassis and CAN-IHS); SGW `47E → 47F`. Prefer the response ID you actually
+discovered. A **stale filter hides every other module** (the "first module
+works, the rest are silent" bug), so set it per module — or `ATAR` to clear it.
 
-## Receive filter (ATCRA) — handle with care
+Verified: `742` without a filter → `NO DATA`; with `ATCRA 4C2` → answers.
 
-`ATCRA <responder_id>` restricts the adapter to that address. It is useful, but
-**a stale filter hides every other module** — the classic "the first module
-works, the rest are silent" bug. Either update it as you move between modules or
-clear it (`ATAR`) before switching.
+## Flow control — and its limit
+
+Multi-frame replies (e.g. the 20-byte VIN) need the tester to send an ISO-TP
+**Flow Control** frame. The adapter's **automatic** flow control completes these
+**only for the `+8` convention** (`7E0`–`7E7`). For `−0x280` and CAN-IHS pairs a
+multi-frame reply stalls after the first frame. So:
+
+- **discover with a single-frame probe** — `22F100` is 4 bytes and works for
+  every module; `10 03` also works on many. `22F190` is multi-frame and will
+  miss the `−0x280` set.
+- expect long DIDs (`F190`, `F187`) on `−0x280`/CAN-IHS modules to be truncated
+  or unavailable; short ones (`F100`) read fine.
+- Explicit `ATFCSM1` + `ATFCSH` + `ATFCSD` did **not** fix it here and *broke
+  parsing* (the adapter switched to an indexed `0:`/`1:` frame format). Reach for
+  `ATCRA` first, not FC.
 
 ## Addressing rules (validated on hardware)
 

@@ -52,6 +52,7 @@ from pacifica_obd.profiles import (
     looks_like_vin,
     normalize_vin,
     resolve as resolve_profile,
+    response_id as module_response_id,
     year_from_vin,
 )
 from pacifica_obd.report import write_dump
@@ -347,11 +348,14 @@ def _read_uds_vin(args: argparse.Namespace) -> str | None:
     try:
         for bus in ("can-c", "can-ihs"):
             configure_bus(elm, bus, timeout_ms)
-            for _name, request, _response in module_addresses(bus):
+            for _name, request, _response in module_addresses(bus, powertrain="phev"):
                 rid = "%03X" % request
                 elm.cmd("ATSH " + rid)
+                try:
+                    elm.cmd("ATCRA %03X" % module_response_id(request))
+                except ValueError:
+                    pass
                 expect = _enter_session(elm, rid, wait)
-                configure_flow_control(elm, expect or rid)
                 record = _read_did(elm, 0xF190, wait, expect_header=expect)
                 if record["status"] == "ok" and looks_like_vin(record.get("ascii")):
                     return record["ascii"]
@@ -783,7 +787,7 @@ def cmd_modules(args: argparse.Namespace) -> None:
     try:
         configure_bus(elm, args.bus, args.timeout_ms)
 
-        for entry in _probe_ids_multi(elm, start, end, (args.session, "22F190"), wait):
+        for entry in _probe_ids_multi(elm, start, end, (args.session, "22F100", "22F190"), wait, receive_id=module_response_id):
             if args.identify:
                 elm.cmd("ATSH " + entry["request_id"])
                 _, vin_uds = _parse_uds_frame(elm.cmd("22F190", wait=wait))
@@ -859,7 +863,7 @@ def cmd_dtc_all(args: argparse.Namespace) -> None:
             if module:
                 targets = [{"request_id": module}]
             else:
-                targets = list(_probe_ids_multi(elm, start, end, ("1003", "22F190"), wait))
+                targets = list(_probe_ids_multi(elm, start, end, ("1003", "22F100", "22F190"), wait, receive_id=module_response_id))
 
             for target in targets:
                 rid = target["request_id"]
@@ -951,8 +955,11 @@ def cmd_read_did(args: argparse.Namespace) -> None:
     try:
         configure_bus(elm, args.bus, args.timeout_ms)
         elm.cmd("ATSH " + rid)
+        try:
+            elm.cmd("ATCRA %03X" % module_response_id(args.module))
+        except ValueError:
+            pass
         expect = _enter_session(elm, rid, wait)  # correlate replies to this ECU
-        configure_flow_control(elm, expect or rid)
         for did in args.dids:
             record = _read_did(elm, did, wait, expect_header=expect)
             record["module"] = rid
@@ -1003,12 +1010,15 @@ def cmd_module_info(args: argparse.Namespace) -> None:
             else:
                 request_ids = [
                     target["request_id"]
-                    for target in _probe_ids_multi(elm, args.start, args.end, ("1003", "22F190"), wait)
+                    for target in _probe_ids_multi(elm, args.start, args.end, ("1003", "22F100", "22F190"), wait, receive_id=module_response_id)
                 ]
             for rid in request_ids:
                 elm.cmd("ATSH " + rid)
+                try:
+                    elm.cmd("ATCRA %03X" % module_response_id(int(rid, 16)))
+                except (ValueError, TypeError):
+                    pass
                 expect = _enter_session(elm, rid, wait)
-                configure_flow_control(elm, expect or rid)
                 for did in _INFO_DIDS:
                     record = _read_did(elm, did, wait, expect_header=expect)
                     record["module"] = rid
@@ -1075,7 +1085,7 @@ def cmd_capture(args: argparse.Namespace) -> None:
         for bus in buses:
             diag(args).print(f"[dim]Capturing {bus} (STP {_BUS_PROTOCOL[bus]})…[/dim]")
             configure_bus(elm, bus, args.timeout_ms)
-            for target in _probe_ids_multi(elm, args.start, args.end, ("1003", "22F190"), wait):
+            for target in _probe_ids_multi(elm, args.start, args.end, ("1003", "22F100", "22F190"), wait, receive_id=module_response_id):
                 rid = target["request_id"]
                 elm.cmd("ATSH " + rid)
                 expect = _enter_session(elm, rid, wait)
@@ -1285,7 +1295,7 @@ def cmd_monitor(args: argparse.Namespace) -> None:
         if args.module is not None:
             modules = ["%03X" % args.module]
         else:
-            modules = [t["request_id"] for t in _probe_ids_multi(elm, args.start, args.end, ("1003", "22F190"), wait)]
+            modules = [t["request_id"] for t in _probe_ids_multi(elm, args.start, args.end, ("1003", "22F100", "22F190"), wait, receive_id=module_response_id)]
         if not modules:
             err_console.print("[yellow]No modules responded.[/yellow]")
             sys.exit(1)
@@ -1656,7 +1666,7 @@ def build_vehicle_dump(args: argparse.Namespace) -> dict:
             for bus in buses:
                 diag(args).print(f"[dim]Dumping {bus} (STP {_BUS_PROTOCOL[bus]})…[/dim]")
                 configure_bus(elm, bus, args.timeout_ms)
-                for target in _probe_ids_multi(elm, args.start, args.end, ("1003", "22F190"), wait):
+                for target in _probe_ids_multi(elm, args.start, args.end, ("1003", "22F100", "22F190"), wait, receive_id=module_response_id):
                     rid = target["request_id"]
                     elm.cmd("ATSH " + rid)
                     expect = _enter_session(elm, rid, wait)

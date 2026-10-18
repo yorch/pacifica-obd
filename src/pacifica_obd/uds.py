@@ -155,11 +155,13 @@ def probe_ids(elm, start: int, end: int, probe: str, wait: float):
         }
 
 
-def probe_ids_multi(elm, start: int, end: int, probes, wait: float):
+def probe_ids_multi(elm, start: int, end: int, probes, wait: float, receive_id=None):
     """Probe each ID with several services (e.g. 1003 then 22F190).
 
     Many modules reject `10 03` but answer `22 F190` (and vice versa), so trying
-    more than one service materially improves discovery.
+    more than one service materially improves discovery. `receive_id(request)`
+    returns the address to accept replies from (the ELM otherwise expects
+    `request+8` and silently drops `-0x280` and CAN-IHS answers).
     """
     if isinstance(probes, str):
         probes = [probes]
@@ -170,8 +172,11 @@ def probe_ids_multi(elm, start: int, end: int, probes, wait: float):
             if rid in known:
                 continue
             elm.cmd("ATSH %03X" % rid)
-            for command in ("ATFCSM1", "ATFCSH%03X" % rid, "ATFCSD3000"):
-                elm.cmd(command)  # best-effort flow control for non-standard pairs
+            if receive_id is not None:
+                try:
+                    elm.cmd("ATCRA %03X" % receive_id(rid))
+                except Exception:  # noqa: BLE001 - no mapping (e.g. broadcast)
+                    elm.cmd("ATAR")
             header, uds = parse_uds_frame(elm.cmd(probe, wait=wait))
             if header is None:
                 continue
@@ -263,6 +268,7 @@ def read_dtcs(elm, expect_header: str | None = None, wait: float = 0.5) -> tuple
 # Data identifiers (UDS 0x22)
 # --------------------------------------------------------------------------- #
 DID_NAMES = {
+    0xF100: "Supplier identifier",
     0xF186: "Active diagnostic session",
     0xF187: "Spare part number",
     0xF188: "ECU software number",

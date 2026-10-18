@@ -12,12 +12,13 @@ mislead the user if you don't follow the protocol rules below.
 
 ## The one thing that matters most
 
-An ELM327/STN adapter will happily talk to the four OBD-II modules in the
-`7E8`–`7EF` block and **pretend that is the whole car**. It is not. On a
-Pacifica Hybrid, configuring the adapter's receive filter and ISO-TP flow
-control raised the visible module count from **4 to 25**. If you skip flow
-control, every chassis (`-0x280`) module and every CAN-IHS module looks like
-"no response" and you will report a healthy car as nearly dead.
+An ELM327/STN adapter only accepts replies from `request + 8` by default, so it
+will happily talk to the four modules in the `7E8`–`7EF` block and **pretend
+that is the whole car**. It is not: most modules answer at `request − 0x280`
+(CAN-C chassis and CAN-IHS) or `+1` (SGW), and their replies are **silently
+dropped** — they look like "no response". Setting the adapter's **receive filter
+(`ATCRA <responder>`)** and discovering with a **single-frame probe** (`22F100`)
+raised the visible module count from **4 to 32** on a Pacifica Hybrid.
 
 If you take one thing from this skill: **read `references/protocol.md` before
 trusting any "module did not respond" result.**
