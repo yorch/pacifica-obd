@@ -1,0 +1,43 @@
+/* Print stylesheet — "print is a first-class target" (design §2.5 rule 7).
+ *
+ * White background, black text, no chrome, pills become bracketed text, and the
+ * data tables/lists keep their rows together so a report prints cleanly on one
+ * page. Loaded with media="print" from index.html.
+ */
+@media print {
+  :root, [data-theme="dark"] {
+    color-scheme: light;
+    --bg: #ffffff; --bg-soft: #ffffff; --panel: #ffffff; --panel-soft: #ffffff;
+    --panel-raised: #ffffff;
+    --text: #000000; --text-soft: #1a1a1a; --muted: #444444;
+    --border: #bbbbbb; --border-strong: #888888;
+    --accent: #000000; --accent-ink: #000000; --on-accent: #ffffff;
+    --shadow: none; --shadow-sm: none; --shadow-lg: none;
+    --gauge-track: #dddddd; --gauge-tick: #666666; --gauge-redline: #999999;
+  }
+  body { background: #fff; color: #000; font-size: 11pt; }
+  .rail, .topbar, .toasts, .card__actions, .toolbar, .pager, .view__head .btn,
+  .recording, .legend, .skip-link, .cellcopy, .tabs, .drawer-backdrop { display: none !important; }
+  .shell { display: block; }
+  .view { padding: 0; max-width: none; }
+  .card { break-inside: avoid; border: 1px solid #ccc; box-shadow: none; margin: 0 0 12pt; }
+  .card__head { background: #fff; border-bottom: 1px solid #ccc; }
+  .kpi { border: 1px solid #ccc; box-shadow: none; }
+  .grid--kpi { display: flex; flex-wrap: wrap; gap: 10pt; }
+  .kpi { flex: 1 1 140pt; }
+  .pill, .untrusted {
+    background: #fff !important; color: #000 !important; border: 1px solid #999;
+    font-weight: 400;
+  }
+  .pill::before { content: "["; }
+  .pill::after { content: "]"; }
+  table.data { font-size: 9.5pt; }
+  table.data thead th { position: static; background: #fff; color: #000; border-bottom: 1pt solid #000; }
+  table.data tbody td { border-bottom: 1px solid #ddd; }
+  table.data tr { break-inside: avoid; }
+  .table-wrap { max-height: none; overflow: visible; }
+  .chart { break-inside: avoid; }
+  a { color: #000; text-decoration: none; }
+  a[href]::after { content: ""; }
+  .banner { border: 1px solid #999; background: #fff; color: #000; break-inside: avoid; }
+}

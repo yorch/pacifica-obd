@@ -20,3 +20,6 @@ vehicle.xml
 vehicle.html
 vehicle-dump.*
 dumps/
+
+# macOS metadata
+.DS_Store

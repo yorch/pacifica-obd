@@ -94,6 +94,7 @@ partial result (`3`) from a complete one (`0`).
 | [`show`](#show) | — | Everything stored for one VIN. |
 | [`vehicles`](#vehicles) | — | Vehicles with stored records. |
 | [`tui`](#tui) | both | Interactive Textual UI over the same helpers. |
+| [`web`](#web) | both | Local web UI (read-only; optional `[web]` extra). |
 
 ## ports
 
@@ -531,6 +532,52 @@ uv run pacifica-obd tui
 
 Press ++ctrl+c++ (or quit from the UI) and the previous adapter protocol is
 restored before the port closes.
+
+## web
+
+A local, **read-only** web UI served from the same source tree. It is an
+**optional extra**: the CLI and TUI keep working without it.
+
+```sh
+uv sync --extra web                     # installs fastapi + uvicorn + httpx
+uv run pacifica-obd web                 # http://127.0.0.1:8765
+uv run pacifica-obd web --port 9000
+uv run pacifica-obd web --demo          # synthetic adapter + a seeded database
+uv run pacifica-obd web --token         # requires a bearer token; prints a #t=… URL
+uv run pacifica-obd web --open          # open a browser
+uv run --extra web pacifica-obd-web     # same server, standalone entry point
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--host HOST` | `127.0.0.1` | Bind address. Never `0.0.0.0` without `--allow-remote`. |
+| `--port N` | `8765` | TCP port. |
+| `--token [TOKEN]` | off | Require `Authorization: Bearer …`. A bare flag generates one and prints a URL with the token in the **fragment** (never sent to the server or written to a log). |
+| `--demo` | off | Synthetic adapter + a seeded `pacifica.db` so the UI is explorable with no car. |
+| `--open` | off | Open the UI in a browser. |
+| `--allow-remote` | off | Permit a non-loopback bind (requires `--token`). |
+
+With the extra missing, the command prints an install hint and exits `1` instead
+of raising an import error:
+
+```text
+uv sync --extra web
+uv run --extra web pacifica-obd web
+```
+
+Screens: Dashboard (`#/`), Live data (`#/live`), Modules & DTCs (`#/modules`),
+DIDs / module info (`#/dids`), Capture (`#/capture`), Database (`#/db`),
+Reports (`#/reports`), Settings (`#/settings`) and Help (`#/help`). It reaches
+parity with the CLI's read commands and adds gauges, a time-series chart with
+replay, a session comparison, CSV export and print-to-PDF reports.
+
+**Read-only in this build.** There is no write, clear, routine, `0x27` or AI
+endpoint at all — not a disabled one — so "read-only" is structural. The same
+rule as the CLI/TUI applies: one owner talks to the adapter at a time, and each
+request runs as a job on a single worker thread (a second bus operation while a
+stream is running is refused with `409 bus_busy`).
+
+See [Web UI](web-ui.md) for the design, the API catalogue, and how to run it.
 
 ## Storage and environment
 

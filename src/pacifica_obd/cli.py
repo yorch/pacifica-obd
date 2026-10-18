@@ -44,6 +44,7 @@ from pacifica_obd.adapter import (
     restore_protocol,
 )
 from pacifica_obd.elm import Elm327, Elm327Error
+from pacifica_obd.obd_guard import is_read_only_command
 from pacifica_obd.database import EcuDatabase
 from pacifica_obd.profiles import (
     DEFAULT_PROFILE,
@@ -467,9 +468,11 @@ def _render_codes(codes: list[dict], label: str) -> None:
 def cmd_live(args: argparse.Namespace) -> None:
     conn = connect(args)
     rows = []
-    for cmd in sorted(conn.supported_commands, key=lambda c: c.name):
-        if cmd_text(cmd).startswith("AT"):
-            continue
+    # Only mode 01 is a read. ``supported_commands`` also holds CLEAR_DTC (mode
+    # 04) and the mode 03/06/09 requests, so querying everything would clear the
+    # codes we are here to read (see pacifica_obd.obd_guard).
+    for cmd in sorted((c for c in conn.supported_commands if is_read_only_command(c)),
+                      key=lambda c: c.name):
         resp = conn.query(cmd)
         rows.append(
             {
@@ -715,7 +718,7 @@ def cmd_freeze(args: argparse.Namespace) -> None:
 
 def cmd_scan(args: argparse.Namespace) -> None:
     conn = connect(args)
-    n_pids = len([c for c in conn.supported_commands if not c.command.startswith(b"AT")])
+    n_pids = len([c for c in conn.supported_commands if is_read_only_command(c)])
     data = {
         "status": str(conn.status()),
         "protocol": conn.protocol_name(),
@@ -1294,6 +1297,36 @@ def cmd_tui(args: argparse.Namespace) -> None:
     run()
 
 
+def cmd_web(args: argparse.Namespace) -> None:
+    """Launch the local web UI (read-only in this build).
+
+    The web stack is an optional extra: the import is deliberately lazy and the
+    call is wrapped, so this module (and the CLI/TUI) keeps working when FastAPI
+    is not installed and the user gets a one-line install hint instead of a
+    traceback.
+    """
+    try:
+        from pacifica_obd.web.__main__ import run_server
+
+        run_server(
+            host=args.host,
+            port=args.port,
+            token=args.token,
+            read_only=True,
+            demo=args.demo,
+            open_browser=args.open,
+            allow_remote=args.allow_remote,
+        )
+    except ImportError as exc:  # pragma: no cover - depends on the optional extra
+        err_console.print(f"[red]Web UI not available: {exc}[/red]")
+        err_console.print(
+            "Install the web extra, then re-run:\n"
+            "  [bold]uv sync --extra web[/bold]\n"
+            "  [bold]uv run --extra web pacifica-obd web[/bold]"
+        )
+        sys.exit(1)
+
+
 def cmd_vehicles(args: argparse.Namespace) -> None:
     """List vehicles we have records for."""
     store = _open_store(args)
@@ -1814,14 +1847,14 @@ def build_vehicle_dump(args: argparse.Namespace) -> dict:
                 k: (None if v is None else str(v)) for k, v in live.items()
             }
             dump["generic"]["supported_pids"] = len(
-                [c for c in conn.supported_commands if not c.command.startswith(b"AT")]
+                [c for c in conn.supported_commands if is_read_only_command(c)]
             )
             dump["generic"] = {
                 "dtcs": {"stored": stored, "pending": pending, "permanent": permanent},
                 "readiness": readiness,
                 "live": {k: (None if v is None else str(v)) for k, v in live.items()},
                 "supported_pids": len(
-                    [c for c in conn.supported_commands if not c.command.startswith(b"AT")]
+                    [c for c in conn.supported_commands if is_read_only_command(c)]
                 ),
             }
         except (AdapterError, Elm327Error) as exc:
@@ -2100,6 +2133,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_show.set_defaults(func=cmd_show)
 
     sub.add_parser("tui", help="launch the interactive Textual UI").set_defaults(func=cmd_tui)
+
+    p_web = sub.add_parser("web", help="launch the local web UI (needs the [web] extra)")
+    p_web.add_argument("--host", default="127.0.0.1",
+                       help="bind address (default 127.0.0.1; never 0.0.0.0 without --allow-remote)")
+    p_web.add_argument("--port", type=int, default=8765, help="TCP port (default 8765)")
+    p_web.add_argument("--token", nargs="?", const=True, default=None,
+                       help="require a bearer token; bare --token generates and prints one")
+    p_web.add_argument("--demo", action="store_true",
+                       help="synthetic adapter + seeded DB (no car needed)")
+    p_web.add_argument("--open", action="store_true", help="open the UI in a browser")
+    p_web.add_argument("--allow-remote", action="store_true",
+                       help="allow a non-loopback bind (requires --token)")
+    p_web.set_defaults(func=cmd_web)
 
     p_vehicles = sub.add_parser("vehicles", help="list vehicles with stored records")
     p_vehicles.set_defaults(func=cmd_vehicles)

@@ -330,11 +330,13 @@ class Store:
 
     def add_sample(self, session_id: int | None, vin: str | None, bus: str, module: str,
                    did: str, name: str | None, value_num: float | None, value_text: str | None,
-                   unit: str | None = None, status: str = "ok", raw: str | None = None) -> None:
+                   unit: str | None = None, status: str = "ok", raw: str | None = None,
+                   ts: str | None = None) -> None:
         self._execute(
             """INSERT INTO samples (session_id, ts, vin, bus, module, did, name, value_num, value_text, unit, status, raw)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (session_id, _now(), vin, bus, module, did, name, value_num, value_text, unit, status, raw),
+            (session_id, ts or _now(), vin, bus, module, did, name, value_num, value_text,
+             unit, status, raw),
         )
         # high-rate samples go to the JSONL log only, not the events table
         self._append_log({"kind": "sample", "session_id": session_id, "module": module, "did": did,
