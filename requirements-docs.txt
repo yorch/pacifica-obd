@@ -1,5 +1,6 @@
-# Documentation-site build dependencies (used by .github/workflows/pages.yml).
+# Documentation-site build dependencies (used by .github/workflows/pages.yml, tools/build_site.py).
 # Kept out of pyproject.toml on purpose: the published tool must not grow a docs
-# dependency, the site is built in CI, and MkDocs Material brings its own
-# Markdown/Pygments stack.
-mkdocs-material>=9.5,<10
+# dependency; the site is built in CI by a small hand-written generator.
+# The Markdown in docs/ is the source of truth; nothing here renders at runtime.
+markdown>=3.6,<4
+pygments>=2.17,<3

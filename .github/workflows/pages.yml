@@ -1,6 +1,7 @@
-# Build the pacifica-obd documentation site with MkDocs Material and deploy it
+# Build the pacifica-obd documentation site with tools/build_site.py and deploy it
 # to GitHub Pages. The Markdown in docs/ is the source of truth: this workflow
-# only builds it (into site/, an artifact — never a committed directory).
+# only renders it into site/, which is uploaded as an artifact and never
+# committed (the repository .gitignore is intentionally left untouched).
 name: Docs (GitHub Pages)
 
 on:
@@ -40,10 +41,11 @@ jobs:
       - name: Install documentation dependencies
         run: pip install -r requirements-docs.txt
 
-      # --strict turns any warning (broken link, missing nav target, bad anchor)
-      # into a build failure, so the published site cannot silently rot.
+      # The generator is strict about obvious breakage (missing templates, bad
+      # tokens) and reports the pages it rendered; --out site keeps the artifact
+      # path in one place. Build logs list any nav entry whose file is missing.
       - name: Build the site
-        run: mkdocs build --strict
+        run: python tools/build_site.py --out site --verbose
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v6

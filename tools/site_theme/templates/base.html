@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="{{LANG}}" data-theme="light" class="no-js">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{TITLE}}</title>
+<meta name="description" content="{{DESCRIPTION}}">
+<meta name="author" content="{{AUTHOR}}">
+<meta name="color-scheme" content="light dark">
+<link rel="canonical" href="{{CANONICAL}}">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="{{SITE_NAME}}">
+<meta property="og:title" content="{{HEADING}}">
+<meta property="og:description" content="{{DESCRIPTION}}">
+<meta property="og:url" content="{{CANONICAL}}">
+<meta name="twitter:card" content="summary">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0b0f16" media="(prefers-color-scheme: dark)">
+<link rel="icon" href="{{REL}}assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="{{REL}}assets/site.css">
+<script>
+/* Applied before first paint so the saved theme never flashes. */
+(function () {
+  var root = document.documentElement;
+  root.classList.remove('no-js');
+  root.classList.add('js');
+  try {
+    var saved = localStorage.getItem('pacifica-obd-theme');
+    var prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    root.setAttribute('data-theme', saved === 'dark' || saved === 'light' ? saved : (prefersDark ? 'dark' : 'light'));
+  } catch (error) {
+    root.setAttribute('data-theme', 'light');
+  }
+})();
+</script>
+</head>
+<body class="{{BODY_CLASS}}" data-source="{{SOURCE_PATH}}">
+<a class="skip-link" href="#main">Skip to content</a>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <button class="icon-button nav-toggle" type="button" data-nav-toggle aria-expanded="false" aria-controls="sidebar" aria-label="Navigation menu">
+      <span class="icon-open">{{ICON_MENU}}</span>
+      <span class="icon-close">{{ICON_CLOSE}}</span>
+    </button>
+
+    <a class="brand" href="{{REL}}index.html">
+      <span class="brand-mark" aria-hidden="true"><span></span></span>
+      <span class="brand-text">
+        <span class="brand-name">{{SITE_NAME}}</span>
+        <span class="brand-tagline">{{SITE_TAGLINE}}</span>
+      </span>
+    </a>
+
+    <div class="search" data-search>
+      <button class="icon-button search-toggle" type="button" data-search-toggle aria-expanded="false" aria-controls="search-panel" aria-label="Search the documentation">
+        {{ICON_SEARCH}}
+        <span class="search-toggle-label">Search</span>
+        <kbd class="search-toggle-kbd" data-search-kbd aria-hidden="true">⌘K</kbd>
+      </button>
+      <div class="search-panel" id="search-panel" data-search-panel hidden>
+        <div class="search-field">
+          {{ICON_SEARCH}}
+          <input id="search-input" data-search-input type="search" placeholder="Search the docs…" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="Search the documentation" aria-controls="search-results" aria-expanded="false" role="combobox">
+          <button class="icon-button search-close" type="button" data-search-close aria-label="Close search">{{ICON_CLOSE}}</button>
+        </div>
+        <ul class="search-results" id="search-results" data-search-results role="listbox" aria-label="Search results"></ul>
+        <p class="search-hint" data-search-hint aria-live="polite">Type to search every page · <kbd>↑</kbd><kbd>↓</kbd> to move · <kbd>Enter</kbd> to open · <kbd>Esc</kbd> to close</p>
+      </div>
+    </div>
+
+    <div class="topbar-actions">
+      <button class="icon-button theme-toggle" type="button" data-theme-toggle aria-label="Dark theme" aria-pressed="false" title="Switch theme">
+        <span class="icon-light">{{ICON_SUN}}</span>
+        <span class="icon-dark">{{ICON_MOON}}</span>
+      </button>
+      <a class="icon-button github-link" href="{{REPO_URL}}" rel="noopener" title="pacifica-obd on GitHub" aria-label="pacifica-obd on GitHub">
+        {{ICON_EXTERNAL}}
+        <span class="github-label">GitHub</span>
+      </a>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+  <aside class="sidebar" id="sidebar" data-sidebar>
+    <div class="sidebar-inner">
+      <div class="sidebar-top">
+        <span class="sidebar-title">Documentation</span>
+        <button class="icon-button sidebar-close" type="button" data-nav-close aria-label="Close navigation">{{ICON_CLOSE}}</button>
+      </div>
+      {{NAV}}
+      <div class="sidebar-foot">
+        <a class="sidebar-link" href="{{REL}}all-pages/index.html">{{ICON_LIST}}<span>All pages</span></a>
+        <a class="sidebar-link" href="{{REPO_URL}}" rel="noopener">{{ICON_EXTERNAL}}<span>Repository</span></a>
+      </div>
+    </div>
+  </aside>
+
+  <div class="scrim" data-scrim hidden></div>
+
+  <main class="content" id="main" tabindex="-1">
+    <div class="content-inner">
+      {{BREADCRUMBS}}
+      {{TOC_MOBILE}}
+      <article class="prose">
+        {{CONTENT}}
+      </article>
+
+      <footer class="page-footer">
+        <a class="edit-link" href="{{EDIT_URL}}" rel="noopener">
+          {{ICON_PENCIL}}<span>Edit this page on GitHub</span>
+        </a>
+        <span class="page-source">{{SOURCE_PATH}}</span>
+      </footer>
+      {{PAGER}}
+    </div>
+  </main>
+
+  <aside class="toc-column">
+    {{TOC_DESKTOP}}
+  </aside>
+</div>
+
+<footer class="site-footer">
+  <div class="site-footer-inner">
+    <p class="site-footer-brand">
+      <strong>{{SITE_NAME}}</strong> — {{SITE_TAGLINE}}.
+      <span>{{COPYRIGHT}}</span>
+    </p>
+    <nav class="site-footer-links" aria-label="Footer">
+      <a href="{{REPO_URL}}" rel="noopener">GitHub</a>
+      <a href="{{REPO_URL}}/issues" rel="noopener">Issues</a>
+      <a href="{{REPO_URL}}/blob/main/LICENSE" rel="noopener">License</a>
+      <a href="{{REL}}all-pages/index.html">All pages</a>
+    </nav>
+  </div>
+</footer>
+
+<button class="to-top" type="button" data-to-top aria-label="Back to top" hidden>↑</button>
+
+<div class="toast" data-toast role="status" aria-live="polite" hidden></div>
+
+<script src="{{REL}}assets/search-index.js" defer></script>
+<script src="{{REL}}assets/site.js" defer></script>
+</body>
+</html>

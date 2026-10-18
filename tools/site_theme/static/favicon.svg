@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="pacifica-obd">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3d5afe"/>
+      <stop offset="1" stop-color="#0f9d8f"/>
+    </linearGradient>
+  </defs>
+  <rect width="32" height="32" rx="9" fill="url(#g)"/>
+  <path d="M6.5 19.5h19l-1.4-5.4a2.4 2.4 0 0 0-2.3-1.8H10.2a2.4 2.4 0 0 0-2.3 1.8Z" fill="none" stroke="#fff" stroke-width="1.8" stroke-linejoin="round"/>
+  <circle cx="11" cy="22.6" r="2.1" fill="none" stroke="#fff" stroke-width="1.8"/>
+  <circle cx="21" cy="22.6" r="2.1" fill="none" stroke="#fff" stroke-width="1.8"/>
+  <path d="M16 8.5V5.5m-3.5 3V6.5m7 2.5V6.5" fill="none" stroke="#fff" stroke-width="1.6" stroke-linecap="round"/>
+</svg>
