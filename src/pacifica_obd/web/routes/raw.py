@@ -83,6 +83,31 @@ def _refused(decision: raw_guard.Decision) -> errors.ApiError:
     )
 
 
+def _audit_refusal(request: Request, decision: raw_guard.Decision,
+                   *, outcome: str) -> dict:
+    """Record a refused raw command, so the trail covers attempts, not just sends.
+
+    Best-effort like every other audit path (a store failure must never change the
+    response), and it never touches the adapter: this is for the commands that are
+    refused *before* a job is submitted.
+    """
+    try:
+        worker = getattr(request.app.state, "worker", None)
+        factory = getattr(worker, "store_factory", None)
+        store = factory() if callable(factory) else None
+        if store is None:
+            return {"stored": False}
+        session_id = store.start_session("raw-refused", {"command": decision.command})
+        result = audit.record(store, session_id, "raw-refused", decision.command,
+                             {"command": decision.command, "tier": decision.tier,
+                              "service": decision.service, "sent": False,
+                              "outcome": outcome, "reason": decision.reason[:200]})
+        store.finish_session(session_id, "refused")
+        return result
+    except Exception:  # noqa: BLE001 - auditing must never break a refusal path
+        return {"stored": False}
+
+
 def _parse_lines(lines) -> tuple[str | None, str | None, list[dict]]:
     """Reuse the UDS frame reassembly for the raw adapter lines."""
     text_lines = [str(line) for line in lines]
@@ -151,8 +176,10 @@ async def raw_send(request: Request, body: RawCommandRequest):
     worker = deps.get_worker(request)
     decision = raw_guard.classify(body.command)
     if decision.kind == "invalid":
+        _audit_refusal(request, decision, outcome="invalid")
         raise errors.validation(decision.reason, code="raw_invalid")
     if decision.tier == raw_guard.DENY:
+        _audit_refusal(request, decision, outcome="denied")
         raise _refused(decision)
 
     timeout_ms = deps.parse_timeout_ms(body.timeout_ms)

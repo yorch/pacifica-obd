@@ -195,9 +195,9 @@ def test_a_confirm_is_audited_with_the_exact_bytes_and_outcome():
         rows = (await client.get("/api/db/events")).json()["rows"]
         sends = [row for row in rows if row["kind"] == "raw-send"]
         assert sends, "the raw send was not audited"
-        assert any(json.loads(row["detail"])["detail"]["command"] == "ATCFC0"
-                   and json.loads(row["detail"])["detail"]["sent"] is True
-                   for row in sends)
+        details = [json.loads(row["detail"])["detail"] for row in sends]
+        assert any(d["command"] == "ATCFC0" and d["sent"] is True
+                   and d.get("outcome") for d in details), details
 
     run_async(app, body)
 
@@ -233,6 +233,12 @@ def test_the_read_tier_works_in_read_only_mode_but_confirm_does_not():
                                     headers=HEADERS)
         assert refused.status_code == 403, refused.text
         assert refused.json()["error"]["kind"] == "readonly"
+        # …and the confirm endpoint itself is closed, not merely unreachable
+        confirm = await client.post("/api/raw/confirm",
+                                    json={"confirm_token": "x" * 8,
+                                          "acknowledgement": "ATCFC0"}, headers=HEADERS)
+        assert confirm.status_code in (403, 409), confirm.text
+        assert list(adapter(app).commands) == before, "read-only still sent something"
         assert adapter(app).commands == before
 
         # A deny is still a deny even in read-only mode.
@@ -308,6 +314,25 @@ def test_the_caf0_framing_bypass_is_closed():
         assert sent[0] == "ATCAF1", "framing was not restored before a hex send"
         assert "0104000000000000" in sent
         assert sent.index("ATCAF1") < sent.index("0104000000000000")
+
+    run_async(app, body)
+
+
+def test_a_refused_command_is_audited_with_sent_false():
+    """The trail must cover refused attempts, not only the ones that were sent."""
+    app = make_app()
+
+    async def body(client):
+        refused = await client.post("/api/raw", json={"command": "2E F1 90 01"},
+                                    headers=HEADERS)
+        assert refused.status_code == 403, refused.text
+        assert adapter(app).commands == [], "a deny must not reach the adapter"
+        rows = (await client.get("/api/db/events")).json()["rows"]
+        refusals = [row for row in rows if row["kind"] == "raw-refused"]
+        assert refusals, "a refused command left no audit row"
+        details = [json.loads(row["detail"])["detail"] for row in refusals]
+        assert any(d["command"] == "2EF19001" and d["sent"] is False
+                   and d["outcome"] == "denied" for d in details), details
 
     run_async(app, body)
 
