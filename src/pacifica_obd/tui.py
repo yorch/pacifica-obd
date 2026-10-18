@@ -739,6 +739,13 @@ def _addressed_session(
     if not _address(elm, rid):
         raise AdapterError(f"could not address module {rid}; refusing")
     expected = _known_response_id(rid)
+    if expected is None:
+        # A guarded write has to be verifiable: without a physical response
+        # address a stray ECU's 5003 could authorise it (0x7DF is broadcast and
+        # cannot answer at all).
+        raise AdapterError(
+            f"no known response address for module {rid}; refusing this operation"
+        )
     header, uds = _parse_uds_frame(elm.cmd("1003", wait=wait), prefer_header=expected)
     if header is None or not (uds or "").startswith("5003"):
         raise AdapterError(f"module {rid} did not enter an extended session; refusing")
