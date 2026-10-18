@@ -38,7 +38,8 @@ def run_server(*, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
         )
 
     settings = Settings(host=host, port=port, token=resolved, demo=demo,
-                        allow_remote=allow_remote, log_level=log_level)
+                        allow_remote=allow_remote, log_level=log_level,
+                        read_only=bool(read_only))
     app = create_app(settings)
 
     display = _display_host(host)
@@ -48,9 +49,11 @@ def run_server(*, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
     shown = f"{url}#t={resolved}" if resolved else url
     # flush: the URL (with its one-time token) must be visible immediately, even
     # when stdout is a pipe or a log file.
-    print("pacifica-obd web UI (read-only)")
+    print("pacifica-obd web UI" + (" (read-only)" if read_only else " (writes enabled)"))
     if demo:
         print("  demo mode: synthetic adapter + a seeded demo database")
+    if not read_only:
+        print("  writes enabled: 0x27 unlock and 2E/31 writes require a typed confirmation")
     print(f"  {shown}")
     print("  the UI talks only to this machine; Ctrl-C to stop")
     sys.stdout.flush()
@@ -63,15 +66,17 @@ def run_server(*, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="pacifica-obd-web",
-        description="Local read-only web UI for pacifica-obd.",
+        description="Local web UI for pacifica-obd.",
     )
     parser.add_argument("--host", default=DEFAULT_HOST,
                         help="bind address (default 127.0.0.1)")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="TCP port")
     parser.add_argument("--token", nargs="?", const=True, default=None,
                         help="require a bearer token (bare flag generates one)")
-    parser.add_argument("--read-only", action="store_true", default=True,
-                        help="read-only mode (always on in this build)")
+    parser.add_argument("--read-only", dest="read_only", action="store_true",
+                        help="disable every write route (this is the default)")
+    parser.add_argument("--allow-writes", dest="allow_writes", action="store_true",
+                        help="enable the guarded write surface (0x27 / 2E / 31)")
     parser.add_argument("--demo", action="store_true",
                         help="synthetic adapter + seeded DB (no car needed)")
     parser.add_argument("--open", action="store_true", help="open a browser")
@@ -79,8 +84,11 @@ def main(argv: list[str] | None = None) -> None:
                         help="allow a non-loopback bind (requires --token)")
     parser.add_argument("--log-level", default="info", help="uvicorn log level")
     args = parser.parse_args(argv)
+    if args.read_only and args.allow_writes:
+        raise SystemExit("--read-only and --allow-writes are mutually exclusive")
     try:
-        run_server(host=args.host, port=args.port, token=args.token, read_only=True,
+        run_server(host=args.host, port=args.port, token=args.token,
+                   read_only=not args.allow_writes,
                    demo=args.demo, open_browser=args.open, allow_remote=args.allow_remote,
                    log_level=args.log_level)
     except ImportError as exc:  # pragma: no cover - depends on the optional extra

@@ -101,13 +101,14 @@ def from_exception(exc: BaseException) -> ApiError:
     from pacifica_obd.adapter import AdapterError
     from pacifica_obd.elm import Elm327Error
     from pacifica_obd.web.bus import BusBusy, JobCancelled
+    from pacifica_obd.web.service import OperationCancelled
 
     if isinstance(exc, ApiError):
         return exc
     if isinstance(exc, BusBusy):
         return busy(str(exc))
-    if isinstance(exc, JobCancelled):
-        return ApiError("cancelled", "bus", str(exc))
+    if isinstance(exc, (JobCancelled, OperationCancelled)):
+        return ApiError("cancelled", "bus", str(exc) or "cancelled")
     if isinstance(exc, AdapterError):
         return adapter(str(exc), code="adapter")
     if isinstance(exc, Elm327Error):

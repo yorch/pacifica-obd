@@ -43,7 +43,9 @@ def default_store_factory() -> Store | None:
 
 def build_backend(settings: Settings):
     if settings.demo:
-        return FakeBackend()
+        from pacifica_obd.web.demo import demo_backend
+
+        return demo_backend()
     return SerialBackend(
         port=settings.port_name,
         baudrate=settings.baud,

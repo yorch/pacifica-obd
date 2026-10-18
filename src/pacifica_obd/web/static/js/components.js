@@ -218,8 +218,7 @@ export function sparkline(values, { width = 64, height = 24, colour = "var(--acc
 
 /* ------------------------------------------------------------------ drawer */
 
-export function drawer({ title, content, onClose }) {
-  const backdrop = h("div.drawer-backdrop", { role: "dialog", "aria-modal": "true", "aria-label": title });
+export function drawer({ title, content, onClose }) {  const backdrop = h("div.drawer-backdrop", { role: "dialog", "aria-modal": "true", "aria-label": title });
   const close = () => { backdrop.remove(); document.removeEventListener("keydown", onKey); if (onClose) onClose(); };
   const onKey = (event) => { if (event.key === "Escape") close(); };
   const panel = h("div.drawer", null,
@@ -268,6 +267,60 @@ export function progressBar() {
   const node = h("div.progress", { role: "progressbar" }, fill);
   node.update = (fraction) => { fill.style.width = `${Math.max(0, Math.min(1, fraction)) * 100}%`; };
   return node;
+}
+
+/* ------------------------------------------------------------------ modal */
+
+// A focus-trapped modal. Esc closes; the backdrop click closes. Content is
+// built from nodes (never markup), so bus data can safely be shown inside.
+export function modal({ title, content, onClose, actions = null, danger = false } = {}) {
+  const backdrop = h("div.modal-backdrop", { role: "dialog", "aria-modal": "true",
+    "aria-label": title });
+  let closed = false;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    backdrop.remove();
+    document.removeEventListener("keydown", onKey);
+    if (onClose) onClose();
+  };
+  const onKey = (event) => { if (event.key === "Escape") close(); };
+  const panel = h("div", { class: `modal${danger ? " modal--danger" : ""}` },
+    h("div.modal__head", null, h("h2", { text: title })),
+    h("div.modal__body", null, content),
+    h("div.modal__actions", null,
+      h("button.btn.btn--ghost", { type: "button", text: "Cancel", onClick: close }),
+      actions || null));
+  backdrop.appendChild(panel);
+  on(backdrop, "click", (event) => { if (event.target === backdrop) close(); });
+  document.addEventListener("keydown", onKey);
+  document.body.appendChild(backdrop);
+  const focusable = panel.querySelector("input, select, textarea, button");
+  if (focusable) focusable.focus();
+  return { close };
+}
+
+// The typed-acknowledgement confirm: the button stays disabled until the user
+// types the module id. This mirrors what a browser makes "practically
+// impossible to do by accident" (design §4.5.3).
+export function typedConfirm({ title, request, module, warning, hint, onConfirm }) {
+  const input = h("input.mono", { type: "text", autocomplete: "off",
+    placeholder: module, "aria-label": "type the module id to confirm" });
+  const button = h("button.btn.btn--danger", { type: "button", disabled: true,
+    text: "Send", onClick: () => { button.disabled = true; onConfirm(closeModal); } });
+  const update = () => { button.disabled = input.value.trim().toUpperCase() !== module.toUpperCase(); };
+  on(input, "input", update);
+  const content = h("div", null,
+    warning ? banner(warning, "warn") : null,
+    h("div.modal__request", null,
+      h("div.eyebrow", { text: "exact wire request" }),
+      h("code.mono.code-line", { text: request })),
+    h("p.sub", { text: hint || `Type ${module} to confirm. This tool cannot undo the change.` }),
+    h("div.field", null, h("label", { for: "confirm-ack", text: `Module id (${module})` }), input));
+  const handle = modal({ title, content, danger: true, actions: button });
+  const closeModal = handle.close;
+  input.id = "confirm-ack";
+  return handle;
 }
 
 export { clear, mount, h };

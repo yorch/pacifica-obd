@@ -27,8 +27,10 @@ import re
 import threading
 from typing import Callable, Iterable, Iterator
 
-from pacifica_obd.adapter import AdapterError, configure_bus
+from pacifica_obd.adapter import AdapterError, configure_bus, reset_flow_control
 from pacifica_obd.elm import Elm327Error
+from pacifica_obd import fca_keys
+from pacifica_obd import security as security_policy
 from pacifica_obd.profiles import (
     detect_powertrain,
     looks_like_vin,
@@ -43,6 +45,10 @@ from pacifica_obd.uds import (
     parse_dtcs,
     parse_uds_frame,
     read_did,
+    routine_control as uds_routine_control,
+    security_access,
+    send_security_key as uds_send_security_key,
+    write_did as uds_write_did,
 )
 
 __all__ = [
@@ -75,6 +81,17 @@ __all__ = [
     "is_read_only_command",
     "address_module",
     "command_text",
+    "parse_hex_payload",
+    "require_extended_session",
+    "security_explain",
+    "ecu_for_module",
+    "read_security_seed",
+    "preview_security_key",
+    "send_security_key_guarded",
+    "preview_write_did",
+    "preview_routine",
+    "execute_write_did",
+    "execute_routine",
 ]
 
 Cancel = threading.Event | None
@@ -121,6 +138,18 @@ def parse_timeout_ms(text) -> int:
         raise ValueError(f"not an integer: {text!r}")
     if not 1 <= value <= 65535:
         raise ValueError("timeout must be 1..65535 ms")
+    return value
+
+
+def parse_hex_payload(text, *, allow_empty: bool = False) -> str:
+    """Uppercase, even-length data bytes (the TUI's ``_parse_hex_payload``)."""
+    value = str(text or "").strip().upper().removeprefix("0X")
+    if not value:
+        if allow_empty:
+            return ""
+        raise ValueError("data must be non-empty even-length hex")
+    if len(value) % 2 or not re.fullmatch(r"[0-9A-F]+", value):
+        raise ValueError(f"not an even-length hex payload: {text!r}")
     return value
 
 
@@ -185,6 +214,22 @@ def _acknowledged(lines: Iterable[str]) -> bool:
 
 def _cancelled(cancel: Cancel) -> bool:
     return cancel is not None and cancel.is_set()
+
+
+class OperationCancelled(RuntimeError):
+    """The client went away (or the job timed out) before anything was sent."""
+
+
+def _ensure_live(cancel: Cancel) -> None:
+    """Refuse to *begin* an irreversible step once the job is cancelled.
+
+    A job that is cancelled while blocked in session setup would otherwise still
+    reach ``2E``/``31``/``27 <key>`` after the HTTP response timed out. This is
+    checked immediately before the transmit, not only at the start.
+    """
+    if _cancelled(cancel):
+        raise OperationCancelled("cancelled before the operation was sent")
+
 
 
 def _note(progress: Progress, event: dict) -> None:
@@ -530,6 +575,318 @@ def _vin_from_records(records: list[dict]) -> str | None:
             if looks_like_vin(value):
                 return value
     return None
+
+
+# --------------------------------------------------------------------------- #
+# guarded operations: 0x27 security, 0x2E write, 0x31 routine
+# --------------------------------------------------------------------------- #
+def require_extended_session(adapter, *, bus: str, module, timeout_ms: int = 100,
+                             wait: float | None = None,
+                             cancel: Cancel = None) -> tuple[str, str]:
+    """Address one module and require it to answer ``50 03`` extended session.
+
+    This reproduces the TUI's ``_addressed_session`` rule and is deliberately
+    stricter than the read paths:
+
+    * the receive filter is set **at the responder first** (``ATCRA``), then the
+      header (``ATSH``); manual ISO-TP flow control is reset to automatic and is
+      never configured here (AGENTS.md);
+    * the module must have a **known physical response address**. A broadcast or
+      unmapped id (e.g. ``7DF``) cannot prove who answered, so a guarded write is
+      refused rather than risk landing on whatever ECU was selected last;
+    * the reply must come from that exact responder and start with ``50 03``.
+
+    Returns ``(request_id, expected_response_id)``.
+    """
+    if bus not in BUS_PROTOCOL:
+        raise ValueError(f"unknown bus: {bus!r}")
+    _ensure_live(cancel)
+    rid = as_request_id(module)
+    configure_bus(adapter, bus, timeout_ms)
+    reset_flow_control(adapter)  # stay in the adapter's automatic mode
+    expected, addressable = address_module(adapter, rid)
+    if not addressable:
+        raise AdapterError(f"could not address module {rid}; refusing")
+    if expected is None:
+        raise AdapterError(
+            f"no known response address for module {rid}; refusing this operation"
+        )
+    reply_wait = read_wait(timeout_ms) if wait is None else wait
+    _ensure_live(cancel)
+    header, uds = parse_uds_frame(adapter.cmd("1003", wait=reply_wait),
+                                  prefer_header=expected)
+    if header is None or not (uds or "").startswith("5003"):
+        raise AdapterError(f"module {rid} did not enter an extended session; refusing")
+    if header != expected:
+        raise AdapterError(
+            f"module {rid} answered from {header}, expected {expected}; refusing"
+        )
+    return rid, expected
+
+
+def security_explain(module, level: int = 1, device_id=None, variant_id=None,
+                     supplier=None) -> dict:
+    """Offline ``fca_keys.explain`` wrapper (resolved / ambiguous / unmapped).
+
+    Accepts either a dataset ECU name (``ORC_PN``) or a CAN request id
+    (``0x744``); the selector is keyed by ECU name, so a raw request id is mapped
+    through the bundled dataset first. An unmapped request id stays unmapped.
+    """
+    target = str(module).strip().upper()
+    request_id = None
+    try:
+        request_id = as_request_id(module)
+        mapped = ecu_for_module(request_id)
+        if mapped:
+            target = mapped
+    except (TypeError, ValueError):
+        request_id = None
+    info = fca_keys.explain(target, int(level), device_id, variant_id, supplier)
+    if request_id:
+        info["request_id"] = request_id
+    info["ecu"] = target
+    return info
+
+
+def ecu_for_module(module) -> str | None:
+    """Map a CAN request id to the bundled dataset's ECU name (``744`` -> ``ORC_PN``)."""
+    from pacifica_obd import pacifica_data
+
+    try:
+        want = int(str(module), 16)
+    except (TypeError, ValueError):
+        return None
+    for row in pacifica_data.modules():
+        request = row.get("request")
+        if request is None:
+            continue
+        try:
+            if int(str(request), 16) == want:
+                return row.get("ecu")
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def read_security_seed(adapter, *, bus: str, module, level: int,
+                       timeout_ms: int = 100, cancel: Cancel = None) -> dict:
+    """Read one ``27 <level>`` seed without sending a key (read-only)."""
+    rid, expected = require_extended_session(adapter, bus=bus, module=module,
+                                             timeout_ms=timeout_ms, cancel=cancel)
+    _ensure_live(cancel)
+    result = security_access(adapter, int(level), seedkey=None,
+                             wait=read_wait(timeout_ms), expect_header=expected)
+    result["module"] = rid
+    result["bus"] = bus
+    result["sent"] = False
+    if result.get("seed"):
+        result["seed"] = security_policy.normalize_seed(result["seed"])
+    return result
+
+
+def _key_for(module, level, device_id, variant_id, supplier, seed_hex: str,
+             seedkey) -> tuple[int, int]:
+    """Compute ``(key_int, key_width_bytes)`` from a resolved provider."""
+    width = len(seed_hex) // 2
+    key = seedkey(int(seed_hex, 16), level=int(level), width=width)
+    key_bytes = getattr(seedkey, "key_width", 0) or width
+    if type(key) is not int or key < 0 or key >= (1 << (8 * key_bytes)):
+        raise ValueError("the key provider returned a key of the wrong width")
+    return key, key_bytes
+
+
+def preview_security_key(adapter, *, bus: str, module, level: int,
+                         device_id=None, variant_id=None, supplier=None,
+                         timeout_ms: int = 100, cancel: Cancel = None) -> dict:
+    """Read the seed, resolve the algorithm, compute a key — send nothing.
+
+    The caller stores the returned seed under a :class:`SecurityLease`; no key is
+    ever sent from this function. An ambiguous/unmapped selector returns
+    ``status == "ambiguous"``/``"unmapped"`` with the candidate list and does not
+    touch the adapter at all.
+    """
+    level = int(level)
+    info = security_explain(module, level, device_id, variant_id, supplier)
+    if info.get("status") != "resolved":
+        return {
+            "status": info.get("status", "unmapped"),
+            "reason": info.get("reason"),
+            "explain": info,
+            "candidates": info.get("candidates", []),
+            "algorithm": None,
+            "seed": None,
+            "key": None,
+            "request": None,
+            "sent": False,
+        }
+    seed_result = read_security_seed(adapter, bus=bus, module=module, level=level,
+                                     timeout_ms=timeout_ms, cancel=cancel)
+    base = {
+        "status": seed_result.get("status"),
+        "explain": info,
+        "algorithm": info.get("algorithm"),
+        "module": seed_result.get("module"),
+        "bus": bus,
+        "level": level,
+        "seed": seed_result.get("seed"),
+        "seed_result": seed_result,
+        "sent": False,
+    }
+    if seed_result.get("unlocked"):
+        base["status"] = "already_unlocked"
+        base["key"] = None
+        base["request"] = None
+        return base
+    if not seed_result.get("seed") or seed_result.get("status") not in ("ok", "no_key_provider"):
+        base["key"] = None
+        base["request"] = None
+        return base
+    try:
+        provider = fca_keys.provider_for(info["ecu"], level, device_id, variant_id,
+                                         supplier)
+        key, width = _key_for(info["ecu"], level, device_id, variant_id, supplier,
+                              seed_result["seed"], provider)
+    except (fca_keys.FcaKeyError, ValueError, KeyError) as exc:
+        base["status"] = "key_error"
+        base["reason"] = str(exc)
+        base["key"] = None
+        base["request"] = None
+        return base
+    key_hex = "%0*X" % (width * 2, key)
+    base["status"] = "preview"
+    base["key"] = key_hex
+    base["request"] = security_policy.key_request(level, key_hex)
+    return base
+
+
+def send_security_key_guarded(adapter, *, bus: str, module, level: int,
+                              key_hex: str, timeout_ms: int = 100,
+                              cancel: Cancel = None) -> dict:
+    """Send a reviewed key once, on an extended session, to the verified responder.
+
+    This never requests a seed: the held-seed policy makes the lease (checked by
+    the caller) authoritative. Strict mode re-reads in the caller before this is
+    reached.
+    """
+    rid, expected = require_extended_session(adapter, bus=bus, module=module,
+                                             timeout_ms=timeout_ms, cancel=cancel)
+    _ensure_live(cancel)  # do not transmit if the client/job went away
+    result = uds_send_security_key(adapter, int(level), key_hex,
+                                   wait=read_wait(timeout_ms),
+                                   expect_header=expected)
+    result["module"] = rid
+    result["bus"] = bus
+    result["sent"] = True
+    result["request"] = security_policy.key_request(level, key_hex)
+    return result
+
+
+def preview_write_did(adapter, *, bus: str, module, did: int, data: str,
+                      timeout_ms: int = 100, cancel: Cancel = None) -> dict:
+    """Read-half of a guarded ``2E`` write: session, current value, exact bytes.
+
+    A DID whose current value cannot be read is **refused**, not previewed as a
+    blind write: a transient read failure must not silently disable the
+    precondition check (adversarial review finding).
+    """
+    rid, expected = require_extended_session(adapter, bus=bus, module=module,
+                                             timeout_ms=timeout_ms, cancel=cancel)
+    _ensure_live(cancel)
+    record = read_did(adapter, int(did), read_wait(timeout_ms),
+                      expect_header=expected)
+    current = record.get("hex") if record.get("status") == "ok" else None
+    if current is None:
+        raise AdapterError(
+            f"could not read the current value of DID {int(did):04X} on module "
+            f"{rid} ({record.get('status')}); refusing to preview a blind write"
+        )
+    return {
+        "module": rid,
+        "bus": bus,
+        "did": "%04X" % int(did),
+        "data": data,
+        "request": "2E%04X%s" % (int(did), data),
+        "service": "2E",
+        "current": current,
+        "current_status": record.get("status"),
+        "response_id": expected,
+        "sent": False,
+    }
+
+
+def preview_routine(adapter, *, bus: str, module, rid: int, sub: int, data: str,
+                    timeout_ms: int = 100, cancel: Cancel = None) -> dict:
+    """Read-half of a guarded ``31`` routine control."""
+    module_rid, expected = require_extended_session(adapter, bus=bus, module=module,
+                                                    timeout_ms=timeout_ms, cancel=cancel)
+    _ensure_live(cancel)
+    return {
+        "module": module_rid,
+        "bus": bus,
+        "routine": "%04X" % int(rid),
+        "sub": int(sub),
+        "data": data,
+        "request": "31%02X%04X%s" % (int(sub), int(rid), data),
+        "service": "31",
+        "current": None,
+        "response_id": expected,
+        "sent": False,
+    }
+
+
+def execute_write_did(adapter, *, bus: str, module, did: int, data: str,
+                      timeout_ms: int = 100,
+                      expected_current: str | None = None,
+                      cancel: Cancel = None) -> dict:
+    """Execute a reviewed ``2E`` write; refuses if the current value changed.
+
+    The precondition is re-read inside the *same* serialized job as the write, so
+    there is no window where a different value could be overwritten after the
+    check.
+    """
+    rid, expected = require_extended_session(adapter, bus=bus, module=module,
+                                             timeout_ms=timeout_ms, cancel=cancel)
+    current = None
+    if expected_current is not None:
+        _ensure_live(cancel)
+        record = read_did(adapter, int(did), read_wait(timeout_ms),
+                          expect_header=expected)
+        current = record.get("hex") if record.get("status") == "ok" else None
+        if current != expected_current:
+            return {
+                "status": "confirm_stale",
+                "sent": False,
+                "module": rid,
+                "bus": bus,
+                "did": "%04X" % int(did),
+                "request": "2E%04X%s" % (int(did), data),
+                "current": current,
+                "reason": "the current value changed since the preview",
+            }
+    _ensure_live(cancel)  # checked immediately before transmission
+    result = uds_write_did(adapter, int(did), data, wait=read_wait(timeout_ms),
+                           expect_header=expected)
+    result["module"] = rid
+    result["bus"] = bus
+    result["sent"] = True
+    result["request"] = "2E%04X%s" % (int(did), data)
+    result["current"] = current
+    return result
+
+
+def execute_routine(adapter, *, bus: str, module, rid: int, sub: int, data: str,
+                    timeout_ms: int = 100, cancel: Cancel = None) -> dict:
+    """Execute a reviewed ``31`` routine control on the verified responder."""
+    module_rid, expected = require_extended_session(adapter, bus=bus, module=module,
+                                                    timeout_ms=timeout_ms, cancel=cancel)
+    _ensure_live(cancel)  # checked immediately before transmission
+    result = uds_routine_control(adapter, int(rid), sub=int(sub), data_hex=data,
+                                 wait=read_wait(timeout_ms), expect_header=expected)
+    result["module"] = module_rid
+    result["bus"] = bus
+    result["sent"] = True
+    result["request"] = "31%02X%04X%s" % (int(sub), int(rid), data)
+    return result
 
 
 # --------------------------------------------------------------------------- #

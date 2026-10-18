@@ -21,5 +21,12 @@ vehicle.html
 vehicle-dump.*
 dumps/
 
+# AI provider keys/config — never commit (also lives under $PACIFICA_OBD_HOME,
+# but this is a backstop for a repo-local key file)
+ai.json
+.ai.json
+pacifica-obd/ai.json
+*.key.json
+
 # macOS metadata
 .DS_Store

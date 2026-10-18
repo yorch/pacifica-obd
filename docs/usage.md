@@ -535,16 +535,19 @@ restored before the port closes.
 
 ## web
 
-A local, **read-only** web UI served from the same source tree. It is an
-**optional extra**: the CLI and TUI keep working without it.
+A local web UI served from the same source tree. It is an **optional extra**:
+the CLI and TUI keep working without it. The default is **read-only**; the
+guarded write surface (`0x27` unlock, `2E` write, `31` routine) and the
+bring-your-own-key AI layer are opt-in.
 
 ```sh
 uv sync --extra web                     # installs fastapi + uvicorn + httpx
-uv run pacifica-obd web                 # http://127.0.0.1:8765
+uv run pacifica-obd web                 # http://127.0.0.1:8765 (read-only)
 uv run pacifica-obd web --port 9000
 uv run pacifica-obd web --demo          # synthetic adapter + a seeded database
 uv run pacifica-obd web --token         # requires a bearer token; prints a #t=… URL
 uv run pacifica-obd web --open          # open a browser
+uv run pacifica-obd web --allow-writes  # enable the guarded write surface
 uv run --extra web pacifica-obd-web     # same server, standalone entry point
 ```
 
@@ -554,6 +557,8 @@ uv run --extra web pacifica-obd-web     # same server, standalone entry point
 | `--port N` | `8765` | TCP port. |
 | `--token [TOKEN]` | off | Require `Authorization: Bearer …`. A bare flag generates one and prints a URL with the token in the **fragment** (never sent to the server or written to a log). |
 | `--demo` | off | Synthetic adapter + a seeded `pacifica.db` so the UI is explorable with no car. |
+| `--read-only` | **on** | The default. Removes every write route from the app. |
+| `--allow-writes` | off | Registers the guarded write surface: `0x27` unlock, `2E` write, `31` routine. Each still needs a typed confirmation and is audited. |
 | `--open` | off | Open the UI in a browser. |
 | `--allow-remote` | off | Permit a non-loopback bind (requires `--token`). |
 
@@ -566,16 +571,25 @@ uv run --extra web pacifica-obd web
 ```
 
 Screens: Dashboard (`#/`), Live data (`#/live`), Modules & DTCs (`#/modules`),
-DIDs / module info (`#/dids`), Capture (`#/capture`), Database (`#/db`),
-Reports (`#/reports`), Settings (`#/settings`) and Help (`#/help`). It reaches
-parity with the CLI's read commands and adds gauges, a time-series chart with
-replay, a session comparison, CSV export and print-to-PDF reports.
+DIDs / module info (`#/dids`), Security 0x27 (`#/security`), Writes (`#/writes`),
+Assistant (`#/assistant`), Capture (`#/capture`), Database (`#/db`), Reports
+(`#/reports`), Settings (`#/settings`) and Help (`#/help`). It reaches parity
+with the CLI's read commands and adds gauges, a time-series chart with replay, a
+session comparison, CSV export and print-to-PDF reports.
 
-**Read-only in this build.** There is no write, clear, routine, `0x27` or AI
-endpoint at all — not a disabled one — so "read-only" is structural. The same
-rule as the CLI/TUI applies: one owner talks to the adapter at a time, and each
-request runs as a job on a single worker thread (a second bus operation while a
-stream is running is refused with `409 bus_busy`).
+The write surfaces are **structurally absent** unless `--allow-writes` is given:
+the routes are not registered, and a request to them returns `403 readonly`. In
+write mode each operation is two-phase (preview → typed confirm), single-use and
+audited. `0x27` holds one seed under a 30 s lease rather than re-reading it; the
+opt-in strict re-read is documented in [Web UI](web-ui.md).
+
+The AI layer is bring-your-own-key, has **no write capability** (a read-only tool
+registry with no write/reach path into `security` or `writes`), and needs no SDK.
+See [How to run the AI layer](web-ui.md#how-to-run--stage-2-security-writes-and-ai).
+
+The same rule as the CLI/TUI applies: one owner talks to the adapter at a time,
+and each request runs as a job on a single worker thread (a second bus operation
+while a stream is running is refused with `409 bus_busy`).
 
 See [Web UI](web-ui.md) for the design, the API catalogue, and how to run it.
 
@@ -587,6 +601,11 @@ See [Web UI](web-ui.md) for the design, the API catalogue, and how to run it.
 | `PACIFICA_OBD_DB` | Explicit SQLite path. |
 | `PACIFICA_OBD_LOG` | Explicit JSONL log path. |
 | `PACIFICA_OBD_NO_LOG=1` | Disable persistence entirely. |
+| `PACIFICA_OBD_WEB_TOKEN` | Bearer token for the web UI (same as `--token`). |
+| `PACIFICA_OBD_AI_PROVIDER` | Override the AI provider id (file values lose to the environment). |
+| `PACIFICA_OBD_AI_MODEL` / `PACIFICA_OBD_AI_BASE_URL` | Override the model / endpoint. |
+| `PACIFICA_OBD_AI_KEY_OPENAI` / `_ANTHROPIC` | Key override (wins over the 0600 `ai.json`). |
+| `PACIFICA_OBD_AI_OFFLINE=1` | Force the deterministic offline provider (tests/demos). |
 
 `--db PATH` and `--no-log` override the corresponding variables for one run. See
 [Storage model](technical.md#storage-model) for the tables and retention story.

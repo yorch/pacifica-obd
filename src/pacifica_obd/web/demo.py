@@ -21,8 +21,18 @@ DEMO_VIN = FAKE_VIN
 
 
 def demo_backend() -> FakeBackend:
-    """The synthetic adapter used by ``--demo`` (and by the tests)."""
-    return FakeBackend(adapter=FakeAdapter(vin=DEMO_VIN))
+    """The synthetic adapter used by ``--demo`` (and by the tests).
+
+    On top of the four OBD-block modules it exposes the steering-column and ABS
+    addresses, so the security screen has a *resolved* target (``744`` with
+    variant 64) and an *ambiguous* one (``747`` without a discriminator) without
+    a car.
+    """
+    return FakeBackend(adapter=FakeAdapter(
+        vin=DEMO_VIN,
+        modules={"7E0": 0x7E8, "7E1": 0x7E9, "7E2": 0x7EA, "7E7": 0x7EF,
+                 "744": 0x4C4, "747": 0x4C7},
+    ))
 
 
 def _iso(dt: datetime) -> str:

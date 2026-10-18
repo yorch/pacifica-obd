@@ -239,7 +239,9 @@ export function render(root, ctx) {
           { key: "status", label: "Status", render: (dtc) => pill(dtc.status, dtc.status) },
           { key: "flags", label: "Flags", render: (dtc) => h("span", null,
             (dtc.flags || []).map((flag) => h("span", { class: `pill ${statusClass(flag)}`, text: flag, style: { marginRight: "4px" } }))) },
-          { key: "action", label: "AI", render: () => h("span.pill.pill--ghost", { title: "stage 2", text: "explain (stage 2)" }) },
+          { key: "action", label: "AI", render: (dtc) => h("a.pill.pill--ghost", {
+            title: "ask the read-only assistant", text: "explain",
+            href: `#/assistant?ask=${encodeURIComponent(`Explain DTC ${dtc.code} in one or two sentences.`)}` }) },
         ],
         rows: row.dtcs,
       }));

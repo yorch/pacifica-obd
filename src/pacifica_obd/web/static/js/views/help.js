@@ -22,7 +22,8 @@ const CLI_MAP = [
   ["history / show / vehicles", "#/db", "the database browser"],
   ["dump", "#/reports", "multi-format report"],
   ["module-map", "#/modules", "known module addresses (offline)"],
-  ["security / write-did / routine", "stage 2", "guarded writes (not in this build)"],
+  ["security / write-did / routine", "#/security · #/writes", "guarded 0x27 unlock, 0x2E write and 0x31 routine"],
+  ["assistant", "#/assistant", "read-only AI over the stored data (bring your own key)"],
 ];
 
 const GLOSSARY = [

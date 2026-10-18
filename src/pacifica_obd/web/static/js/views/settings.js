@@ -1,9 +1,11 @@
-// Settings (#/settings) — adapter, bus defaults, the bundled dataset, data paths,
-// and the read-only safety statement. All read-only except Connect/Disconnect.
+// Settings (#/settings) — adapter, bus defaults, the bundled dataset, local data
+// paths, the safety posture, and the AI layer (provider, key, privacy toggles).
 
-import { h, clear, mount, on } from "../dom.js";
+import { h, clear, mount } from "../dom.js";
 import { api } from "../api.js";
-import { card, cardBody, pill, emptyState, errorState, toast, banner, select, dataTable } from "../components.js";
+import {
+  card, pill, emptyState, errorState, toast, banner, select, dataTable, checkbox,
+} from "../components.js";
 
 export function render(root, ctx) {
   const adapterHolder = h("div");
@@ -11,15 +13,16 @@ export function render(root, ctx) {
   const datasetHolder = h("div");
   const dataHolder = h("div");
   const busHolder = h("div");
+  const safetyHolder = h("div");
+  const aiHolder = h("div");
 
   const head = h("div.view__head", null,
     h("div", null, h("h1", { text: "Settings" }),
-      h("div.sub", { text: "Adapter and bus configuration, the bundled dataset summary, and where local data lives." })));
+      h("div.sub", { text: "Adapter and bus configuration, the bundled dataset summary, where local data lives, the safety posture and the AI layer." })));
 
   mount(root, head,
-    card({ eyebrow: "Safety", title: "Read-only build", body: h("div", null,
-      banner("This build has no write path: no clear-DTC, no write-DID, no routine, no 0x27 unlock, and no AI provider. Every endpoint is a read.", "info"),
-      h("p.sub", { text: "Status colour is never the only signal: each pill carries the machine status text the CLI emits." })) }),
+    card({ eyebrow: "Safety", title: "Safety posture", body: safetyHolder }),
+    card({ eyebrow: "AI", title: "Assistant provider", body: aiHolder }),
     card({ eyebrow: "Adapter", title: "Connection", actions: h("div.row", null,
       h("button.btn.btn--sm", { type: "button", text: "Read info", onClick: readInfo }),
       h("button.btn.btn--sm", { type: "button", text: "Connect", onClick: () => connect(true) }),
@@ -30,7 +33,124 @@ export function render(root, ctx) {
     card({ eyebrow: "Dataset", title: "Bundled pacifica.json", body: datasetHolder }),
     card({ eyebrow: "Data", title: "Local files", body: dataHolder }));
 
-  /* ----------------------------------------------------------------- adapter */
+  /* -------------------------------------------------------------- safety */
+
+  async function loadSafety() {
+    try {
+      const info = await api.settings();
+      const toggle = checkbox({ id: "strict-seed", label: "Strict 0x27 seed re-read (opt-in)",
+        checked: info.strict_seed_reread });
+      clear(safetyHolder);
+      safetyHolder.appendChild(h("div", null,
+        h("div.row", null,
+          pill(info.read_only ? "read-only" : "writes enabled", info.read_only ? "ok" : "warn"),
+          info.read_only ? null : banner("Write mode", "warn")),
+        h("p.sub", { text: `Enabled by: ${info.safety?.enabled_by || "—"}` }),
+        h("p.sub", { text: info.safety?.sgw || "" }),
+        toggle,
+        h("p.sub", { text: "Strict mode re-reads the seed and compares it before sending. It spends a second seed request, which can advance some ECUs' bad-attempt counter — enable it only for a module whose seed is known to be stable." }),
+        h("button.btn.btn--sm", { type: "button", text: "Apply", onClick: async () => {
+          const checked = safetyHolder.querySelector("#strict-seed").checked;
+          try { await api.putSettings({ strict_seed_reread: checked }); toast("Safety setting updated"); }
+          catch (error) { toast(error.message, "err"); }
+        } })));
+    } catch (error) { clear(safetyHolder); safetyHolder.appendChild(errorState(error, { onRetry: loadSafety })); }
+  }
+
+  /* ------------------------------------------------------------------ AI */
+
+  async function loadAI() {
+    try {
+      const [config, providers] = await Promise.all([api.aiConfig(), api.aiProviders()]);
+      clear(aiHolder);
+      const providerSelect = select({ id: "ai-provider", label: "Provider",
+        value: config.provider || "",
+        options: [{ value: "", label: "— none configured —" }].concat(
+          (providers.providers || []).map((row) => ({
+            value: row.id, label: `${row.label}${row.requires_key ? " (key required)" : ""}`,
+          })))});
+      const model = textField("ai-model", "Model", config.model || "", "model id");
+      const baseUrl = textField("ai-base", "Base URL (compatible APIs)", config.base_url || "",
+        "https://… or a local endpoint");
+      const key = h("div.field", null,
+        h("label", { for: "ai-key", text: "API key (write-only; never shown again)" }),
+        h("input.mono", { id: "ai-key", type: "password", autocomplete: "new-password", placeholder: "paste a key" }),
+        h("div.sub", { text: "Stored 0600 under the tool's home directory — never logged, never returned." }));
+      const keyState = h("div.row", null);
+      const builds = [];
+      for (const [id, label, value] of [
+        ["send-remote", "Send bus data to a remote model", config.send_bus_data_to_remote],
+        ["redact-vin", "Redact VIN before egress", config.redact_vin],
+        ["live-bus", "Allow the assistant to read the live bus", config.allow_live_bus],
+        ["persist", "Save conversations locally (opt-in)", config.persist_conversations],
+        ["local-only", "Local models only (block remote providers)", config.force_local_only],
+      ]) builds.push(checkbox({ id, label, checked: value }));
+
+      const save = h("button.btn", { type: "button", text: "Save AI settings", onClick: async () => {
+        try {
+          await api.aiSetConfig({
+            provider: providerSelect.querySelector("select").value || null,
+            model: model.input.value.trim(),
+            base_url: baseUrl.input.value.trim() || null,
+            send_bus_data_to_remote: flag("send-remote"),
+            redact_vin: flag("redact-vin"),
+            allow_live_bus: flag("live-bus"),
+            persist_conversations: flag("persist"),
+            force_local_only: flag("local-only"),
+          });
+          toast("AI settings saved");
+          loadAI();
+        } catch (error) { toast(`${error.code || "error"}: ${error.message}`, "err", 0); }
+      } });
+      const saveKey = h("button.btn.btn--sm", { type: "button", text: "Save key", onClick: async () => {
+        const provider = providerSelect.querySelector("select").value;
+        const value = key.querySelector("input").value;
+        if (!provider || !value) { toast("Choose a provider and paste a key", "warn"); return; }
+        try {
+          const result = await api.aiSetKey({ provider, key: value });
+          key.querySelector("input").value = "";
+          toast(`Key saved (${result.key.hint})`);
+          loadAI();
+        } catch (error) { toast(`${error.code || "error"}: ${error.message}`, "err", 0); }
+      } });
+      const removeKey = h("button.btn.btn--sm.btn--ghost", { type: "button", text: "Remove key", onClick: async () => {
+        const provider = providerSelect.querySelector("select").value;
+        if (!provider) return;
+        try { await api.aiDeleteKey(provider); toast("Key removed"); loadAI(); }
+        catch (error) { toast(error.message, "err"); }
+      } });
+
+      for (const [name, info] of Object.entries(config.keys || {})) {
+        keyState.appendChild(h("span.pill.pill--idle", {
+          text: `${name}: ${info.configured ? `configured ${info.hint}` : "no key"}${info.source ? ` (${info.source})` : ""}` }));
+      }
+
+      aiHolder.appendChild(h("div", null,
+        banner(config.provider
+          ? (config.is_local ? "Local model: vehicle data does not leave this machine."
+            : "Remote model: enable 'send bus data to a remote model' before a task can attach vehicle data.")
+          : "No provider configured. Paste a key, or point the base URL at a local model.", config.provider ? "info" : "warn"),
+        providerSelect, model.node, baseUrl.node, key,
+        h("div.row", null, saveKey, removeKey), keyState,
+        h("div.grid.grid--form", null, builds),
+        h("div.row", null, save,
+          h("button.btn.btn--sm.btn--ghost", { type: "button", text: "Delete saved conversations",
+            onClick: async () => {
+              try { await api.aiDeleteConversations(); toast("Saved conversations deleted"); }
+              catch (error) { toast(error.message, "err"); }
+            } })),
+        h("p.sub", { text: "Reads are cache-first; live reads need the setting above, an idle bus and a per-turn cap. The assistant's tools are read-only." })));
+
+      function flag(id) { return Boolean(aiHolder.querySelector(`#${id}`).checked); }
+    } catch (error) { clear(aiHolder); aiHolder.appendChild(errorState(error, { onRetry: loadAI })); }
+  }
+
+  function textField(id, label, value, placeholder) {
+    const input = h("input.mono", { id, type: "text", value: value || "", placeholder });
+    return { input, node: h("div.field", null, h("label", { for: id, text: label }), input) };
+  }
+
+  /* ------------------------------------------------------------- adapter */
 
   async function readInfo() {
     clear(adapterHolder);
@@ -71,7 +191,7 @@ export function render(root, ctx) {
     } catch (error) { clear(portsHolder); portsHolder.appendChild(errorState(error, { onRetry: loadPorts })); }
   }
 
-  /* ------------------------------------------------------------------- bus */
+  /* ------------------------------------------------------------------ bus */
 
   const busSelect = select({ id: "set-bus", label: "Default bus", value: "can-c",
     options: [{ value: "can-c", label: "can-c (HS 500k, pins 6/14)" }, { value: "can-ihs", label: "can-ihs (MS 125k, pins 3/11)" }] });
@@ -82,7 +202,7 @@ export function render(root, ctx) {
     } })));
   busHolder.appendChild(h("p.sub", { text: "Reads use an ATCRA receive filter pointing at the responder; ISO-TP flow control is always left automatic." }));
 
-  /* --------------------------------------------------------------- dataset */
+  /* -------------------------------------------------------------- dataset */
 
   async function loadDataset() {
     try {
@@ -97,7 +217,7 @@ export function render(root, ctx) {
     } catch (error) { clear(datasetHolder); datasetHolder.appendChild(errorState(error, { onRetry: loadDataset })); }
   }
 
-  /* ------------------------------------------------------------------ data */
+  /* ----------------------------------------------------------------- data */
 
   async function loadData() {
     try {
@@ -108,7 +228,7 @@ export function render(root, ctx) {
         ["Available", schema.available ? "yes" : "no"],
         ["Tables", (schema.tables || []).map((table) => `${table.name} (${table.rows})`).join(", ") || "—"],
         ["Server", `${location.origin} · v${info?.version || "?"}`],
-        ["Read-only", String(info?.read_only ?? true)],
+        ["Write surface", info?.write_enabled ? "enabled" : "read-only"],
         ["Auth", info?.auth_required ? "bearer token required" : "none (loopback only)"],
       ].flatMap(([key, value]) => [h("dt", { text: key }), h("dd", { text: String(value ?? "—") })])));
       dataHolder.appendChild(h("p.sub", { text: "The database browser opens SQLite read-only (mode=ro) and issues SELECTs only." }));
@@ -119,6 +239,8 @@ export function render(root, ctx) {
   loadPorts();
   loadDataset();
   loadData();
+  loadSafety();
+  loadAI();
 
   return { dispose() {}, resize() {} };
 }

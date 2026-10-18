@@ -1,10 +1,10 @@
 # Web UI + bring-your-own-key AI layer — design
 
-Status: **stage 1 built (read-only web UI); the AI layer and the write surface are
-still design-only.** Sections §1–§4 and §6 are implemented for reads (see
-[How to run](#how-to-run--stage-1-read-only) at the end of this document); §5 (AI),
-§3.7/§3.8 (security + writes) and the `ai` extra are not built yet. Nothing here
-changes `src/`, the protocol layer, or the safety rules in `AGENTS.md`.
+Status: **stages 1 and 2 built.** Stage 1 is the read-only web UI (§1–§4, §6);
+stage 2 adds the guarded write surface (§3.7/§3.8), the `0x27` held-seed policy
+(§9.2) and the bring-your-own-key AI layer (§5), built to the owner decisions in
+§9. Sections §7/§8 and §9.1–§9.4 remain the design record. Nothing here changes
+the protocol layer or the safety rules in `AGENTS.md`.
 
 ## 0. Scope
 
@@ -2167,3 +2167,188 @@ checks the vendored uPlot licence text.
    `openai_compat` (OpenAI, Gemini, Ollama, LM Studio, vLLM, custom base URL)
    plus native `anthropic`; PDF is the browser's print path; no subscription, no
    credits (MIT, local-first) is the positioning.
+
+---
+
+## How to run — stage 2 (security, writes and AI)
+
+Stage 2 adds three screens and one opt-in server flag. Read-only remains the
+default; nothing below is reachable until it is asked for.
+
+### Security (`0x27`) and guarded writes
+
+```sh
+uv sync --extra web
+uv run pacifica-obd web --demo --allow-writes    # enables the write surface
+```
+
+* `#/security` — **Explain** (offline), **Read seed**, **Preview key**. The
+  preview shows the exact wire bytes (`27 <level+1> <key>`); **Confirm and send**
+  opens a modal that requires typing the module id.
+* `#/writes` — `write-did` (`2E`) and `routine` (`31`), each preview → typed
+  confirm. Preview reads the current value where it exists; the confirm re-checks
+  it in the same serialized job.
+* Every preview and send is written to the store's `events` table
+  (`write-preview` / `write-send` / `security-preview` / `security-send`) with the
+  module, the bus, the exact request and the outcome. A `0x27` key is never
+  logged — only its byte length.
+
+`0x27` holds **one** seed under a 30 s lease bound to `(module, level, bus)`; the
+send does not request a second seed. Enable **Strict `0x27` seed re-read** in
+Settings → Safety only for a module whose seed is known to be stable: strict mode
+spends a second seed request, which on some ECUs advances a bad-attempt counter.
+
+Without `--allow-writes`, the write routes are not registered at all and a
+request to them returns `403 readonly`.
+
+### The AI layer (bring your own key)
+
+No provider is configured out of the box and no traffic leaves the machine until
+one is. There is no SDK and no required dependency: the adapters use `httpx`,
+which is already in the `[web]` extra.
+
+**Configure a provider.** The UI is deliberately vendor-neutral. Two wire shapes
+are supported:
+
+| Provider id | Shape | Typical base URL |
+|---|---|---|
+| `openai_compat` | any `/v1/chat/completions` endpoint | a local server such as `http://127.0.0.1:11434/v1`, or a hosted endpoint |
+| `anthropic` | the native messages API | the vendor's endpoint |
+| `fake` | deterministic, offline | none — for tests and demos |
+
+Do it in **Settings → AI** (`#/settings`): pick the provider, set the base URL and
+model, paste a key (write-only; the form never echoes it and the API returns only
+a masked hint), and choose the privacy toggles — *send bus data to a remote
+model* (off), *redact VIN* (on), *allow live bus reads* (off), *save
+conversations* (off), *local models only* (off).
+
+Or set it from the environment for a one-off run:
+
+```sh
+export PACIFICA_OBD_AI_PROVIDER=openai_compat      # or anthropic / fake
+export PACIFICA_OBD_AI_BASE_URL=http://127.0.0.1:11434/v1
+export PACIFICA_OBD_AI_MODEL=<a model id your endpoint serves>
+export PACIFICA_OBD_AI_KEY_OPENAI=<your key>        # optional for a local server
+uv run pacifica-obd web --demo
+```
+
+Keys live in `$PACIFICA_OBD_HOME/ai.json` (mode `0600`; a looser file is refused
+with a `chmod 600` message) or in the environment. They are never written to the
+database, the event log, a report, a conversation record or a log line, and they
+are scrubbed from provider errors before an HTTP response is serialised.
+
+**Using it.** `#/assistant` streams answers over SSE. The default is
+**context-pack-first**: the app gathers a deterministic evidence pack in code and
+makes one model call, which works on local models that cannot call tools. The
+**bounded tool loop** is opt-in (≤6 calls / ≤3 rounds). The tool timeline shows
+each read-only call with an untrusted-data badge; the cost meter shows tokens and
+a dated USD estimate; **Stop** aborts; **What will be sent** shows the exact
+system prompt, user message and tool schemas.
+
+Task endpoints: `POST /api/ai/tasks/{explain|diagnose|report|compare|pretrip}`.
+Reads are cache-first; a live read needs *allow live bus reads*, an idle bus and a
+per-turn cap. Prompt-injection defence fences every tool result as untrusted, with
+`<`/`>` escaped so a payload cannot close the fence.
+
+**Offline demo (no key, no network).** Point the assistant at the deterministic
+provider — this is also what the test suite uses:
+
+```sh
+PACIFICA_OBD_AI_OFFLINE=1 uv run pacifica-obd web --demo
+# or, per request/run:
+PACIFICA_OBD_AI_PROVIDER=fake PACIFICA_OBD_AI_MODEL=fake-1 uv run pacifica-obd web --demo
+```
+
+### Tests
+
+```sh
+# Stage 2 additions:
+uv run python tests/test_security_policy.py          # lease/held-seed policy
+uv run --extra web python tests/test_web_security.py # explain/seed/preview/unlock + audit
+uv run --extra web python tests/test_web_writes.py   # confirm token, ack, precondition, 403
+uv run --extra web python tests/test_ai_layer.py     # registry, chat loop, caps, redaction
+uv run --extra web python tests/test_web_ai_api.py   # HTTP + SSE + a real-socket e2e
+```
+
+### Screenshots (headless Chrome)
+
+```sh
+PACIFICA_OBD_HOME=$(mktemp -d) \
+  PACIFICA_OBD_AI_PROVIDER=fake PACIFICA_OBD_AI_MODEL=fake-1 \
+  uv run pacifica-obd web --demo --allow-writes --port 8781 &
+
+CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+shot() { "$CHROME" --headless=new --disable-gpu --hide-scrollbars \
+  --virtual-time-budget=8000 --window-size=1440,1100 --screenshot="$1.png" "$2"; }
+
+shot security_explain 'http://127.0.0.1:8781/#/security?module=747&variant=&auto=explain'
+shot security_preview 'http://127.0.0.1:8781/#/security?module=744&variant=64&auto=preview'
+shot writes_preview   'http://127.0.0.1:8781/#/writes?module=744&did=F190&data=01&auto=1'
+shot writes_confirm   'http://127.0.0.1:8781/#/writes?module=744&did=F190&data=01&auto=1&confirm=1'
+shot assistant        'http://127.0.0.1:8781/#/assistant?ask=Explain%20the%20codes%20on%20this%20car&task=diagnose&collect=1'
+shot ai_settings      'http://127.0.0.1:8781/#/settings'
+```
+
+`auto=explain` runs the offline explanation on load, so the ambiguous refusal (and
+its candidate list) is deterministic; `confirm=1` opens the typed-confirm modal;
+`ask=` sends a question on load. The live assistant uses SSE (`POST /api/ai/chat`);
+headless Chrome does not pump a streaming response body under
+`--virtual-time-budget`, so the screenshot uses the same engine through its
+`collect=1` drain (a JSON response) — the streaming path itself is exercised by
+`tests/test_web_ai_api.py` and by `curl -N` (see the test file).
+
+### Adversarial review (stage 2)
+
+Two independent reviews were run, as in stage 1, against the new code
+(`codex exec … "review the write paths"`, `claude -p "review the AI layer"`).
+Real findings and their fixes:
+
+**Write paths (codex).**
+
+1. **Tokens survived an adapter replacement** (high). A preview token named the
+   module and bytes but not the connection, so a token issued before a
+   disconnect/reconnect could execute against a different adapter. Fixed: the
+   adapter *generation* is captured inside the preview job and compared inside
+   the confirm job; a change is a `409 generation_mismatch` with no transmission.
+2. **A newer seed request did not invalidate an older lease** (high). Two leases
+   for the same module/level could coexist. Fixed with a per-`(module, level,
+   bus)` challenge epoch: `issue` and a plain seed read bump it, and `consume`
+   refuses a superseded lease (`409 superseded`).
+3. **A cancelled/timed-out confirm could still transmit** (high). The job bodies
+   never checked the worker's cancel flag, so a client timeout could still send
+   `2E`/`31`/`27 <key>`. Fixed: `require_extended_session` and every transmit
+   check cancellation immediately before the command.
+4. **A failed preview read silently disabled the precondition** (medium). A DID
+   whose current value could not be read was previewed as a blind write. Fixed:
+   such a preview is refused (403) rather than previewed.
+5. **Audit could claim a transmission that never happened** (medium). Exception
+   paths recorded `sent=True`; preview audits started after the bus work. Fixed:
+   the audit session opens before bus work and every outcome (including a
+   refusal) is recorded; a pre-transmission failure records `sent: null`.
+
+**AI layer (claude).**
+
+1. **Tool-calling bypassed the remote-consent gate** (highest). With a remote
+   provider and consent off, the evidence pack was withheld but `tools: true`
+   still dispatched cache-first database tools whose results went to the remote
+   API. Fixed: bus consent gates the tool loop too — `tools` with consent off is
+   `403 remote_context_not_allowed`, and the backend is not wired at all.
+2. **The evidence pack was placed in the system (trusted) message.** Fixed: the
+   pack is now a fenced `user`-role message; the system prompt stays static.
+3. **VIN redaction covered only two tool handlers.** Fixed: every tool result is
+   VIN-redacted after serialisation, and the evidence-pack text too.
+4. **Key-shaped material only redacted by regex.** Fixed: the logging filter is
+   installed at app creation (on handlers as well as loggers) and provider errors
+   are redacted with the configured key literals.
+5. **`http://` remote endpoints and an unsalted VIN pseudonym.** Fixed: a
+   non-loopback `base_url` must be `https://`; the pseudonym is HMAC'd with a
+   per-install salt (`$PACIFICA_OBD_HOME/ai-salt`, 0600).
+6. **Caps were per-request; output was uncapped; extra tool calls left
+   unanswered `tool_use` ids.** Fixed: a per-conversation token total is carried
+   across requests, `max_output_tokens_per_request` is enforced, and only the
+   calls actually run are recorded in the assistant message.
+7. **`/api/ai/*` and the key-delete route skipped the CSRF header.** Fixed: the
+   custom header is required for chat, tasks, key mutation and config.
+8. **"What will be sent" omitted the evidence pack; saved chats could not be
+   deleted.** Fixed: the preview can include the pack (`?task=`) and a
+   `DELETE /api/ai/conversations` endpoint plus a Settings button were added.

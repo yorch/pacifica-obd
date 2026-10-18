@@ -30,14 +30,24 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from pacifica_obd.web import errors
 from pacifica_obd.web.bus import BusWorker
+from pacifica_obd.web.confirm import ConfirmTokenStore
 from pacifica_obd.web.deps import build_worker, default_store_factory
 from pacifica_obd.web.reports import ReportRegistry
+from pacifica_obd.security import SecurityLeaseStore
 from pacifica_obd.web.settings import Settings
 
 STATIC_DIR = Path(__file__).parent / "static"
 
-# Read-only is a property of this build, not a runtime switch.
+# The safe default. A server started with --allow-writes sets
+# ``app.state.read_only = False``; the routes are then registered. This constant
+# stays True so an accidental import cannot enable writes.
 READ_ONLY = True
+
+# Routes that can change a module or a stored secret, or spend money. They require
+# the custom header as well as a JSON body and a same-origin Origin (design §4.5).
+_WRITE_PREFIXES = ("/api/writes/", "/api/security/unlock", "/api/ai/keys/",
+                   "/api/ai/chat", "/api/ai/tasks/")
+_WRITE_EXACT = ("/api/ai/keys", "/api/ai/config", "/api/ai/conversations")
 
 _CSP = (
     "default-src 'self'; img-src 'self' data:; connect-src 'self'; "
@@ -93,9 +103,35 @@ def _report_document_path(path: str) -> bool:
     return action in ("html", "zip") or (action == "download" and len(parts) == 5)
 
 
+def _ai_redactor():
+    """A redactor that knows the configured key literals (read lazily)."""
+    def _redact(value):
+        text = "" if value is None else str(value)
+        try:
+            from pacifica_obd.web.ai.keys import KeyStore, redact_text
+
+            store = KeyStore()
+            return redact_text(text, tuple(store._keys.values()))
+        except Exception:  # noqa: BLE001 - redaction must never raise
+            return text
+
+    return _redact
+
+
 def create_app(settings: Settings | None = None, *, worker: BusWorker | None = None) -> FastAPI:
     settings = settings or Settings()
-    redact = errors.redactor(settings.token)
+    # Scrub key-shaped material from every log record before it can be emitted.
+    try:
+        from pacifica_obd.web.ai.keys import install_logging_filter
+
+        install_logging_filter()
+    except Exception:  # noqa: BLE001 - redaction setup must never break startup
+        pass
+    token_redact = errors.redactor(settings.token)
+    ai_redact = _ai_redactor()
+
+    def redact(value):
+        return ai_redact(token_redact(value))
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -115,8 +151,11 @@ def create_app(settings: Settings | None = None, *, worker: BusWorker | None = N
         lifespan=lifespan,
     )
     app.state.settings = settings
-    app.state.read_only = READ_ONLY
+    app.state.read_only = bool(settings.read_only)
     app.state.reports = ReportRegistry()
+    app.state.security = SecurityLeaseStore(ttl_s=30.0)
+    app.state.confirm = ConfirmTokenStore(ttl_s=120.0)
+    app.state.ai_rate_limiter = None  # created lazily by the AI routes
 
     if worker is None:
         worker = build_worker(settings)
@@ -174,6 +213,19 @@ def create_app(settings: Settings | None = None, *, worker: BusWorker | None = N
                                         detail={"origin": origin}),
                         redact,
                     )
+                needs_header = (
+                    any(path.startswith(prefix) for prefix in _WRITE_PREFIXES)
+                    or path.rstrip("/") in _WRITE_EXACT
+                )
+                if needs_header and request.headers.get("x-pacifica-request") != "1":
+                    return _envelope(
+                        errors.ApiError(
+                            "missing_request_header", "auth",
+                            "this operation requires the X-Pacifica-Request header",
+                            http_status=403, status="rejected",
+                        ),
+                        redact,
+                    )
 
         response = await call_next(request)
         is_report_html = path.endswith("/html") and "/reports/" in path
@@ -217,8 +269,12 @@ def create_app(settings: Settings | None = None, *, worker: BusWorker | None = N
     from pacifica_obd.web.routes import live as live_routes
     from pacifica_obd.web.routes import obd as obd_routes
     from pacifica_obd.web.routes import reports as report_routes
+    from pacifica_obd.web.routes import security as security_routes
+    from pacifica_obd.web.routes import settings as settings_routes
     from pacifica_obd.web.routes import system as system_routes
     from pacifica_obd.web.routes import uds as uds_routes
+    from pacifica_obd.web.routes import writes as write_routes
+    from pacifica_obd.web.routes import ai as ai_routes
 
     app.include_router(system_routes.router, prefix="/api")
     app.include_router(obd_routes.router, prefix="/api")
@@ -226,11 +282,38 @@ def create_app(settings: Settings | None = None, *, worker: BusWorker | None = N
     app.include_router(uds_routes.router, prefix="/api")
     app.include_router(db_routes.router, prefix="/api")
     app.include_router(report_routes.router, prefix="/api")
+    app.include_router(settings_routes.router, prefix="/api")
+    app.include_router(ai_routes.router, prefix="/api")
+    # Security explain/seed/preview are reads of the bus; always available.
+    app.include_router(security_routes.router, prefix="/api")
+
+    if settings.read_only:
+        # Read-only: the write routes are not registered at all. A stray request
+        # still gets a documented 403 rather than a bare 405/404.
+        _write_methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
+
+        @app.api_route("/api/writes/{rest:path}", methods=_write_methods,
+                       include_in_schema=False)
+        async def _writes_disabled(rest: str):
+            raise errors.readonly(
+                "the write surface is disabled: restart with --allow-writes to enable it"
+            )
+
+        @app.api_route("/api/security/unlock", methods=_write_methods,
+                       include_in_schema=False)
+        async def _unlock_disabled():
+            raise errors.readonly(
+                "0x27 unlock is disabled: restart with --allow-writes to enable it"
+            )
+    else:
+        app.include_router(security_routes.unlock_router, prefix="/api")
+        app.include_router(write_routes.router, prefix="/api")
 
     # Any unmatched /api path is a documented 404 envelope, for every method: the
     # static mount below would otherwise answer a stray POST with a bare 405.
     @app.api_route("/api/{rest:path}",
-                   methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"])
+                   methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
+                   include_in_schema=False)
     async def _api_not_found(rest: str):
         raise errors.not_found(f"no such endpoint: /api/{rest}")
 

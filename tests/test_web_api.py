@@ -213,53 +213,58 @@ def test_static_index_is_served():
     run_async(app, body)
 
 
-def test_no_write_route_exists_and_read_only_is_structural():
+def test_no_write_route_exists_by_default_and_read_only_is_structural():
+    """Stage 2 default: the write surface is absent, not merely guarded.
+
+    ``--read-only`` (and the default) must not register ``write-did``, ``routine``
+    or a real ``security/unlock`` route at all; a stray request still gets a
+    documented 403. The AI routes exist but its registry has no write tool.
+    """
     assert READ_ONLY is True
     assert Settings().read_only is True
     app = make_app()
     assert app.state.read_only is True
     try:
-        routes = []
-        for route in app.routes:
-            path = getattr(route, "path", "")
-            methods = sorted(getattr(route, "methods", []) or [])
-            if path.startswith("/api") and "{rest:path}" not in path:
-                routes.append((path, methods))
-        forbidden_words = ("write", "clear", "routine", "security", "unlock", "ai/", "settings")
-        for path, _methods in routes:
-            assert not any(word in path for word in forbidden_words), path
-            assert not path.endswith("/confirm"), path
-        # Only reads: GET, plus POSTs that open the bus or start a stream.
-        allowed_posts = {
-            "/api/connect", "/api/disconnect", "/api/vin", "/api/bus",
-            "/api/obd/scan", "/api/uds/modules", "/api/uds/dtc-all", "/api/uds/read-did",
-            "/api/uds/module-info", "/api/uds/capture", "/api/live/watch/start",
-            "/api/live/watch/stop", "/api/uds/monitor/start", "/api/uds/monitor/stop",
-            "/api/reports/dump", "/api/reports/from-session", "/api/reports/compare",
-        }
-        for path, methods in routes:
-            for method in methods:
-                if method in ("HEAD", "OPTIONS"):
-                    continue
-                if method == "GET":
-                    continue
-                assert method == "POST", (path, method)
-                if "{job_id}" in path:
-                    continue
-                assert path in allowed_posts, f"unexpected POST route: {path}"
+        paths = set(app.openapi()["paths"])
+        assert "/api/writes/write-did" not in paths
+        assert "/api/writes/routine" not in paths
+        assert "/api/writes/write-did/confirm" not in paths
+        assert "/api/security/unlock" not in paths  # a 403 stub, not a documented route
+        # The AI tool registry is read-only by construction.
+        from pacifica_obd.web.ai import tools as ai_tools
+
+        assert ai_tools.FORBIDDEN_NAMES.isdisjoint(ai_tools.TOOL_NAMES)
+        assert all(spec.read_only and not spec.vehicle_write for spec in ai_tools.TOOLS.values())
     finally:
         app.state.worker.stop()
 
     async def body(client):
-        for path in ("/api/obd/dtc/clear", "/api/security/unlock", "/api/writes/write-did",
-                     "/api/writes/routine", "/api/raw", "/api/ai/chat"):
-            response = await client.post(path, json={})
-            assert response.status_code == 404, (path, response.status_code)
-            envelope = response.json()
-            assert envelope["error"]["kind"] == "not_found"
+        for path in ("/api/writes/write-did", "/api/writes/routine",
+                     "/api/writes/write-did/confirm", "/api/security/unlock"):
+            response = await client.post(path, json={}, headers={"X-Pacifica-Request": "1"})
+            assert response.status_code == 403, (path, response.status_code)
+            assert response.json()["error"]["kind"] == "readonly"
+        # Unknown reads still get the not-found envelope.
+        assert (await client.post("/api/obd/dtc/clear", json={})).status_code == 404
 
     app2 = make_app()
     run_async(app2, body)
+
+
+def test_writes_enabled_registers_the_guarded_routes():
+    app = create_app(Settings(demo=True, read_only=False))
+    try:
+        paths = set(app.openapi()["paths"])
+        assert "/api/writes/write-did" in paths
+        assert "/api/writes/write-did/confirm" in paths
+        assert "/api/writes/routine" in paths
+        assert "/api/security/unlock" in paths
+        unlock = app.openapi()["paths"]["/api/security/unlock"]
+        operations = " ".join(str(value.get("operationId", ""))
+                              for value in unlock.values() if isinstance(value, dict))
+        assert "disabled" not in operations, operations
+    finally:
+        app.state.worker.stop()
 
 
 def test_report_documents_are_capability_addressed_not_token_gated():

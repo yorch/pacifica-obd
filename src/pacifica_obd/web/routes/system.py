@@ -45,7 +45,8 @@ async def health(request: Request):
     return {
         "ok": True,
         "version": tool_version(),
-        "read_only": True,
+        "read_only": bool(settings.read_only),
+        "write_enabled": bool(settings.write_enabled),
         "auth_required": settings.auth_required,
         "adapter": {
             "attached": status["attached"],
@@ -129,9 +130,11 @@ async def vin(request: Request):
 @router.get("/status", summary="Worker + bus status (the TUI status line)")
 async def status(request: Request):
     worker = deps.get_worker(request)
+    settings = deps.get_settings(request)
     return {
         "bus": worker.bus,
-        "read_only": True,
+        "read_only": bool(settings.read_only),
+        "write_enabled": bool(settings.write_enabled),
         "attached": bool(getattr(worker.backend, "attached", False)),
         "adapter": adapter_state(worker),
         "job": worker.status(),

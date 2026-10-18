@@ -42,10 +42,12 @@
       </div>
     </header>
 
-    <div id="banners" class="banners" role="status" aria-live="polite">
-      <div class="banner banner--info">Read-only build: this UI can read the vehicle and the local
-        database; it has no write, clear, or security-unlock path.</div>
+    <div id="safety-banner" class="banners" role="status" aria-live="polite">
+      <div class="banner banner--info">Read-only: this server can read the vehicle, unlock
+        nothing and write nothing. The assistant can read; it cannot write.</div>
     </div>
+
+    <div id="banners" class="banners" role="status" aria-live="polite"></div>
 
     <main id="view" class="view" tabindex="-1"></main>
   </div>

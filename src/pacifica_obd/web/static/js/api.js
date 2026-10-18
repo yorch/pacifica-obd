@@ -78,6 +78,8 @@ async function throwFromBody(text, response, payload = null) {
 
 export const get = (path, options) => request("GET", path, options);
 export const post = (path, body, options) => request("POST", path, { ...options, body });
+export const put = (path, body, options) => request("PUT", path, { ...options, body });
+export const del = (path, options) => request("DELETE", path, options);
 export const rawResponse = (path, options) => request("GET", path, { ...options, raw: true });
 
 export function query(params) {
@@ -139,4 +141,27 @@ export const api = {
   reportFromSession: (body) => post("/api/reports/from-session", body),
   reportMeta: (id) => get(`/api/reports/${id}`),
   reportCompare: (a, b) => post("/api/reports/compare", { a, b }),
+
+  settings: () => get("/api/settings"),
+  putSettings: (body) => put("/api/settings", body),
+
+  securityExplain: (body) => post("/api/security/explain", body),
+  securitySeed: (body) => post("/api/security/seed", body),
+  securityPreview: (body) => post("/api/security/preview", body),
+  securityUnlock: (body) => post("/api/security/unlock", body),
+
+  writeDidPreview: (body) => post("/api/writes/write-did", body),
+  writeDidConfirm: (body) => post("/api/writes/write-did/confirm", body),
+  routinePreview: (body) => post("/api/writes/routine", body),
+  routineConfirm: (body) => post("/api/writes/routine/confirm", body),
+
+  aiProviders: () => get("/api/ai/providers"),
+  aiConfig: () => get("/api/ai/config"),
+  aiSetConfig: (body) => put("/api/ai/config", body),
+  aiSetKey: (body) => post("/api/ai/keys", body),
+  aiDeleteKey: (provider) => del(`/api/ai/keys/${encodeURIComponent(provider)}`),
+  aiConversations: () => get("/api/ai/conversations"),
+  aiConversation: (id) => get(`/api/ai/conversations/${encodeURIComponent(id)}`),
+  aiDeleteConversations: () => del("/api/ai/conversations"),
+  aiWhatWillBeSent: (message, task) => get(`/api/ai/what-will-be-sent${query({ message, task })}`),
 };

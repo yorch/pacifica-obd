@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 import secrets
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
@@ -35,17 +35,22 @@ class Settings:
     generic_protocol: str | None = "6"
     log_level: str = "info"
     open_browser: bool = False
-    # Never settable: the web UI is read-only in this build (stage 1).
-    _read_only: bool = field(default=True, init=False, repr=False)
-
-    @property
-    def read_only(self) -> bool:
-        """Always True in stage 1; there is no write surface to disable."""
-        return True
+    # Stage 2: the write surface is off unless the operator starts the server
+    # with --allow-writes. `--read-only` (or the default) removes every write
+    # route from the app entirely; the AI layer never has one either way.
+    read_only: bool = True
+    # Owner decision §9.2: held-seed is the default. This opt-in is for modules
+    # whose seed is known to be stable and whose bad-attempt counter is not a
+    # concern; it is documented with that caveat in Settings → Safety.
+    strict_seed_reread: bool = False
 
     @property
     def auth_required(self) -> bool:
         return bool(self.token)
+
+    @property
+    def write_enabled(self) -> bool:
+        return not self.read_only
 
     @property
     def origin(self) -> str:

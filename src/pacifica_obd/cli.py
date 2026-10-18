@@ -1312,7 +1312,7 @@ def cmd_web(args: argparse.Namespace) -> None:
             host=args.host,
             port=args.port,
             token=args.token,
-            read_only=True,
+            read_only=not getattr(args, "allow_writes", False),
             demo=args.demo,
             open_browser=args.open,
             allow_remote=args.allow_remote,
@@ -2145,6 +2145,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_web.add_argument("--open", action="store_true", help="open the UI in a browser")
     p_web.add_argument("--allow-remote", action="store_true",
                        help="allow a non-loopback bind (requires --token)")
+    p_web.add_argument("--allow-writes", action="store_true",
+                       help="enable the guarded write surface (0x27 / 2E / 31); "
+                            "off by default")
     p_web.set_defaults(func=cmd_web)
 
     p_vehicles = sub.add_parser("vehicles", help="list vehicles with stored records")

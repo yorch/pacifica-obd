@@ -304,6 +304,7 @@ class SerialBackend:
         self._elm: ElmAdapter | None = None
         self._conn = None
         self._last_info: dict | None = None
+        self.generation = 0
 
     @property
     def attached(self) -> bool:
@@ -324,6 +325,7 @@ class SerialBackend:
             except Exception:  # noqa: BLE001
                 pass
             self._conn = None
+            self.generation += 1
 
     def _close_elm(self) -> None:
         if self._elm is not None:
@@ -332,6 +334,7 @@ class SerialBackend:
             except Exception:  # noqa: BLE001
                 pass
             self._elm = None
+            self.generation += 1
 
     def uds(self) -> ElmAdapter:
         if self._elm is None:
@@ -340,6 +343,7 @@ class SerialBackend:
                              timeout=self.timeout)
             self._elm = elm
             self.port = elm.port
+            self.generation += 1
         return self._elm
 
     def obd(self):
@@ -360,6 +364,7 @@ class SerialBackend:
                 self._conn = None
                 raise AdapterError(f"could not open {port}: {exc}") from exc
             self.port = port
+            self.generation += 1
         return self._conn
 
     def info(self) -> dict:
@@ -747,7 +752,9 @@ class FakeAdapter:
                  dids: dict[str, dict[int, str]] | None = None,
                  refuse: set[str] | None = None,
                  refuse_filter: bool = False,
-                 adapter_id: str = "STN1170 v4.3.2"):
+                 adapter_id: str = "STN1170 v4.3.2",
+                 seeds: dict[str, str] | None = None,
+                 security_accept: bool = True):
         # modules: request id -> response id
         self.modules = modules or {"7E0": 0x7E8, "7E1": 0x7E9, "7E2": 0x7EA, "7E7": 0x7EF}
         self.vin = vin
@@ -762,9 +769,18 @@ class FakeAdapter:
         self.refuse = refuse or set()
         self.refuse_filter = refuse_filter
         self.adapter_id = adapter_id
+        # A per-module seed and whether a key is accepted (a test can make the
+        # ECU reject it to exercise the "rejected, not unlocked" path).
+        self.seeds = seeds or {}
+        self.security_accept = security_accept
         self.commands: list[str] = []
+        self.seed_requests: list[tuple[str, str]] = []
+        self.keys_sent: list[dict] = []
+        self.writes: list[dict] = []
+        self.routines: list[dict] = []
         self.header: str | None = None
         self.filter: str | None = None
+        self.bus: str | None = None
         self.flow_control = False
         self.closed = False
 
@@ -838,6 +854,10 @@ class FakeAdapter:
         if command == "ATAR":
             self.filter = None
             return ["OK"]
+        if command.startswith("STP ") or command.startswith("ATTP"):
+            token = command.split()[-1]
+            self.bus = {"33": "can-c", "53": "can-ihs"}.get(token, self.bus)
+            return ["OK"]
         if command.startswith("ATFC") or command.startswith("ATCFC"):
             self.flow_control = True
             return ["OK"]
@@ -849,6 +869,40 @@ class FakeAdapter:
             return ["OK"]
         if self.header is None:
             return ["NO DATA"]
+        # -- guarded services (0x27 / 0x2E / 0x31) -------------------------
+        if command.startswith("27") and len(command) >= 4 and self.header in self.modules:
+            response = self._response_id(self.header)
+            if response is None:
+                return ["NO DATA"]
+            level = command[2:4]
+            if len(command) == 4:
+                self.seed_requests.append((self.header, level))
+                seed = self.seeds.get(self.header, "A1B2C3D4")
+                return _isotp_lines(response, "67" + level + seed)
+            key = command[4:]
+            self.keys_sent.append({"module": self.header, "level": level,
+                                   "key": key, "bus": self.bus})
+            if self.security_accept:
+                return _isotp_lines(response, "67" + level)
+            return _isotp_lines(response, "7F2722")
+        if command.startswith("2E") and len(command) >= 6 and self.header in self.modules:
+            response = self._response_id(self.header)
+            if response is None:
+                return ["NO DATA"]
+            did = command[2:6]
+            self.writes.append({"module": self.header, "did": did,
+                                "data": command[6:], "request": command,
+                                "bus": self.bus})
+            return _isotp_lines(response, "6E" + did)
+        if command.startswith("31") and len(command) >= 8 and self.header in self.modules:
+            response = self._response_id(self.header)
+            if response is None:
+                return ["NO DATA"]
+            sub, routine = command[2:4], command[4:8]
+            self.routines.append({"module": self.header, "sub": sub,
+                                  "routine": routine, "data": command[8:],
+                                  "request": command, "bus": self.bus})
+            return _isotp_lines(response, "71" + sub + routine)
         lines = self._probe_response(self.header, command)
         if lines is None:
             lines = self._custom_did(self.header, command)
@@ -967,6 +1021,7 @@ class FakeBackend:
     def __init__(self, adapter: FakeAdapter | None = None, conn: FakeOBD | None = None):
         self._adapter = adapter or FakeAdapter()
         self._conn = conn or FakeOBD(vin=self._adapter.vin)
+        self.generation = 0
         self._info = {
             "port": "/dev/cu.fake",
             "status": "Car connected",

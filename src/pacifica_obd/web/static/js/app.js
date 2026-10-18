@@ -15,6 +15,13 @@ const NAV = [
     { path: "/modules", label: "Modules & DTCs", glyph: "⌗" },
     { path: "/dids", label: "DIDs / ID block", glyph: "⧉" },
   ]],
+  ["GUARDED", [
+    { path: "/security", label: "Security 0x27", glyph: "🔒" },
+    { path: "/writes", label: "Writes", glyph: "✎", writes: true },
+  ]],
+  ["AI", [
+    { path: "/assistant", label: "Assistant", glyph: "✦" },
+  ]],
   ["DATA", [
     { path: "/capture", label: "Capture", glyph: "⤓" },
     { path: "/db", label: "Database", glyph: "▦" },
@@ -26,17 +33,14 @@ const NAV = [
   ]],
 ];
 
-const STAGE_TWO = [
-  { label: "Security 0x27", glyph: "⚿" },
-  { label: "Writes", glyph: "✎" },
-  { label: "Assistant", glyph: "✦" },
-];
-
 const VIEWS = {
   "/": () => import("./views/dashboard.js"),
   "/live": () => import("./views/live.js"),
   "/modules": () => import("./views/modules.js"),
   "/dids": () => import("./views/dids.js"),
+  "/security": () => import("./views/security.js"),
+  "/writes": () => import("./views/writes.js"),
+  "/assistant": () => import("./views/assistant.js"),
   "/capture": () => import("./views/capture.js"),
   "/db": () => import("./views/db.js"),
   "/reports": () => import("./views/reports.js"),
@@ -75,23 +79,20 @@ function cycleTheme() {
 function renderNav(activePath) {
   const groups = document.getElementById("rail-groups");
   clear(groups);
+  const writeEnabled = state.status?.health ? !state.status.health.read_only : false;
   for (const [title, items] of NAV) {
-    groups.appendChild(h("nav.rail__group", { "aria-label": title },
-      h("div.eyebrow", { text: title }),
-      items.map((item) => h("a.rail__link", {
+    const links = items
+      .filter((item) => !item.writes || writeEnabled)
+      .map((item) => h("a.rail__link", {
         href: `#${item.path}`,
         "aria-current": item.path === activePath ? "page" : null,
       },
         h("span.glyph", { text: item.glyph, "aria-hidden": "true" }),
-        h("span", { text: item.label })))));
+        h("span", { text: item.label })));
+    if (!links.length) continue;
+    groups.appendChild(h("nav.rail__group", { "aria-label": title },
+      h("div.eyebrow", { text: title }), links));
   }
-  groups.appendChild(h("nav.rail__group", { "aria-label": "Stage 2 (not in this build)" },
-    h("div.eyebrow", { text: "STAGE 2" }),
-    STAGE_TWO.map((item) => h("span.rail__link", {
-      "aria-disabled": "true", title: "not part of this read-only build",
-    },
-      h("span.glyph", { text: item.glyph, "aria-hidden": "true" }),
-      h("span", { text: item.label })))));
 }
 
 /* -------------------------------------------------------- status/top bar */
@@ -130,10 +131,28 @@ async function refreshStatus() {
     const [health, status] = await Promise.all([api.health(), api.status()]);
     state.status = { health, status };
     renderStatus(status, health);
+    renderNav(parseHash().path);
+    updateSafetyChrome(health);
   } catch (error) {
     const dot = document.getElementById("conn-dot");
     if (dot) dot.dataset.state = "crit";
   }
+}
+
+// The rail subtitle and the top banner state the actual safety posture, so a
+// screenshot can never imply a write surface that is not enabled.
+function updateSafetyChrome(health) {
+  const subtitle = document.querySelector(".rail__title small");
+  const region = document.getElementById("safety-banner");
+  const writes = health ? !health.read_only : false;
+  if (subtitle) subtitle.textContent = writes ? "writes enabled" : "read-only";
+  if (!region) return;
+  clear(region);
+  region.appendChild(banner(
+    writes
+      ? "Write mode: 0x27 unlock and 2E/31 writes require a typed confirmation. The Security Gateway may still refuse; this tool cannot undo a change."
+      : "Read-only: this server can read the vehicle, unlock nothing and write nothing. The assistant can read; it cannot write.",
+    writes ? "warn" : "info"));
 }
 
 /* ------------------------------------------------------------------ router */
@@ -204,6 +223,13 @@ function wireTopBar() {
 /* -------------------------------------------------------------------- boot */
 
 async function boot() {
+  window.addEventListener("error", (event) => {
+    setBanner(banner(`Script error: ${event.message || "unknown"}`, "err"));
+  });
+  window.addEventListener("unhandledrejection", (event) => {
+    const reason = event.reason;
+    setBanner(banner(`Script error: ${reason?.message || String(reason)}`, "err"));
+  });
   ingestTokenFromFragment();
   applyTheme();
   window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {

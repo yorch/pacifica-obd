@@ -463,6 +463,40 @@ def security_access(elm, level: int, seedkey=None, wait: float = 0.5,
     return result
 
 
+def send_security_key(elm, level: int, key_hex: str, wait: float = 0.5,
+                      expect_header: str | None = None) -> dict:
+    """Send an already-computed key (``27 <level+1> <key>``) and read the ACK.
+
+    Split out from :func:`security_access` for the held-seed policy: the web UI
+    reads one seed at preview time, holds it under a lease, and sends the key
+    here **without** asking the ECU for a second seed (a second request can
+    advance some modules' bad-attempt counter). No key computation happens here.
+    """
+    level = int(level)
+    if level % 2 == 0 or not 0x01 <= level <= 0x7D:
+        raise ValueError("security level must be an odd value in 0x01..0x7D")
+    key_hex = (key_hex or "").upper().removeprefix("0X")
+    if not key_hex or len(key_hex) % 2 or not re.fullmatch(r"[0-9A-F]+", key_hex):
+        raise ValueError("key must be non-empty even-length hex")
+    request = "27%02X%s" % (level + 1, key_hex)
+    lines = elm.cmd(request, wait=wait)
+    header, uds = parse_uds_frame(lines, prefer_header=expect_header)
+    result = _result(header, uds, level=level, key_hex=key_hex, request=request,
+                     unlocked=False, status="ok")
+    if header is None:
+        result["status"] = "no_response"
+    elif expect_header and header != expect_header:
+        result["status"] = "wrong_responder"
+    elif uds.startswith("7F"):
+        result["status"] = "rejected"  # the ECU refused the key; it is not unlocked
+    elif uds.startswith("67%02X" % (level + 1)):
+        result["status"] = "unlocked"
+        result["unlocked"] = True
+    else:
+        result["status"] = "unexpected"
+    return result
+
+
 def write_did(elm, did: int, data_hex: str, wait: float = 0.5,
               expect_header: str | None = None) -> dict:
     """UDS 0x2E WriteDataByIdentifier."""

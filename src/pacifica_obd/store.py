@@ -87,6 +87,32 @@ CREATE INDEX IF NOT EXISTS idx_readings_vin  ON readings(vin);
 CREATE INDEX IF NOT EXISTS idx_modules_vin   ON modules(vin);
 CREATE INDEX IF NOT EXISTS idx_samples_vin   ON samples(vin);
 CREATE INDEX IF NOT EXISTS idx_samples_sess  ON samples(session_id, ts);
+-- Opt-in AI tables (design §4.8). Deliberately outside `events`: that table is a
+-- record of vehicle interactions, not of chat. Additive and behind the same
+-- degrade-to-no-op behaviour as everything else here.
+CREATE TABLE IF NOT EXISTS ai_usage (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts            TEXT NOT NULL,
+    provider      TEXT,
+    model         TEXT,
+    input_tokens  INTEGER,
+    output_tokens INTEGER,
+    cost_est      REAL
+);
+CREATE TABLE IF NOT EXISTS ai_conversations (
+    id         TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    title      TEXT
+);
+CREATE TABLE IF NOT EXISTS ai_messages (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id TEXT,
+    ts              TEXT NOT NULL,
+    role            TEXT,
+    content         TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ai_messages ON ai_messages(conversation_id, id);
 """
 
 
@@ -345,6 +371,56 @@ class Store:
 
     def sessions(self, limit: int = 50) -> list[dict]:
         return self._query("SELECT * FROM sessions ORDER BY id DESC LIMIT ?", (limit,))
+
+    # -- AI usage + opt-in conversations (design §4.8) ---------------------
+    def ai_record_usage(self, provider: str | None, model: str | None,
+                        input_tokens: int, output_tokens: int,
+                        cost_est: float) -> None:
+        self._execute(
+            "INSERT INTO ai_usage (ts, provider, model, input_tokens, output_tokens, cost_est)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (_now(), provider, model, int(input_tokens or 0), int(output_tokens or 0),
+             float(cost_est or 0.0)),
+        )
+
+    def ai_save_conversation(self, conversation_id: str, messages: list[dict],
+                             title: str | None = None) -> None:
+        if not conversation_id:
+            return
+        now = _now()
+        self._execute(
+            """INSERT INTO ai_conversations (id, created_at, updated_at, title)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at,
+                   title = COALESCE(excluded.title, ai_conversations.title)""",
+            (conversation_id, now, now, title),
+        )
+        self._execute("DELETE FROM ai_messages WHERE conversation_id = ?", (conversation_id,))
+        for message in messages or []:
+            self._execute(
+                "INSERT INTO ai_messages (conversation_id, ts, role, content) VALUES (?, ?, ?, ?)",
+                (conversation_id, now, str(message.get("role") or ""),
+                 str(message.get("content") or "")[:20000]),
+            )
+
+    def ai_list_conversations(self, limit: int = 50) -> list[dict]:
+        return self._query(
+            "SELECT id, created_at, updated_at, title FROM ai_conversations"
+            " ORDER BY updated_at DESC LIMIT ?", (max(1, int(limit)),))
+
+    def ai_get_conversation(self, conversation_id: str) -> dict | None:
+        rows = self._query("SELECT * FROM ai_conversations WHERE id = ?", (conversation_id,))
+        if not rows:
+            return None
+        messages = self._query(
+            "SELECT role, content, ts FROM ai_messages WHERE conversation_id = ? ORDER BY id",
+            (conversation_id,))
+        return {"conversation": rows[0], "messages": messages}
+
+    def ai_delete_conversations(self) -> None:
+        self._execute("DELETE FROM ai_messages")
+        self._execute("DELETE FROM ai_conversations")
+
 
     def vehicle_summary(self, vin: str) -> dict:
         return {
