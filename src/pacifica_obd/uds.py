@@ -385,6 +385,11 @@ def _seed_ctx(func, level: int, width: int | None) -> dict:
     return ctx
 
 
+# Public alias: a front end (the TUI) that computes a preview key itself must
+# build the provider context the same way this module does.
+provider_context = _seed_ctx
+
+
 def security_access(elm, level: int, seedkey=None, wait: float = 0.5,
                     expect_header: str | None = None) -> dict:
     """UDS 0x27: request a seed (odd level) and, if a provider allows, send a key.

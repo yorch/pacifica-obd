@@ -294,6 +294,28 @@ def test_cli_json_unlock_refusal_is_structured_stdout():
     assert payload["selector"]["status"] == "ambiguous"
 
 
+def test_tui_uses_the_builtin_selector_the_same_way():
+    """The TUI must resolve/refuse exactly as the CLI does (front-end parity)."""
+    from pacifica_obd import tui
+
+    assert tui._ecu_for_module("742") == "IPC_PN"
+    assert tui._ecu_for_module("7E2") == "HCP_PN"
+    assert tui._ecu_for_module("7E7") == "BPCM_PN"
+    assert tui._ecu_for_module("123") is None
+
+    provider, info = tui._builtin_provider("742", 1, device_id=11872)
+    assert info["status"] == "resolved"
+    assert provider is not None
+    # same key the CLI/library computes for the same seed
+    assert provider(SEED) == fca_keys.compute_key("IPC_PN", 1, SEED, device_id=11872)
+
+    # ambiguous / unmapped must come back as a refusal, never a provider
+    for module, status in (("747", "ambiguous"), ("7E0", "unmapped")):
+        provider, info = tui._builtin_provider(module, 1)
+        assert provider is None and info["status"] == status, (module, info["status"])
+    assert tui._builtin_provider("747", 1)[1]["candidates"]
+
+
 if __name__ == "__main__":
     for name, func in sorted(globals().items()):
         if name.startswith("test_") and callable(func):

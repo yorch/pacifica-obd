@@ -119,6 +119,7 @@ from pacifica_obd.uds import (
     enter_session as _uds_enter_session,
     parse_dtcs as _parse_dtcs,
     parse_uds_frame as _parse_uds_frame,
+    provider_context,
     read_did as _read_did,
     routine_control,
     security_access,
@@ -759,6 +760,49 @@ def _addressed_session(
 # --------------------------------------------------------------------------- #
 # input validation (the UI counterpart of the CLI's argparse types)
 # --------------------------------------------------------------------------- #
+def _ecu_for_module(module_hex: str) -> str | None:
+    """Map a CAN request id to the dataset's ECU name (``742`` -> ``IPC_PN``)."""
+    from pacifica_obd import pacifica_data
+
+    try:
+        want = int(str(module_hex), 16)
+    except (TypeError, ValueError):
+        return None
+    for row in pacifica_data.modules():
+        request = row.get("request")
+        if request is None:
+            continue
+        try:
+            if int(str(request), 16) == want:
+                return row.get("ecu")
+        except ValueError:
+            continue
+    return None
+
+
+def _builtin_provider(module_hex: str, level: int,
+                      device_id: int | None = None,
+                      variant_id: int | None = None):
+    """``(provider, info)`` from the shipped selector; ``provider`` is None on refusal.
+
+    A refusal is returned rather than raised so the caller can show the candidate
+    list and send nothing — a guessed key can lock a module.
+    """
+    from pacifica_obd import fca_keys
+
+    ecu = _ecu_for_module(module_hex)
+    if not ecu:
+        return None, {
+            "status": "unmapped",
+            "reason": f"{module_hex} is not in the bundled dataset",
+            "candidates": [], "module": module_hex, "level": level, "ids": {},
+        }
+    info = fca_keys.explain(ecu, level, device_id=device_id, variant_id=variant_id)
+    if info["status"] != "resolved":
+        return None, info
+    return fca_keys.provider_for(ecu, level, device_id=device_id, variant_id=variant_id), info
+
+
 def _parse_module_id(text: str) -> str | None:
     """Validate an 11-bit CAN request ID such as '7E0'; return 3-hex upper-case."""
     token = text.strip().upper().removeprefix("0X")
@@ -2003,7 +2047,12 @@ class PacificaTui(App[None]):
                     Field("level", "Security level (odd)", value="1"),
                     Field("provider", "Key provider file (optional)",
                           placeholder="~/my_provider.py",
-                          hint="Python file exposing key_for(seed, **ctx) -> int."),
+                          hint="Python file exposing key_for(seed, **ctx) -> int. Leave blank "
+                               "to use the built-in PowerNet selector."),
+                    Field("device-id", "Device ID (optional)",
+                          hint="A module that pins several device IDs needs this (see --explain)."),
+                    Field("variant", "Variant ID (optional, hex or dec)",
+                          hint="Disambiguates modules the selector keys on the variant."),
                     Field("unlock", "Send the key (unlock)", value="0", kind="switch"),
                 ],
                 hint="Dumping a seed is a read. Sending a key is a write and will ask again.",
@@ -2022,9 +2071,36 @@ class PacificaTui(App[None]):
             return "Level must be a number."
         if not 1 <= level <= 0x7D or level % 2 == 0:
             return "Level must be an odd number in 1..125 (0x7D)."
-        if bool(values.get("unlock")) and _parse_path(str(values.get("provider", ""))) is None:
-            return "Unlocking needs a key provider file."
-        return None
+        ids = self._security_ids(values)
+        if ids is None:
+            return "Device ID and variant must be numbers (or blank)."
+        if not bool(values.get("unlock")):
+            return None
+        if _parse_path(str(values.get("provider", ""))) is not None:
+            return None  # an explicit provider always wins
+        module = _parse_module_id(str(values.get("module", ""))) or ""
+        provider, info = _builtin_provider(module, level, **ids)
+        if provider is not None:
+            return None
+        if info.get("candidates"):
+            names = ", ".join(c["algorithm"] for c in info["candidates"][:3])
+            return (f"Built-in selector {info['status']}: supply a device ID / variant, "
+                    f"or a provider file. Candidates: {names}")
+        return f"Built-in selector {info['status']}: {info.get('reason', 'no algorithm')}."
+
+    @staticmethod
+    def _security_ids(values: dict) -> dict | None:
+        """Parse the optional device ID / variant fields (None = invalid)."""
+        out: dict = {"device_id": None, "variant_id": None}
+        for field, key in (("device-id", "device_id"), ("variant", "variant_id")):
+            text = str(values.get(field, "")).strip()
+            if not text:
+                continue
+            try:
+                out[key] = int(text, 0)
+            except ValueError:
+                return None
+        return out
 
     def _security_review(self, values: dict | None) -> None:
         if not values:
@@ -2035,11 +2111,13 @@ class PacificaTui(App[None]):
         module = _parse_module_id(str(values.get("module", ""))) or ""
         level = int(str(values.get("level", "1")).strip() or "1")
         provider = _parse_path(str(values.get("provider", "")))
+        ids = self._security_ids(values) or {"device_id": None, "variant_id": None}
         if not bool(values.get("unlock")):
             self._start("Security", partial(self._do_security_seed, bus, module, level))
             return
         self._start(
-            "Security", partial(self._do_security_key_request, bus, module, level, provider)
+            "Security",
+            partial(self._do_security_key_request, bus, module, level, provider, **ids),
         )
 
     def _do_security_seed(self, bus: str, module: str, level: int, elm: Elm327) -> None:
@@ -2076,7 +2154,8 @@ class PacificaTui(App[None]):
             )
 
     def _do_security_key_request(
-        self, bus: str, module: str, level: int, provider_path: str | None, elm: Elm327
+        self, bus: str, module: str, level: int, provider_path: str | None, elm: Elm327,
+        device_id: int | None = None, variant_id: int | None = None,
     ) -> None:
         """Read the seed and compute the key, then hand the exact request to the UI."""
         wait = _probe_wait()
@@ -2091,6 +2170,26 @@ class PacificaTui(App[None]):
             except SeedKeyError as exc:
                 self._post(self._log_err, str(exc))
                 return
+        else:
+            seedkey, info = _builtin_provider(module, level, device_id=device_id,
+                                              variant_id=variant_id)
+            if seedkey is None:
+                self._post(
+                    self._line,
+                    f"Built-in selector {info['status']}: "
+                    f"{info.get('reason', 'no single algorithm')}",
+                    "yellow",
+                )
+                for cand in info.get("candidates", []):
+                    sels = ", ".join(f"{s['field']}={s['value']}" for s in cand["selectors"])
+                    self._post(self._line, f"{cand['algorithm']}  ({sels})", "dim")
+                self._post(
+                    self._line,
+                    "Refusing: no single algorithm could be chosen, so no key was sent.",
+                    "yellow",
+                )
+                return
+            self._post(self._line, f"Built-in algorithm: {info['algorithm']}", "dim")
         rid, resp = _addressed_session(elm, bus, module, wait)
         result = security_access(elm, level, seedkey=None, wait=wait, expect_header=resp)
         seed = result.get("seed")
@@ -2119,18 +2218,23 @@ class PacificaTui(App[None]):
             return
         if seedkey is None:
             return
+        width = len(seed) // 2
         try:
-            key = seedkey(int(seed, 16))
+            ctx = provider_context(seedkey, level, width)
+            key = seedkey(int(seed, 16), **ctx) if ctx else seedkey(int(seed, 16))
         except Exception as exc:  # noqa: BLE001 - a broken provider must never send a key
             self._post(self._log_err, f"Key provider failed: {exc}")
             return
-        width = len(seed)
-        if type(key) is not int or key < 0 or key >= (1 << (4 * width)):
+        # The algorithm states its own key width (an 8-byte-seed module may want
+        # a 4-byte key); fall back to the seed width when it does not.
+        key_bytes = getattr(seedkey, "key_width", 0) or width
+        if type(key) is not int or key < 0 or key >= (1 << (8 * key_bytes)):
             self._post(
                 self._log_err, "The provider returned a key of the wrong width; nothing sent."
             )
             return
-        self._post(self._security_confirm_key, bus, module, level, seed, "%0*X" % (width, key))
+        self._post(self._security_confirm_key, bus, module, level, seed,
+                   "%0*X" % (2 * key_bytes, key))
 
     def _security_confirm_key(
         self, bus: str, module: str, level: int, seed: str, key_hex: str
@@ -2166,13 +2270,16 @@ class PacificaTui(App[None]):
             f"Security unlock 0x27 level {level:02X} — {module} on {_bus_label(bus)}",
         )
 
-        def reviewed_key(current_seed: int) -> int | None:
+        def reviewed_key(current_seed: int, **_ctx) -> int | None:
             # Send the key that was shown to the user, and only for the seed they
             # saw: None makes the library stop without sending anything, so a
             # changed seed invalidates the confirmation instead of sending a key.
             if "%0*X" % (len(seed), current_seed) != seed:
                 return None
             return int(key_hex, 16)
+
+        # Send the reviewed key at the width it was reviewed at.
+        reviewed_key.key_width = len(key_hex) // 2
 
         rid, resp = _addressed_session(elm, bus, module, wait)
         result = security_access(elm, level, seedkey=reviewed_key, wait=wait, expect_header=resp)
