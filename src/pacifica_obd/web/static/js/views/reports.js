@@ -2,7 +2,7 @@
 // session, preview/print/download it (json/xml/html/zip), and compare sessions.
 
 import { h, clear, mount, on, downloadBlob } from "../dom.js";
-import { api } from "../api.js";
+import { api, rawResponse } from "../api.js";
 import {
   card, cardBody, pill, emptyState, errorState, toast, dataTable, field, select,
   checkbox,

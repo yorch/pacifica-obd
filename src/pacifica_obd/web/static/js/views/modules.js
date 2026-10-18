@@ -59,6 +59,7 @@ export function render(root, ctx) {
     actions: h("span.sub", { id: "mod-summary", text: "nothing scanned" }) });
 
   const mapCard = card({ eyebrow: "Offline", title: "Module map (bundled dataset)",
+    body: mapHolder,
     actions: h("button.btn.btn--sm", { type: "button", text: "Load map", onClick: loadMap }) });
 
   mount(root, head, formCard, filterCard, card({ eyebrow: "Tree", title: "Modules & codes", body: treeHolder }),
