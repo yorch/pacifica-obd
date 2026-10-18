@@ -2141,3 +2141,29 @@ checks the vendored uPlot licence text.
 - Torque Pro / Car Scanner — [skanyx comparison](https://skanyx.com/blog/car-scanner-vs-torque-pro), [tacomaworld thread](https://www.tacomaworld.com/threads/torque-pro-vs-odb-fusion.711820/), [r/OBD2](https://www.reddit.com/r/OBD2/comments/19euzhy/torque_pro_or_whats_best_feedback_needed/)
 - Leaf Spy — [wind-works overview](https://wind-works.org/leaf-spy-an-essential-tool-for-serious-nissan-leaf-drivers/), [App Store](https://apps.apple.com/pe/app/leafspy-pro/id967376861)
 - Dr. Prius — [product page](https://priusapp.com/), [FAQ](https://priusapp.com/faq.html), [App Store](https://apps.apple.com/us/app/dr-prius-dr-hybrid/id1321750222)
+
+---
+
+## 9. Owner decisions (stage 2 is built to these)
+
+1. **Write surface: reads + security + guarded writes.** The web UI may unlock
+   (`0x27`) and write (`0x2E` / `0x31`), but only behind the confirm-token store,
+   a typed acknowledgement naming the exact wire request, and an audit event in
+   the store's `events` table (which job, which module, which bytes). A
+   `--read-only` server flag disables every write route outright. The AI layer
+   gets **no** write tool, ever.
+2. **`0x27` seed freshness: held seed + lease, never a second seed request.**
+   Request one seed, hold it with a 30 s lease bound to (module, level), compute
+   and preview the key, then send it against that held seed. Re-requesting a seed
+   can increment an ECU's bad-attempt counter, so the TUI-style "re-read and
+   compare" is an **opt-in** setting only, documented with that rationale.
+3. **AI: privacy-first and opt-in.** No provider configured out of the box (with
+   an Ollama shortcut); "send bus data to a remote model" **off**; VIN redaction
+   **on**; conversation persistence **off** (opt-in); AI reads are served from
+   the stored cache first, with live reads requiring an explicit setting and an
+   idle bus. Keys live in a `0600` file (or an env var), are never logged and are
+   scrubbed from every error path and report.
+4. Accepted as proposed elsewhere: `seedkey-brute` stays CLI-only; providers are
+   `openai_compat` (OpenAI, Gemini, Ollama, LM Studio, vLLM, custom base URL)
+   plus native `anthropic`; PDF is the browser's print path; no subscription, no
+   credits (MIT, local-first) is the positioning.
