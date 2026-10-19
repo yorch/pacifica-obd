@@ -20,18 +20,41 @@ from pacifica_obd.web.bus import FAKE_VIN, FakeAdapter, FakeBackend
 DEMO_VIN = FAKE_VIN
 
 
+def _demo_battery_dids() -> dict[str, dict[int, str]]:
+    """Synthetic pack frames for the HV battery screen (``--demo`` only).
+
+    These DIDs (``F40C``..``F40F``) are a **demo fixture**, not confirmed
+    vehicle identifiers: they exist so the per-cell chart, the imbalance metric
+    and the stat cards render with no car attached. A real vehicle's DID map is
+    supplied by the owner through the preset editor.
+    """
+    offsets = [0, 1, -1, 2, 0, -2, 1, -55, 0, 1, 2, -1, 0, 1, -2, 1,
+               0, 2, -1, 1, 0, 1, 2, 0, -1, 1, 0, 2, -2, 1, 0, 1]
+    cells = [3800 + offset for offset in offsets]          # mV, one weak cell
+    cells_hex = "62F40C" + "".join("%04X" % value for value in cells)
+    return {
+        "7E7": {                                            # BPCM: cells, pack, temps
+            0xF40C: cells_hex,
+            0xF40D: "62F40D0DDF",                            # 3551 × 0.1 = 355.1 V
+            0xF40F: "62F40F161B",                            # 22 °C … 27 °C
+        },
+        "7E2": {0xF40E: "62F40E00B0"},                       # HCP SoC: 176 × 0.5 = 88.0 %
+    }
+
+
 def demo_backend() -> FakeBackend:
     """The synthetic adapter used by ``--demo`` (and by the tests).
 
     On top of the four OBD-block modules it exposes the steering-column and ABS
     addresses, so the security screen has a *resolved* target (``744`` with
     variant 64) and an *ambiguous* one (``747`` without a discriminator) without
-    a car.
+    a car, plus the synthetic HV battery frames above.
     """
     return FakeBackend(adapter=FakeAdapter(
         vin=DEMO_VIN,
         modules={"7E0": 0x7E8, "7E1": 0x7E9, "7E2": 0x7EA, "7E7": 0x7EF,
                  "744": 0x4C4, "747": 0x4C7},
+        dids=_demo_battery_dids(),
     ))
 
 

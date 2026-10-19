@@ -3,7 +3,8 @@
 Status: **stages 1 and 2 built.** Stage 1 is the read-only web UI (§1–§4, §6);
 stage 2 adds the guarded write surface (§3.7/§3.8), the `0x27` held-seed policy
 (§9.2) and the bring-your-own-key AI layer (§5), built to the owner decisions in
-§9. **Stage 3 adds the Raw console (§3.14).** Sections §7/§8 and §9.1–§9.4 remain
+§9. **Stage 3 adds the Raw console (§3.14) and the HV battery screen (§3.6).**
+Sections §7/§8 and §9.1–§9.4 remain
 the design record. Nothing here changes the protocol layer or the safety rules in
 `AGENTS.md`.
 
@@ -561,6 +562,34 @@ button that cancels the current job. This mirrors the TUI's status line and
 - **States:** *Empty* ("this vehicle did not answer as a PHEV; the HV modules
   (7E2/7E7) did not respond — is the ignition on?"), *Loading*, *Error* per DID.
 
+**Built — with one honest gap.** The screen (`#/battery`,
+`routes/battery.py`, `views/battery.js`) is the 14th view: the per-cell bar chart
+with the mean line, min/max markers and a colour band for cells >50 mV from the
+mean; the max−min **imbalance** as the hero number with a plain-English verdict;
+pack voltage / SoC / temperature stat cards; a preset editor with an
+"unverified" warning and a record-to-database toggle.
+
+The gap is the DID map. The operator's AlfaOBD analysis copy
+(`~/temp/alfa-obd/analysis/alfaobd.db.joined`) enumerates the BPCM/HCP pack
+*quantities* and their units (Cell N Voltage in mV, State of Charge in %,
+Max/Min Cell Temp in °C, High Voltage Sensor (Pack) in V, …) but carries **no DID
+/ hex / request column** for the Pacifica hybrid modules, and
+`findings/09-real-vehicle-session.md` records the same conclusion ("no live/static
+definitions"). So every pack DID ships `verified: false` with `did: null` until
+the owner supplies one through the preset editor or the Raw console
+(`22 <DID>`).
+
+The identification block is treated the same way: only the DIDs the first
+real-vehicle session lists as *answering* (F100, F154/F155, F122, F132, F18C,
+F190) are marked `verified`; the standard ISO candidates F186–F191 are offered
+with `verified: false`, because that same session records standard F180–F19E
+mostly returning NRC `31` on this vehicle. None of it is pack data.
+
+Two decoding rules keep an unverified read from reading as a healthy pack: the
+**verdict is withheld** (band `incomplete`) when fewer cells answer than the
+preset's count, and the **pack voltage is not inferred** from a partial or
+implausible cell sum.
+
 ### 3.7 Security (0x27) — `#/security`
 
 - **Purpose:** the seed→key flow, with the **preview + confirm** choreography the
@@ -868,6 +897,14 @@ Legend: **R** = read-only, **W** = write/guarded, **S** = streaming.
 | POST | `/api/uds/capture` | `capture` |
 | GET | `/api/uds/dids?ecu=` | `pacifica_data.dids` (offline) |
 | GET | `/api/uds/adaptations?ecu=` | `pacifica_data.adaptations` (offline) |
+
+**HV battery (§3.6)** — the pack read is a read; the preset is a local file
+
+| Method | Path | Wraps | Notes |
+|---|---|---|---|
+| GET | `/api/battery/schema` | — | the recovered DID map (verified/unverified + source) and the saved-preset shape |
+| POST | `/api/battery/read` | `service.read_dids` against 7E7/7E2 | one snapshot; per-field failure degrades to a status |
+| POST | `/api/battery/preset` | — | validates (DID hex, count 1..96, finite positive scale) and saves the DID map; no bus access |
 
 **Security (0x27)** — each step is its own call; nothing is implicit
 
@@ -2733,7 +2770,9 @@ A second pass reviewed the components against the direction and found:
 - The "vLinker FS" mentions in the adapter empty state are pre-existing shipped
   strings that the docs and the CLI error text also use; no *new* vendor name was
   introduced anywhere in the front end.
-- There is no separate HV-battery route in this front end (13 routes, not 15), so
-  there was nothing to restyle there.
+- There is now a **14th** route, the HV battery screen (§3.6): the pack reads are
+  `0x22` only, its DID map ships `verified: false` until the owner supplies an
+  identifier, and the guided battery test is a roadmap item (no routine id was
+  recovered). The other 13 routes are unchanged.
 - The pre-existing `?auto=…`, `?replay=…`, `?start=1` deep links and the
   `?collect=1` screenshot drain are unchanged.

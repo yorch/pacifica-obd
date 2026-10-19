@@ -43,6 +43,7 @@ REQUIRED = [
     "js/views/security.js",
     "js/views/writes.js",
     "js/views/assistant.js",
+    "js/views/battery.js",
     "js/views/capture.js",
     "js/views/db.js",
     "js/views/reports.js",

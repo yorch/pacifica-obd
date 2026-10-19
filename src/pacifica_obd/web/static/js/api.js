@@ -159,6 +159,10 @@ export const api = {
   raw: (body) => post("/api/raw", body),
   rawConfirm: (body) => post("/api/raw/confirm", body),
 
+  batterySchema: () => get("/api/battery/schema"),
+  batteryRead: (body) => post("/api/battery/read", body),
+  batteryPreset: (body) => post("/api/battery/preset", body),
+
   aiProviders: () => get("/api/ai/providers"),
   aiConfig: () => get("/api/ai/config"),
   aiSetConfig: (body) => put("/api/ai/config", body),

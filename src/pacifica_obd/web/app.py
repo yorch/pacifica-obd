@@ -265,6 +265,7 @@ def create_app(settings: Settings | None = None, *, worker: BusWorker | None = N
         return _envelope(api, redact)
 
     # -- routers -----------------------------------------------------------
+    from pacifica_obd.web.routes import battery as battery_routes
     from pacifica_obd.web.routes import db as db_routes
     from pacifica_obd.web.routes import live as live_routes
     from pacifica_obd.web.routes import obd as obd_routes
@@ -281,6 +282,8 @@ def create_app(settings: Settings | None = None, *, worker: BusWorker | None = N
     app.include_router(obd_routes.router, prefix="/api")
     app.include_router(live_routes.router, prefix="/api")
     app.include_router(uds_routes.router, prefix="/api")
+    # The HV battery screen is reads + a local preset file; no bus write exists.
+    app.include_router(battery_routes.router, prefix="/api")
     app.include_router(db_routes.router, prefix="/api")
     app.include_router(report_routes.router, prefix="/api")
     app.include_router(settings_routes.router, prefix="/api")

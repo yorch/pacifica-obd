@@ -24,6 +24,7 @@ const NAV = [
     { path: "/assistant", label: "Assistant", glyph: "sparkles" },
   ]],
   ["DATA", [
+    { path: "/battery", label: "HV battery", glyph: "gauge" },
     { path: "/capture", label: "Capture", glyph: "download" },
     { path: "/db", label: "Database", glyph: "database" },
     { path: "/reports", label: "Reports", glyph: "file" },
@@ -43,6 +44,7 @@ const VIEWS = {
   "/security": () => import("./views/security.js"),
   "/writes": () => import("./views/writes.js"),
   "/assistant": () => import("./views/assistant.js"),
+  "/battery": () => import("./views/battery.js"),
   "/capture": () => import("./views/capture.js"),
   "/db": () => import("./views/db.js"),
   "/reports": () => import("./views/reports.js"),

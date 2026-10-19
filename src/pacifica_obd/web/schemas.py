@@ -111,6 +111,36 @@ class CompareRequest(BaseModel):
     b: int
 
 
+# -- HV battery screen (design §3.6) --------------------------------------- #
+class BatteryPreset(BaseModel):
+    """A DID map for one pack. Domain rules (DID hex, count, scale) are enforced
+    by ``routes/battery.py`` so the web and any future caller reject the same
+    strings with the same messages. ``cells_did: None`` clears the cell map."""
+
+    cells_did: str | None = None
+    first_cell_index: int = 1
+    count: int = 0
+    scale: float = 1.0
+    pack_voltage_did: str | None = None
+    pack_voltage_scale: float = 0.1
+    soc_did: str | None = None
+    soc_scale: float = 0.5
+    temp_did: str | None = None
+    temp_scale: float = 1.0
+    current_did: str | None = None
+    current_scale: float = 0.1
+    module: str = "7E7"
+    soc_module: str = "7E2"
+    source: str | None = None
+
+
+class BatteryReadRequest(BaseModel):
+    bus: Literal["can-c", "can-ihs"] = "can-c"
+    timeout_ms: int = 100
+    preset: BatteryPreset | None = None
+    store: bool = False
+
+
 # -- guarded surfaces ------------------------------------------------------ #
 class SecurityTargetRequest(BaseModel):
     module: str | int
