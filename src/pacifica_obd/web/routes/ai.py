@@ -25,6 +25,7 @@ from pacifica_obd.web import deps, errors
 from pacifica_obd.web.ai import backend as ai_backend
 from pacifica_obd.web.ai import config as ai_config
 from pacifica_obd.web.ai import keys as ai_keys
+from pacifica_obd.web.ai import models_cache as ai_models
 from pacifica_obd.web.ai import presets as ai_presets
 from pacifica_obd.web.ai import prompts as ai_prompts
 from pacifica_obd.web.ai import tools as ai_tools
@@ -187,6 +188,10 @@ async def put_config(request: Request, body: AIConfigPatch):
         updated.save()
     except ai_keys.KeyStoreError as exc:
         raise errors.ApiError("key_store", "validation", str(exc), http_status=400) from exc
+    # A model list belongs to one provider + endpoint; if either moved, the cached
+    # list is no longer about the configuration being used.
+    if "provider" in patch or "base_url" in patch:
+        ai_models.clear(config.provider or updated.provider)
     return _public_config(_load_config(), store)
 
 
@@ -201,6 +206,7 @@ async def set_key(body: AIKeyRequest):
         # A fresh key must be masked by the log filter immediately, not at the
         # next restart.
         store.refresh_logging_literals()
+        ai_models.clear(provider)
     except ai_keys.KeyStoreError as exc:
         raise errors.ApiError("key_store", "validation", str(exc), http_status=400) from exc
     # Never echo the key back; a masked hint only.
@@ -217,6 +223,7 @@ async def delete_key(provider: str):
         store.refresh_logging_literals()
     except Exception:  # noqa: BLE001 - logging is best-effort
         pass
+    ai_models.clear(provider)
     return {"provider": provider, "removed": removed}
 
 
@@ -314,15 +321,27 @@ async def test_connection(body: AITestRequest):
             models = await bounded(provider.list_models())
             result["models"] = redact_models(models)
             check("endpoint", True, f"reachable; {len(models)} model(s)")
+            # Remember the listing (and the endpoint it came from) so the settings
+            # screen can offer it without another round trip.
+            ai_models.store(config.provider, config.url(),
+                            models=[{"id": info.id, "name": getattr(info, "name", None)}
+                                    for info in models],
+                            supported=True)
         else:
-            # No model-discovery API (e.g. Anthropic): a 1-token ping is the only
-            # honest proof of reachability.
+            # No model-discovery API (e.g. Anthropic native): a 1-token ping is the
+            # only honest proof of reachability.
+            ai_models.store(config.provider, config.url(), models=[],
+                            supported=False,
+                            reason="this provider has no model-listing endpoint")
             await bounded(_ping(provider, model))
             check("endpoint", True, "reachable (no model list; a 1-token ping succeeded)")
     except ProviderError as exc:
         if exc.code == "bad_request" and getattr(provider, "supports_model_discovery", True):
             # The server may simply have no /models route; a 1-token ping proves
             # the chat path instead.
+            ai_models.store(config.provider, config.url(), models=[],
+                            supported=False,
+                            reason="this endpoint does not advertise a model list")
             try:
                 await bounded(_ping(provider, model))
                 check("endpoint", True,
@@ -367,6 +386,107 @@ async def _ping(provider, model: str) -> None:
                                     "the provider did not complete the probe")
             return
     raise ProviderError("bad_request", "the provider did not complete a stream")
+
+
+@router.get("/ai/models", summary="Model list for the configured (or a candidate) provider")
+async def list_models(provider: str | None = None, base_url: str | None = None,
+                      refresh: bool = False):
+    """Return the discovered model list, the preset's suggestions, and freshness.
+
+    Cached by default (no network): a listing costs a round trip, so it is fetched
+    only when asked for. ``refresh=1`` re-probes the provider — which needs a saved
+    configuration and, for a hosted provider, a key — and stores the result. When
+    listing is unavailable the entry explains why, and the suggestions are returned
+    regardless, so the model field is never empty.
+    """
+    config = _validated_config()
+    store = _keystore()
+
+    wanted_provider = (provider or config.provider or "").strip().lower() or None
+    if wanted_provider is not None and wanted_provider not in ai_presets.PRESETS:
+        raise errors.validation(f"unknown provider: {wanted_provider!r}")
+    preset = ai_presets.preset(wanted_provider)
+    wanted_url = (base_url or (config.url() if wanted_provider == config.provider else None)
+                  or (preset.default_base_url if preset else None))
+
+    entry = ai_models.read_entry(wanted_provider, wanted_url)
+    payload = {
+        "provider": wanted_provider,
+        "label": preset.label if preset else None,
+        "base_url": wanted_url,
+        "suggested": list(preset.example_models) if preset else [],
+        "discovered": [],
+        "supported": None,
+        "reason": None,
+        "checked_at": None,
+        "stale": True,
+        "source": "none",
+    }
+
+    if refresh:
+        if wanted_provider is None:
+            raise errors.validation("choose a provider before refreshing its model list")
+        if wanted_provider != config.provider:
+            # Probing a provider that is not the saved configuration would need a
+            # key we do not have (keys are per provider, but the endpoint must be
+            # the saved one to be meaningful).
+            raise errors.validation(
+                "refresh the list for the configured provider, or save the change first"
+            )
+        key = store.get(config.provider)
+        if preset is not None and preset.requires_key and not key:
+            raise errors.ApiError("no_key", "validation",
+                                 f"no API key is configured for {preset.label}",
+                                 http_status=400)
+        models, supported, reason = await _discover_models(config)
+        entry = ai_models.store(config.provider, config.url(), models=models or [],
+                                supported=supported, reason=reason)
+        payload["source"] = "live"
+
+    if entry is not None:
+        payload["discovered"] = [
+            {"id": item.get("id"), "name": item.get("name")}
+            for item in (entry.get("models") or [])
+        ]
+        payload["supported"] = entry.get("supported")
+        payload["reason"] = entry.get("reason")
+        payload["checked_at"] = entry.get("checked_at")
+        if payload["source"] != "live":
+            payload["source"] = "cache"
+    payload["stale"] = ai_models.is_stale(entry)
+    return payload
+
+
+async def _discover_models(config) -> tuple[list | None, bool, str | None]:
+    """One bounded model listing. Returns ``(models, supported, reason)``.
+
+    Never raises for a provider-side failure: the caller wants to say *why* there
+    is no list, not to fail the request.
+    """
+    key = _keystore().get(config.provider)
+    try:
+        provider = build_provider(config, key=key)
+    except ProviderError as exc:
+        return None, False, exc.message
+    try:
+        if not getattr(provider, "supports_model_discovery", True):
+            return None, False, "this provider has no model-listing endpoint"
+        try:
+            models = await asyncio.wait_for(provider.list_models(), TEST_TIMEOUT_S)
+            return list(models), True, None
+        except ProviderError as exc:
+            if exc.code == "bad_request":
+                return None, False, "this endpoint does not advertise a model list"
+            return None, False, exc.message
+        except asyncio.TimeoutError:
+            return None, False, "the provider did not answer in time"
+        except Exception:  # noqa: BLE001 - never echo a body fragment
+            return None, False, "the model listing failed"
+    finally:
+        try:
+            await provider.aclose()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 @router.get("/ai/conversations", summary="Stored conversations (opt-in)")
