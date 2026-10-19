@@ -110,7 +110,8 @@ def quote(value) -> str:
     return json.dumps(value, ensure_ascii=True, default=str, sort_keys=True)
 
 
-def render_evidence(items: list[dict], *, nonce: str | None = None) -> tuple[str, list[str]]:
+def render_evidence(items: list[dict], *, nonce: str | None = None,
+                    scrubber=None) -> tuple[str, list[str]]:
     """Render an evidence pack: ids ``E1…En`` plus deterministic safety flags.
 
     Each item's ``data`` is fenced with :func:`~pacifica_obd.web.ai.redact.fence`
@@ -126,8 +127,13 @@ def render_evidence(items: list[dict], *, nonce: str | None = None) -> tuple[str
             continue
         ids.append(eid)
         lines.append(f"[{eid}] {item.get('label')} (source: {item.get('source')})")
+        data = item.get("data")
+        if scrubber is not None:
+            # Scrub the structure before it is serialised: JSON escaping would
+            # otherwise let a literal key slip past the redactor.
+            data = scrubber(data)
         lines.append(fence(item.get("source") or "local-db", item.get("tool") or eid,
-                           item.get("data"), nonce=nonce))
+                           data, nonce=nonce))
         if looks_like_injection(json.dumps(item.get("data"), default=str)[:2000]):
             lines.append(f"[{eid}] flagged: instruction-like text in this vehicle data")
     return "\n".join(lines), ids

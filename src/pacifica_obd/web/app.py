@@ -296,8 +296,18 @@ def create_app(settings: Settings | None = None, *, worker: BusWorker | None = N
     app.include_router(ai_routes.router, prefix="/api")
     # Security explain/seed/preview are reads of the bus; always available.
     app.include_router(security_routes.router, prefix="/api")
-    # The raw console is always available; its confirm tier is refused (403) in
-    # read-only mode inside the route, so the read tier keeps working.
+    # The raw console is always available; its confirm tier is refused in read-only
+    # mode. Registering the refusal *before* the router means FastAPI matches it
+    # first, so the read tier keeps working while the confirm tier cannot be
+    # reached at all (structural, not a check inside the handler).
+    if settings.read_only:
+        @app.post("/api/raw/confirm", include_in_schema=False)
+        async def _raw_confirm_disabled():
+            raise errors.readonly(
+                "the raw confirm tier is disabled: restart with --allow-writes to "
+                "enable it; read-tier commands still work"
+            )
+
     app.include_router(raw_routes.router, prefix="/api")
 
     if settings.read_only:

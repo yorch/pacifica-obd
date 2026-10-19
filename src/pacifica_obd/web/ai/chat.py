@@ -283,10 +283,17 @@ class ChatEngine:
                         "message": "tool-call limit reached; extra calls were not run"}}
                 # Only the calls we actually run are recorded, so the next round
                 # never contains an unanswered tool_use id (a provider 400).
-                history.append(Message(role="assistant", content="".join(assistant_text),
-                                       tool_calls=tuple({"id": call.id, "name": call.name,
-                                                         "args": call.args}
-                                                        for call in handled)))
+                # The next request replays this turn to the provider, so the text
+                # and the call metadata are scrubbed on the way into the history —
+                # not only on the way into the SSE stream.
+                history.append(Message(
+                    role="assistant",
+                    content=self._scrub("".join(assistant_text)),
+                    tool_calls=tuple(
+                        {"id": self._scrub(call.id), "name": self._scrub(call.name),
+                         "args": redaction.scrub_obj(call.args or {}, keys=self._keys,
+                                                     enabled=self._redact_vin)}
+                        for call in handled)))
                 for call in handled:
                     calls_made += 1
                     safe_args = redaction.scrub_obj(call.args or {}, keys=self._keys,
@@ -346,10 +353,13 @@ class ChatEngine:
         payload = {"tool": name, "data": result.get("data"),
                    "error": result.get("error"), "summary": result.get("summary"),
                    "untrusted": True}
-        raw = json.dumps(payload, ensure_ascii=True, default=str, sort_keys=True)
-        # One exit gate for untrusted payloads too: VIN redaction covers the ASCII
-        # and the hex (F190) form, and a configured key literal can never ride out
-        # inside bus data that merely echoes it back.
+        # Scrub the *structure* first: JSON escaping turns a key containing a quote
+        # or a backslash into an escaped form that no longer matches the literal, so
+        # scrubbing only the serialised string misses it (adversarial review).
+        clean = redaction.scrub_obj(payload, keys=self._keys,
+                                    enabled=self._redact_vin)
+        raw = json.dumps(clean, ensure_ascii=True, default=str, sort_keys=True)
+        # Belt and braces: a secret assembled across JSON fragments.
         raw = self._scrub(raw)
         text = redaction.fence(source, name, raw, nonce=self.fence.nonce,
                                limit=self.fence.limit)

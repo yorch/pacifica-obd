@@ -274,6 +274,19 @@ async def put_config(request: Request, body: AIConfigPatch):
     clearable = {"provider", "model", "base_url"}
     patch = {key: value for key, value in patch.items()
              if value is not None or key in clearable}
+    # Switching provider on the settings form must not carry the previous endpoint
+    # (or its model) over: the stored key for the new provider would then be sent
+    # to a URL that was only ever approved for the old one. Only an explicitly
+    # supplied model/base_url survives a switch.
+    previous = effective.provider
+    new_provider = patch.get("provider", previous)
+    if new_provider and new_provider != previous and "provider" in patch:
+        preset = ai_presets.preset(new_provider)
+        if preset is not None:
+            if "model" not in patch:
+                patch["model"] = preset.default_model or ""
+            if "base_url" not in patch:
+                patch["base_url"] = preset.default_base_url or None
     try:
         # Validate the *effective* view (file + environment): that is what a chat
         # would use, and the environment may satisfy a field the file leaves empty.
@@ -928,7 +941,19 @@ def _gather_context(cache, task: str | None, body,
         add("E10", "Deterministic safety flags", "safety_flags", {"flags": flags},
             source="local-db")
 
-    text, ids = ai_prompts.render_evidence(items, nonce=nonce)
+    store = _keystore()
+    keys = store.literals()
+    try:
+        redact_vin = bool(_load_config().redact_vin)
+    except Exception:  # noqa: BLE001 - scrubbing is the safe default
+        redact_vin = True
+
+    def scrub_structured(value):
+        from pacifica_obd.web.ai import redact as ai_redact
+
+        return ai_redact.scrub_obj(value, keys=keys, enabled=redact_vin)
+
+    text, ids = ai_prompts.render_evidence(items, nonce=nonce, scrubber=scrub_structured)
     if flags:
         text = "SAFETY FLAGS (computed in code; do not change):\n" + "\n".join(
             f"- {flag}" for flag in flags) + "\n\n" + text
