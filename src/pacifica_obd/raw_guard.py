@@ -75,6 +75,18 @@ _REJECT_REASON = {
 #: The only AT commands that may be followed by one hex argument.
 AT_ARG_TAKING = frozenset({"ATSH", "ATCRA", "ATTP"})
 
+#: STN ("ST…") commands, which the CLI's expert path uses. They select adapter
+#: behaviour rather than carrying a diagnostic service, so they are not a route to
+#: a deny-tier service — but a protocol/identity read still belongs in its own tier.
+ST_READ_EXACT = frozenset({"STI"})
+#: STP/STPRS change the active protocol; STPTO the timeout. Nothing here writes
+#: vehicle data, so `confirm` is the right tier rather than `deny`.
+ST_CONFIRM_PREFIXES = ("STP", "STPRS", "STPTO")
+#: Monitor-all: keeps streaming every frame with no way to stop it from here.
+ST_DENY_EXACT = {"STMA": "monitor-all streams every frame with no way to stop it"}
+
+_ST_TOKEN = re.compile(r"ST[0-9A-Z]*")
+
 _COMMAND_TOKEN = re.compile(r"AT[0-9A-Z]*")
 _HEX_TOKEN = re.compile(r"[0-9A-Fa-f]+")
 _AT_ARG = re.compile(r"[0-9A-Fa-f]{1,8}")
@@ -234,7 +246,8 @@ def _parse(command) -> tuple[str, str, str | None]:
         )
 
     parts = stripped.split()
-    if parts[0][:2].upper() == "AT":
+    head = parts[0][:2].upper()
+    if head in ("AT", "ST"):
         name = parts[0].upper()
         if len(parts) == 1:
             argument = None
@@ -246,9 +259,10 @@ def _parse(command) -> tuple[str, str, str | None]:
             argument = parts[1].upper()
         else:
             raise RawCommandError("only one command may be sent per submit")
-        if not _COMMAND_TOKEN.fullmatch(name):
-            raise RawCommandError(f"not an AT command: {name!r}")
-        return "at", name + (argument or ""), name
+        token = _COMMAND_TOKEN if head == "AT" else _ST_TOKEN
+        if not token.fullmatch(name):
+            raise RawCommandError(f"not a valid command: {name!r}")
+        return ("at" if head == "AT" else "st"), name + (argument or ""), name
 
     for token in parts:
         if not _HEX_TOKEN.fullmatch(token):
@@ -284,6 +298,8 @@ def classify(command) -> Decision:
                         command="", kind="invalid")
     if kind == "at":
         return _classify_at(compact, service or compact)
+    if kind == "st":
+        return _classify_st(compact, service or compact)
     return _classify_hex(compact, service or "")
 
 
@@ -325,6 +341,24 @@ def _classify_hex(compact: str, service: str) -> Decision:
     return Decision(CONFIRM, f"service 0x{service} is not on the read allowlist; "
                              "confirm the exact bytes to send it",
                     command=compact, kind="hex", service=service)
+
+
+def _classify_st(compact: str, name: str) -> Decision:
+    """STN commands: identity is a read, protocol/timeout changes need confirming."""
+    for command, reason in ST_DENY_EXACT.items():
+        if compact.startswith(command):
+            return Decision(DENY, f"{command}… {reason}", command=compact,
+                            kind="st", service=name)
+    if compact in ST_READ_EXACT:
+        return Decision(READ, f"{compact} reads the adapter's identity", command=compact,
+                        kind="st", service=name)
+    for prefix in ST_CONFIRM_PREFIXES:
+        if compact.startswith(prefix):
+            return Decision(CONFIRM, f"{prefix}… changes adapter state (protocol or "
+                                     "timeout); confirm before sending",
+                            command=compact, kind="st", service=name)
+    return Decision(CONFIRM, f"{compact} is not a known read; confirm the exact "
+                             "command to send it", command=compact, kind="st", service=name)
 
 
 def _classify_at(compact: str, name: str) -> Decision:
