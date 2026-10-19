@@ -49,6 +49,8 @@ class ConfirmEntry:
     created: float = 0.0
     ttl_s: float = DEFAULT_TTL_S
     used: bool = False
+    #: Set by :meth:`ConfirmTokenStore.authorize`, at the moment of transmit.
+    authorized: bool = False
     #: When set, the typed acknowledgement must equal this string instead of the
     #: normalised module id (the raw console acknowledges the exact command bytes).
     ack: str | None = None
@@ -165,6 +167,41 @@ class ConfirmTokenStore:
                 )
             burned = ConfirmEntry(**{**entry.__dict__, "used": True})
             self._entries[token] = burned
+            return entry
+
+    def authorize(self, token: str, *, kind: str, generation: str = "") -> ConfirmEntry:
+        """The **final** gate: re-validate immediately before the actual transmit.
+
+        ``consume`` burns the token at the start of the job, but the job then
+        acquires the adapter, opens a session and reads the precondition — seconds
+        during which the token can expire and the adapter generation can change.
+        Without this the earlier positive decision would still authorise the write
+        (adversarial review, highest-risk finding). A successful authorisation is
+        itself single-use, so one token cannot authorise two transmits.
+        """
+        with self._lock:
+            self._purge_locked()  # drops anything past its TTL
+            entry = self._entries.get(token or "")
+            if entry is None:
+                raise ConfirmError("expired", "confirm token expired before the send")
+            if entry.kind != kind:
+                raise ConfirmError(
+                    "mismatch",
+                    f"token belongs to a {entry.kind!r} preview, not {kind!r}",
+                )
+            if not entry.used:
+                raise ConfirmError("unconfirmed", "this operation was never confirmed")
+            if entry.authorized:
+                raise ConfirmError("consumed", "this token already authorised a send")
+            if str(generation or "") != str(entry.params.get("generation", "")):
+                raise ConfirmError(
+                    "generation_mismatch",
+                    "the adapter connection changed before the operation was sent",
+                )
+            if entry.expired(self._clock()):
+                raise ConfirmError("expired", "confirm token expired before the send")
+            authorized = ConfirmEntry(**{**entry.__dict__, "authorized": True})
+            self._entries[token] = authorized
             return entry
 
     def _purge_locked(self) -> None:

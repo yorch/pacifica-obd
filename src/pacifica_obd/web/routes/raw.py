@@ -58,20 +58,18 @@ def _generation(ctx) -> str:
 
 
 def _acknowledged(lines) -> bool:
-    """True only for a clean ``OK``.
+    """True only when *every* non-empty line is a clean ``OK``.
 
-    Substring matching accepted ``"NOT OK"`` and ``"OK\\n?"``, which would let a
-    request through after the adapter refused the command it depends on.
+    Substring matching accepted ``"NOT OK"``, and returning on the first ``OK``
+    accepted a contradictory response such as ``["OK", "?"]`` — so a request could
+    go out after the adapter had signalled a problem. The adapter answers a
+    command with one line, so anything else is a refusal.
     """
-    for line in lines or []:
-        text = str(line).strip().upper()
-        if not text:
-            continue
-        if text in {"OK", "OK."}:
-            return True
-        # any other non-empty line is a refusal ("?", "NOT OK", "ERROR", "NO DATA")
+    seen = [str(line).strip().upper() for line in (lines or [])]
+    seen = [text for text in seen if text]
+    if not seen:
         return False
-    return False
+    return all(text in {"OK", "OK."} for text in seen)
 
 
 def _refused(decision: raw_guard.Decision) -> errors.ApiError:
@@ -283,7 +281,7 @@ async def raw_confirm(request: Request, body: RawConfirmRequest):
         session_id = ctx.open_session("raw", {"command": decision.command,
                                               "tier": raw_guard.CONFIRM})
         try:
-            adapter = ctx.uds()
+            adapter = ctx.uds()   # acquisition can bump the generation: do it first
             if params.get("generation") != _generation(ctx):
                 audit.record(ctx.store, session_id, "raw-send", decision.command,
                              {"command": decision.command, "tier": raw_guard.CONFIRM,
@@ -293,6 +291,19 @@ async def raw_confirm(request: Request, body: RawConfirmRequest):
                     "confirm_stale", "confirm",
                     "the adapter connection changed since the preview; submit again",
                     status="generation_mismatch")
+            # Final gate: the token's TTL can lapse while the adapter is acquired
+            # and the session configured, so re-authorise at the last instant —
+            # and burn the authorisation so one token cannot send twice.
+            try:
+                _store(request).authorize(body.confirm_token, kind="raw",
+                                          generation=_generation(ctx))
+            except ConfirmError as exc:
+                audit.record(ctx.store, session_id, "raw-send", decision.command,
+                             {"command": decision.command, "tier": raw_guard.CONFIRM,
+                              "sent": False, "outcome": exc.status})
+                ctx.close_session(session_id, exc.status)
+                raise errors.ApiError("confirm_stale", "confirm", str(exc),
+                                      status=exc.status) from exc
             if ctx.cancelled():
                 raise service.OperationCancelled("cancelled before transmit")
             lines = _send(adapter, decision, timeout_ms, ctx.cancel)

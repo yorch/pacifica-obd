@@ -486,6 +486,10 @@ async def test_connection(body: AITestRequest):
     # endpoint is a credential-exfiltration primitive: the caller chooses the URL
     # and the server attaches the key (adversarial review, highest-risk finding).
     if config.provider and store.get(config.provider) and base.url() != config.url():
+        # Scrub before building the response: the caller-supplied URL can carry a
+        # credential in a query string, and this path used to echo it verbatim
+        # (the redactor was not created until further down).
+        redact_early = store.redactor()
         return {
             "ok": False,
             "checks": checks + [{
@@ -496,7 +500,7 @@ async def test_connection(body: AITestRequest):
             }],
             "models": [],
             "provider": config.provider,
-            "base_url": config.url(),
+            "base_url": redact_early(config.url()),
             "error": {"code": "endpoint_not_saved",
                       "message": "save the base URL before testing with a stored key"},
         }

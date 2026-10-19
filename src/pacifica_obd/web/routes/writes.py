@@ -141,9 +141,24 @@ async def write_did_confirm(request: Request, body: WriteConfirmRequest):
                 "confirm_stale", "confirm",
                 "the adapter connection changed since the preview; review again",
                 status="generation_mismatch")
+        # Acquire the adapter *before* the final authorisation: acquisition can
+        # itself bump the generation, and the token's TTL can lapse while the
+        # session is opening. The earlier check is a fast fail, not the gate.
+        try:
+            adapter = ctx.uds()
+            _store(request).authorize(
+                entry.token, kind="write-did",
+                generation=str(getattr(ctx.worker.backend, "generation", 0)))
+        except ConfirmError as exc:
+            audit.record(ctx.store, session_id, "write-send", entry.request,
+                         {"module": params["module"], "bus": params["bus"], "service": "2E",
+                          "request": entry.request, "sent": False, "outcome": exc.status})
+            ctx.close_session(session_id, exc.status)
+            raise errors.ApiError("confirm_stale", "confirm", str(exc),
+                                  status=exc.status) from exc
         try:
             result = service.execute_write_did(
-                ctx.uds(), bus=params["bus"], module=params["module"],
+                adapter, bus=params["bus"], module=params["module"],
                 did=int(params["did"], 16), data=params["data"],
                 timeout_ms=int(params.get("timeout_ms", 100)),
                 expected_current=params.get("expected_current"),
@@ -244,8 +259,20 @@ async def routine_confirm(request: Request, body: WriteConfirmRequest):
                 "the adapter connection changed since the preview; review again",
                 status="generation_mismatch")
         try:
+            adapter = ctx.uds()
+            _store(request).authorize(
+                entry.token, kind="routine",
+                generation=str(getattr(ctx.worker.backend, "generation", 0)))
+        except ConfirmError as exc:
+            audit.record(ctx.store, session_id, "write-send", entry.request,
+                         {"module": params["module"], "bus": params["bus"], "service": "31",
+                          "request": entry.request, "sent": False, "outcome": exc.status})
+            ctx.close_session(session_id, exc.status)
+            raise errors.ApiError("confirm_stale", "confirm", str(exc),
+                                  status=exc.status) from exc
+        try:
             result = service.execute_routine(
-                ctx.uds(), bus=params["bus"], module=params["module"],
+                adapter, bus=params["bus"], module=params["module"],
                 rid=int(params["rid"], 16), sub=int(params["sub"]),
                 data=params.get("data", ""),
                 timeout_ms=int(params.get("timeout_ms", 100)), cancel=ctx.cancel)

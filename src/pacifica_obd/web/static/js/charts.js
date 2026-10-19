@@ -51,6 +51,10 @@ export class TimeSeriesChart {
   update(payload) {
     if (!this.plot) this.ensurePlot();
     if (!this.plot) return;
+    // Self-healing columns: `update` may be called before/after a series change
+    // without a rebuild in between (a live chart configured after the first
+    // sample), and pushing into a missing column threw instead of plotting.
+    while (this.data.length < this.series.length + 1) this.data.push([]);
     const xs = this.data[0];
     xs.push(payload.t / 1000);
     this.series.forEach((serie, index) => {
