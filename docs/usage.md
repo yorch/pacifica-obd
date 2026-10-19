@@ -480,13 +480,33 @@ quoted (or use `--header 7E0`).
 | `--header HDR` | Set the CAN header first (`ATSH`, e.g. `7E0`). |
 | `--protocol N` | Try a protocol first (`ATTP`, **non-saving**, e.g. `6` = CAN 11-bit/500k) — unlike `ATSP`, which would persist to adapter EEPROM. |
 | `--headers` | Show response headers (`ATH1`). |
-| `--no-auto-format` | `ATCAF0` — raw CAN, no ISO-TP framing. |
-| `--no-flow-control` | `ATCFC0`. |
+| `--no-auto-format` | `ATCAF0` — raw CAN, no ISO-TP framing. **Needs `--force`.** |
+| `--no-flow-control` | `ATCFC0`. **Needs `--force`.** |
 | `--allow-long` | `ATAL` — allow messages longer than 7 bytes. |
+| `--confirm` | Allow the guard's confirm tier (a service that is not a known read and not a known hazard). |
+| `--force` | Allow the guard's deny tier (writes, clears, framing changes). Prints a loud warning. |
 
-!!! danger "`raw` is unfiltered"
+### The tier guard
 
-    Nothing stops you from sending a write service. Prefer read services
+`raw` classifies every command **before opening the port**, using the same
+`pacifica_obd.raw_guard` rules as the web Raw console:
+
+- **read** — OBD `01/03/07/09/0A`; UDS `10` (sessions `01`/`03`), `19`, `22`,
+  `23`, `24`, `3E`; addressing/info AT commands. Sent as-is.
+- **confirm** — anything else that is not a known hazard. Needs `--confirm`.
+- **deny** — `27`, `2E`, `31`, `2F`, `3D`, `34`–`37`, `11`, `14`, `28`, `85`,
+  OBD `04`, manual flow control (`ATFCSM/H/D`), resets and monitor modes,
+  protocol EEPROM writes, `ATCAF0`, `ATCEA`. Needs `--force`, and the reason is
+  printed either way.
+
+A refused command exits `2` **before** the adapter is opened, and the parser
+rejects a smuggled second command (`;`, a newline, a backtick). The CLI is the
+expert path, so `--force` really does send: a wrong write can lock a module and
+this tool cannot undo a change.
+
+!!! danger "`--force` is unfiltered"
+
+    `--force` reaches the deny tier on purpose. Prefer read services
     (`19`, `22`) and remember that the SGW is there for a reason: on a stock port
     writes are refused, and with a bypass cable installed a mistake is *more*
     likely to be accepted by the vehicle, not less.

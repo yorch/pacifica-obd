@@ -45,6 +45,7 @@ from pacifica_obd.adapter import (
 )
 from pacifica_obd.elm import Elm327, Elm327Error
 from pacifica_obd.obd_guard import is_read_only_command
+from pacifica_obd import raw_guard
 from pacifica_obd.database import EcuDatabase
 from pacifica_obd.profiles import (
     DEFAULT_PROFILE,
@@ -747,7 +748,61 @@ def cmd_scan(args: argparse.Namespace) -> None:
 
 
 def cmd_raw(args: argparse.Namespace) -> None:
-    """Send arbitrary AT/ST/OBD/UDS commands straight to the adapter."""
+    """Send arbitrary AT/ST/OBD/UDS commands straight to the adapter.
+
+    The same three-tier guard as the web console (``pacifica_obd.raw_guard``) is
+    applied first, but here the deny tier is *reachable* behind an explicit
+    ``--force``: the CLI is the expert escape hatch, and the guard exists so that
+    a dangerous command is never sent by accident. Classification happens before
+    the port is opened, so a refused command cannot touch the adapter.
+    """
+    forced = bool(getattr(args, "force", False))
+    confirmed = bool(getattr(args, "confirm", False))
+
+    decisions = [(command, raw_guard.classify(command)) for command in args.commands]
+    if not forced:
+        blocked = []
+        for command, decision in decisions:
+            if decision.tier == raw_guard.DENY:
+                blocked.append((command, decision, "denied"))
+            elif decision.tier == raw_guard.CONFIRM and not confirmed:
+                blocked.append((command, decision, "needs --confirm"))
+        if blocked:
+            for command, decision, why in blocked:
+                err_console.print(f"[red]refusing {command!r} ({why}):[/red] {decision.reason}")
+                if decision.note:
+                    err_console.print(f"  [dim]{decision.note}[/dim]")
+            err_console.print(
+                "[yellow]Read-tier commands run as-is; confirm-tier needs --confirm; "
+                "the deny tier needs --force (it can change a module).[/yellow]"
+            )
+            sys.exit(2)
+        # These flags put the adapter into a mode the guard refuses by name.
+        if args.no_auto_format:
+            err_console.print(
+                "[red]--no-auto-format sends ATCAF0: with framing off the first data "
+                "byte is the ISO-TP PCI, so a classified read can deliver any "
+                "service. Add --force if that is genuinely what you want.[/red]"
+            )
+            sys.exit(2)
+        if args.no_flow_control:
+            err_console.print(
+                "[red]--no-flow-control sends ATCFC0: without flow control a "
+                "multi-frame reply cannot complete, so reads look like 'no "
+                "response'. Add --force to override.[/red]"
+            )
+            sys.exit(2)
+
+    if forced:
+        denied = [command for command, decision in decisions
+                  if decision.tier == raw_guard.DENY]
+        if denied or args.no_auto_format or args.no_flow_control:
+            err_console.print(
+                f"[bold yellow]--force: sending {', '.join(denied) or 'adapter state'} "
+                "past the guard. A wrong write can lock or damage a module; the "
+                "SGW may refuse, and this tool cannot undo a change.[/bold yellow]"
+            )
+
     port = find_port(args.port)
     if not port:
         err_console.print("[bold red]No serial port found.[/bold red]")
@@ -2062,8 +2117,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_raw.add_argument("--protocol", help="try protocol first (ATTP, non-saving), e.g. 6 for CAN 11/500")
     p_raw.add_argument("--headers", action="store_true", help="show response headers (ATH1)")
     p_raw.add_argument("--no-auto-format", action="store_true", help="ATCAF0 (raw CAN, no ISO-TP)")
-    p_raw.add_argument("--no-flow-control", action="store_true", help="ATCFC0")
+    p_raw.add_argument("--no-flow-control", action="store_true", help="ATCFC0 (needs --force)")
     p_raw.add_argument("--allow-long", action="store_true", help="ATAL (allow >7-byte messages)")
+    p_raw.add_argument("--confirm", action="store_true",
+                       help="allow the guard's confirm tier (unknown/advanced commands)")
+    p_raw.add_argument("--force", action="store_true",
+                       help="allow the guard's deny tier (writes, clears, framing changes)")
     p_raw.set_defaults(func=cmd_raw)
 
     p_modules = sub.add_parser("modules", help="discover UDS modules on a CAN bus")
