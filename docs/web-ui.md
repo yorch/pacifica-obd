@@ -756,6 +756,13 @@ implausible cell sum.
 - **States:**
   - *No provider configured:* an empty state that links to Settings → AI, with a
     one-line explanation of BYO-key and a "use a local model (Ollama)" shortcut.
+  - *A key is saved but no provider is selected:* "An Anthropic key is saved, but
+    no provider is selected" with a one-click **Use Anthropic**. This is a
+    distinct state, not "no provider configured" — see `state` in
+    `docs/ai-setup.md` (`unconfigured`, `key_without_provider`,
+    `provider_without_key`, `ready`).
+  - *A provider is selected without its key:* "Anthropic is selected but has no
+    key — add one", linking to Settings.
   - *Streaming:* tokens render live; the Stop button aborts; a per-tool spinner.
   - *Rate-limited / quota:* a non-destructive banner with a retry countdown; the
     conversation is preserved.

@@ -32,18 +32,86 @@ Messages API (`anthropic`); `fake` never touches the network.
 ## The setup flow
 
 1. Open **Settings → Assistant provider**.
-2. Pick a provider. The **model** and **base URL** fields prefill from the preset
-   (OpenAI → `gpt-4o-mini` at `https://api.openai.com/v1`, Ollama →
-   `llama3.2` at `http://127.0.0.1:11434/v1`, …). Change them if you need to.
+2. Pick a provider (the provider pills, or the provider picker). The **model** and
+   **base URL** fields prefill from the preset (OpenAI → `gpt-4o-mini` at
+   `https://api.openai.com/v1`, Ollama → `llama3.2` at
+   `http://127.0.0.1:11434/v1`, …). Change them if you need to.
 3. For a hosted provider, paste the key in **API key** and press **Save key**.
    The key is write-only: it is stored `0600` and only a hint (`…f3a2`) is shown.
-   A local server needs no key.
-4. Press **Test connection**. This calls `POST /api/ai/test`, which validates the
-   settings and probes the endpoint (a model list, or a one-token ping if the
-   server exposes no model list) **without starting a chat**. It never returns the
-   provider's response body.
-5. Press **Save AI settings**. The toggles below control privacy and spend.
-6. Only then does `#/assistant` have a provider to talk to.
+   **Saving a key also selects that provider when no provider is selected yet**,
+   and fills `model`/`base_url` from the preset defaults — but only fields that
+   are still empty, so a model or endpoint you typed is never clobbered. This is
+   the one-step path: a saved key is immediately usable.
+4. If a **different** provider is already selected, saving a key does *not*
+   switch it. The key is stored and the response says so:
+   `{"selected": false, "reason": "another provider is configured"}`. The screen
+   offers **Use <provider> instead**, which calls `POST /api/ai/select` — a
+   single explicit selection. Nothing is switched silently.
+5. Press **Test connection** (optional). This calls `POST /api/ai/test`, which
+   validates the settings and probes the endpoint (a model list, or a one-token
+   ping if the server exposes no model list) **without starting a chat**. It never
+   returns the provider's response body.
+6. Press **Save AI settings** only to change the privacy/spend toggles or to edit
+   the model or base URL by hand. It is not required to make a saved key usable.
+
+### Setup states
+
+A key being stored and a provider being configured are **two different facts**.
+`GET /api/ai/config` reports which one is missing with an explicit `state`, so the
+assistant and Settings can say the specific thing that is wrong instead of a
+generic "no provider configured":
+
+| `state` | Meaning | What the screen offers |
+|---|---|---|
+| `unconfigured` | No provider and no key saved. | "No provider configured…" and a link to Settings. |
+| `key_without_provider` | A key is saved (file **or** environment) but no provider is selected, so the key is present and useless. | "An Anthropic key is saved, but no provider is selected" plus a one-click **Use Anthropic**. |
+| `provider_without_key` | A provider is selected that requires a key, and none is saved for it. | "Anthropic is selected but has no key — add one." |
+| `ready` | A provider is selected, its key situation is complete, and the configuration validates. | The local-model note, or the remote-consent warning. |
+| `invalid` | A provider is selected but the saved configuration cannot be used (unknown provider, missing model, bad base URL or cap). `state_reason` is a fixed phrase — never a value from the file or the request. | "The saved AI configuration is incomplete — …" and a link to Settings. |
+
+The payload also carries the ids needed to act on that state without guessing:
+
+```json
+{ "provider": null, "state": "key_without_provider",
+  "saved_key_providers": ["anthropic"], "suggested_provider": "anthropic",
+  "keys": { "anthropic": { "configured": true, "hint": "…1234", "source": "file" } },
+  "defaults": { "base_urls": { "anthropic": "https://api.anthropic.com", "…": "…" },
+                "models":    { "anthropic": "claude-3-5-sonnet-latest", "…": "…" } } }
+```
+
+* `saved_key_providers` includes keys supplied by the environment, not just the
+  file; a key that only exists as `ANTHROPIC_API_KEY` still produces
+  `key_without_provider` and can be selected with one click.
+* `suggested_provider` is the id a "Use <provider>" action should select.
+* `defaults.models` / `defaults.base_urls` let a screen decide whether a
+  one-click select can succeed (a custom endpoint with no default model needs the
+  model field first) without hard-coding a preset.
+
+`POST /api/ai/keys` keeps its original `provider` + `key` fields and adds
+`selected` and `reason`:
+
+```json
+{ "provider": "anthropic",
+  "key": { "configured": true, "hint": "…1234", "source": "file" },
+  "selected": true, "reason": null }
+```
+
+`reason` is a fixed phrase (for example `another provider is configured` or
+`a model id is required before this provider can be used`) — never a value from
+the request or the file, so a key can never come back through it. The key value
+is never returned either — only the masked hint.
+
+`POST /api/ai/select` takes only `{"provider": "anthropic"}`. Selecting the
+provider that is already configured, or the first selection when none was
+configured, preserves a `model`/`base_url` already saved and fills only the
+gaps; switching from another provider replaces **both** with the new preset's
+defaults (so the old provider's model or endpoint is never reused). Only the id
+is sent, so a value redacted on the way out can never be written back as
+configuration.
+
+No write path (`POST /api/ai/keys`, `POST /api/ai/select`, `PUT /api/ai/config`)
+copies an environment override into the file: `PACIFICA_OBD_AI_PROVIDER`,
+`..._MODEL` and `..._BASE_URL` stay runtime overrides.
 
 ### Toggles
 
@@ -60,9 +128,10 @@ Messages API (`anthropic`); `fake` never touches the network.
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/api/ai/providers` | Preset registry with requirements, defaults and key state. |
-| GET | `/api/ai/config` | Current configuration (never a key). |
+| GET | `/api/ai/config` | Current configuration (never a key), plus the setup `state`. |
 | PUT | `/api/ai/config` | Partial update; an explicit `null` clears `provider`/`model`/`base_url`. |
-| POST | `/api/ai/keys` | Set a key (write-only; returns a masked hint). |
+| POST | `/api/ai/select` | Select a provider explicitly (the "Use <provider>" action); fills only empty preset defaults. |
+| POST | `/api/ai/keys` | Set a key (write-only; returns a masked hint, plus `selected`/`reason`). |
 | DELETE | `/api/ai/keys/{provider}` | Remove a key (takes effect immediately). |
 | POST | `/api/ai/test` | Validate + probe the configuration without a chat. |
 | POST | `/api/ai/chat` | Stream a turn (SSE). |

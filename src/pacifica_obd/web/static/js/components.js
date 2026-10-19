@@ -585,11 +585,11 @@ export function toast(message, kind = "ok", timeout = 4000) {
 
 export function field({ label, value = "", placeholder = "", mono = false, type = "text",
                         id = null, min = null, max = null, step = null, autocomplete = null,
-                        hint = null } = {}) {
+                        list = null, hint = null } = {}) {
   return h("div.field", null,
     h("label", { for: id || undefined, text: label }),
     h("input", { id: id || undefined, class: mono ? "mono" : "", type, value, placeholder,
-                 min, max, step, autocomplete }),
+                 min, max, step, autocomplete, list }),
     hint ? h("div.field__hint", { text: hint }) : null);
 }
 

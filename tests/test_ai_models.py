@@ -113,6 +113,36 @@ def test_a_corrupt_cache_never_raises_and_is_never_clobbered():
     assert models_cache.clear("openai") == 0
 
 
+def test_the_cache_survives_a_config_save():
+    """Save AI settings must not drop the model list (it lives in the same file)."""
+    import tempfile
+    from pacifica_obd.web.ai import config as ai_config
+
+    _home(tempfile.mkdtemp())
+    models_cache.store("openai", "https://api.openai.com/v1",
+                       models=[{"id": "gpt-4o-mini"}])
+    cfg = ai_config.AIConfig(provider="openai", model="gpt-4o-mini")
+    cfg.save()
+    entry = models_cache.read_entry("openai", "https://api.openai.com/v1")
+    assert entry is not None, "the config save dropped the model cache"
+    assert [m["id"] for m in entry["models"]] == ["gpt-4o-mini"]
+
+
+def test_a_provider_modelinfo_object_is_accepted():
+    """The refresh route hands over ModelInfo objects, not dicts."""
+    import tempfile
+
+    _home(tempfile.mkdtemp())
+
+    class ModelInfo:
+        def __init__(self, id, name=None):
+            self.id, self.name = id, name
+
+    entry = models_cache.store("vllm", "http://127.0.0.1:8000/v1",
+                               models=[ModelInfo("served-model", "Served")])
+    assert entry["models"] == [{"id": "served-model", "name": "Served"}]
+
+
 if __name__ == "__main__":
     for name, func in sorted(globals().items()):
         if name.startswith("test_") and callable(func):

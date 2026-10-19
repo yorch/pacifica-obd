@@ -47,6 +47,24 @@ def _now() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
 
+def _model_id(item):
+    """A model id from a mapping *or* a provider's ``ModelInfo`` object.
+
+    Both shapes reach this module: the connection test maps to dicts, but the
+    refresh route hands over whatever the adapter returned (adversarial review
+    caught a 500 from assuming dicts).
+    """
+    if isinstance(item, dict):
+        return item.get("id")
+    return getattr(item, "id", None)
+
+
+def _model_name(item):
+    if isinstance(item, dict):
+        return item.get("name") or None
+    return getattr(item, "name", None)
+
+
 def _read_cache() -> dict:
     try:
         data = read_json_file()
@@ -76,9 +94,9 @@ def store(provider: str | None, base_url: str | None, *, models=None,
         "supported": bool(supported),
         "reason": reason,
         "models": [
-            {"id": str(item.get("id") or ""), "name": item.get("name") or None}
+            {"id": str(_model_id(item) or ""), "name": _model_name(item)}
             for item in (models or [])[:MAX_MODELS]
-            if str(item.get("id") or "").strip()
+            if str(_model_id(item) or "").strip()
         ],
     }
     try:

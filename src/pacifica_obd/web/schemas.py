@@ -228,6 +228,16 @@ class AIKeyRequest(BaseModel):
     key: str = Field(min_length=1, max_length=4096)
 
 
+class AISelectRequest(BaseModel):
+    """Select a provider explicitly (the "Use <provider>" action).
+
+    Only the id: the server fills the preset's defaults, so a display value that
+    was redacted on the way out is never written back as configuration.
+    """
+
+    provider: str = Field(min_length=1, max_length=64)
+
+
 class AITestRequest(BaseModel):
     """Test a configuration without starting a chat.
 

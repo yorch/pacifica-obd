@@ -166,8 +166,15 @@ export const api = {
   aiProviders: () => get("/api/ai/providers"),
   aiConfig: () => get("/api/ai/config"),
   aiSetConfig: (body) => put("/api/ai/config", body),
+  aiSelectProvider: (provider) => post("/api/ai/select", { provider }),
   aiSetKey: (body) => post("/api/ai/keys", body),
   aiDeleteKey: (provider) => del(`/api/ai/keys/${encodeURIComponent(provider)}`),
+  // The connection test reads the *saved* key and endpoint; it takes transient
+  // provider/model/base_url overrides and optional probe=1, never a key.
+  aiTest: (body, options) => post("/api/ai/test", body || {}, options),
+  // The cached, never-polled model list. `refresh=1` re-probes (needs a saved
+  // config, and a saved key for a hosted provider).
+  aiModels: (params, options) => get(`/api/ai/models${query(params)}`, options),
   aiConversations: () => get("/api/ai/conversations"),
   aiConversation: (id) => get(`/api/ai/conversations/${encodeURIComponent(id)}`),
   aiDeleteConversations: () => del("/api/ai/conversations"),

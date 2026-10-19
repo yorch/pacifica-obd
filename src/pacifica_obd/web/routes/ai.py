@@ -42,6 +42,7 @@ from pacifica_obd.web.schemas import (
     AIChatRequest,
     AIConfigPatch,
     AIKeyRequest,
+    AISelectRequest,
     AITaskRequest,
     AITestRequest,
 )
@@ -106,6 +107,87 @@ def _provider_or_400(config, store: ai_keys.KeyStore):
     return provider
 
 
+#: The setup states a screen must tell apart (design §5.5). They are the whole
+#: point of the audit that produced them: "a key is saved" and "a provider is
+#: configured" are **different** facts, and only a provider can serve a chat.
+#:
+#: ``unconfigured``         — no provider and no key saved: nothing to use yet;
+#: ``key_without_provider`` — a key exists (file *or* environment) but no provider
+#:                            is selected, so the key is present and useless;
+#: ``provider_without_key`` — a provider is selected that requires a key and none
+#:                            is saved for it;
+#: ``ready``                — a provider is selected, its key situation is complete
+#:                            and the configuration validates;
+#: ``invalid``              — a provider is selected but the saved configuration
+#:                            cannot be used (unknown provider, missing model, bad
+#:                            base URL); ``state_reason`` says which in prose.
+AI_SETUP_STATES = ("unconfigured", "key_without_provider",
+                   "provider_without_key", "ready", "invalid")
+
+
+def _safe_reason(exc: Exception) -> str:
+    """A human reason that never echoes a configured value — or a key.
+
+    Validation messages are normally built by Web-Framework code and can include
+    a URL or a free-text field; a key can end up in either. The key store's
+    redactor would catch a key-shaped string, but a proxy token in a query string
+    has no key shape. These fixed phrases say what to fix without repeating any
+    value from the request or the file.
+    """
+    text = str(exc)
+    if "model" in text:
+        return "a model id is required before this provider can be used"
+    if "base_url" in text:
+        return "the base URL is not valid for this provider"
+    if "provider" in text:
+        return "the selected provider is not available"
+    if "temperature" in text:
+        return "the temperature setting is out of range"
+    for name in ("max_tokens_per_conversation", "max_requests_per_minute",
+                 "max_output_tokens_per_request", "max_live_reads_per_turn"):
+        if name in text:
+            return f"{name} is out of range"
+    return "the saved configuration needs attention"
+
+
+def _setup_state(config, store: ai_keys.KeyStore) -> dict:
+    """State the UI needs, computed from the *same* store the payload reports.
+
+    A key can be present with no provider selected — the owner's trap — and that
+    key can come from the environment rather than the file, so the state is
+    derived from :meth:`KeyStore.masked` (which checks both) rather than from the
+    file alone. ``saved_key_providers`` lets a screen name every key it holds, and
+    ``suggested_provider`` is the id to offer a one-click "Use <label>" action for
+    (the saved-key provider, or the selected provider that is missing its key).
+    """
+    saved = [pid for pid in ai_presets.PRESETS if store.masked(pid)["configured"]]
+    if not config.provider:
+        if saved:
+            return {"state": "key_without_provider", "saved_key_providers": saved,
+                    "suggested_provider": saved[0], "state_reason": None}
+        return {"state": "unconfigured", "saved_key_providers": [],
+                "suggested_provider": None, "state_reason": None}
+    found = ai_presets.preset(config.provider)
+    requires = bool(found.requires_key) if found else False
+    if requires and not store.get(config.provider):
+        return {"state": "provider_without_key", "saved_key_providers": saved,
+                "suggested_provider": config.provider, "state_reason": None}
+    if found is None:
+        return {"state": "invalid", "saved_key_providers": saved,
+                "suggested_provider": config.provider,
+                "state_reason": "the selected provider is not available"}
+    try:
+        # The config endpoint is read-only, but "ready" must mean *usable*: a
+        # provider with no model (vllm/openai_compat) or a bad cap is not ready.
+        config.validate()
+    except (ValueError, TypeError) as exc:
+        return {"state": "invalid", "saved_key_providers": saved,
+                "suggested_provider": config.provider,
+                "state_reason": _safe_reason(exc)}
+    return {"state": "ready", "saved_key_providers": saved,
+            "suggested_provider": None, "state_reason": None}
+
+
 def _public_config(config, store: ai_keys.KeyStore) -> dict:
     redact = store.redactor()
     data = config.to_dict(include_keys=False)
@@ -123,9 +205,20 @@ def _public_config(config, store: ai_keys.KeyStore) -> dict:
     data["preset"] = config.preset().as_dict() if config.preset() else None
     data["keys"] = {name: store.masked(name) for name in ai_presets.PRESETS}
     data["provider_labels"] = dict(ai_presets.PROVIDER_LABELS)
-    data["defaults"] = {"base_urls": dict(ai_config.DEFAULT_BASE_URLS)}
+    data["defaults"] = {"base_urls": dict(ai_config.DEFAULT_BASE_URLS),
+                        "models": {pid: preset.default_model
+                                   for pid, preset in ai_presets.PRESETS.items()}}
     data["cost_table_date"] = ai_config.COST_TABLE_DATE
     data["local_base_hosts"] = sorted(ai_config.LOCAL_BASE_HOSTS)
+    data.update(_setup_state(config, store))
+    # A provider id is normally a small known token, but a hand-edited file or an
+    # environment override can put anything there. Scrub it like every other
+    # externally sourced string so a key pasted into the wrong field cannot come
+    # back out of this read-only endpoint.
+    if data.get("provider"):
+        data["provider"] = redact(data["provider"])
+    if data.get("suggested_provider"):
+        data["suggested_provider"] = redact(data["suggested_provider"])
     return data
 
 
@@ -149,6 +242,7 @@ def _runner(request: Request):
 async def providers():
     store = _keystore()
     config = _load_config()
+    redact = store.redactor()
     rows = []
     for provider_id, found in ai_presets.PRESETS.items():
         masked = store.masked(provider_id)
@@ -161,7 +255,7 @@ async def providers():
                          or (selected and config.is_local()) or not found.requires_key,
         })
     return {"providers": rows, "cost_table_date": ai_config.COST_TABLE_DATE,
-            "configured_provider": config.provider}
+            "configured_provider": redact(config.provider) if config.provider else config.provider}
 
 
 @router.get("/ai/config", summary="Current AI configuration (never a key)")
@@ -173,7 +267,7 @@ async def get_config():
 @router.put("/ai/config", summary="Patch the AI configuration (secrets go elsewhere)")
 async def put_config(request: Request, body: AIConfigPatch):
     store = _keystore()
-    config = _load_config()
+    effective = _load_config()
     # `exclude_unset` distinguishes "field omitted" from "explicit null": a null
     # on provider/model/base_url clears the field (so a reset is possible).
     patch = body.model_dump(exclude_unset=True)
@@ -181,18 +275,146 @@ async def put_config(request: Request, body: AIConfigPatch):
     patch = {key: value for key, value in patch.items()
              if value is not None or key in clearable}
     try:
-        updated = config.patch(patch).validate()
+        # Validate the *effective* view (file + environment): that is what a chat
+        # would use, and the environment may satisfy a field the file leaves empty.
+        updated = effective.patch(patch).validate()
     except (ValueError, TypeError) as exc:
         raise errors.validation(str(exc)) from exc
     try:
-        updated.save()
+        # Persist the patch onto the *file-only* config: an environment override in
+        # effect for this process must never be copied into the file by an
+        # unrelated save.
+        _persisted_config().patch(patch).save()
     except ai_keys.KeyStoreError as exc:
         raise errors.ApiError("key_store", "validation", str(exc), http_status=400) from exc
     # A model list belongs to one provider + endpoint; if either moved, the cached
     # list is no longer about the configuration being used.
     if "provider" in patch or "base_url" in patch:
-        ai_models.clear(config.provider or updated.provider)
+        ai_models.clear(effective.provider or updated.provider)
     return _public_config(_load_config(), store)
+
+
+def _persisted_config() -> ai_config.AIConfig:
+    """The configuration as stored on disk, without environment overrides.
+
+    Environment values are runtime overrides. A write path must never copy them
+    into the file just because they were in effect for this process: saving a key
+    while ``PACIFICA_OBD_AI_PROVIDER`` was set for a one-off run must not make
+    that provider permanent.
+    """
+    return ai_config.AIConfig.load(env={})
+
+
+def _fill_preset_defaults(config, preset) -> ai_config.AIConfig:
+    """Fill ``model``/``base_url`` from the preset only where they are empty."""
+    filled: dict = {}
+    if not (config.model or "").strip() and preset and preset.default_model:
+        filled["model"] = preset.default_model
+    if not (config.base_url or "").strip() and preset and preset.default_base_url:
+        filled["base_url"] = preset.default_base_url
+    return config.patch(filled) if filled else config
+
+
+def _needs_base_url(config, preset) -> bool:
+    """True when a non-fake preset has no default endpoint and none is set.
+
+    ``AIConfig.validate`` does not require a base URL (a local adapter can have a
+    built-in fallback), but a *selection* of a generic endpoint with no URL would
+    leave a key pointed at a placeholder. The selection paths refuse it; the
+    settings form already enforces the same rule.
+    """
+    return (preset is not None and preset.format != ai_presets.FAKE_FORMAT
+            and not preset.default_base_url
+            and not (config.base_url or "").strip())
+
+
+def _select_provider_for_key(provider: str) -> dict:
+    """Make a freshly saved key usable, without ever switching a chosen provider.
+
+    Saving a key for a provider must be enough to *use* that provider: when no
+    provider is configured yet, the saved provider is selected and any empty
+    ``model``/``base_url`` is filled from the preset defaults. When a **different**
+    provider is already configured the selection is left untouched and the caller
+    gets a hint to offer in the UI ("another provider is configured") — a silent
+    switch would edit a config the user set on another screen.
+
+    Decisions use the *effective* configuration (file + environment) but writes
+    target the **file** configuration only. Only empty fields are filled, so a
+    saved model or a custom base URL is never clobbered. Returns
+    ``{"selected": bool, "reason": str | None}`` and never raises: a preset with
+    no default model (a custom endpoint) still needs one, so the call reports that
+    instead of storing a configuration the config endpoint would reject.
+    """
+    effective = _load_config()
+    if effective.provider and effective.provider != provider:
+        return {"selected": False, "reason": "another provider is configured"}
+    preset = ai_presets.preset(provider)
+    saved = _persisted_config()
+    if saved.provider and saved.provider != provider:
+        # The file names another provider; an environment override is what makes
+        # this key usable right now. The key works, but do not rewrite the choice
+        # the file already holds.
+        return {"selected": True, "reason": None}
+    candidate = saved if saved.provider else saved.patch({"provider": provider})
+    candidate = _fill_preset_defaults(candidate, preset)
+    if _needs_base_url(candidate, preset):
+        return {"selected": False, "reason": "a base URL is required for this provider"}
+    try:
+        candidate.validate()
+    except (ValueError, TypeError) as exc:
+        return {"selected": False, "reason": _safe_reason(exc)}
+    if candidate != saved:
+        try:
+            candidate.save()
+        except ai_keys.KeyStoreError as exc:
+            return {"selected": False, "reason": _safe_reason(exc)}
+    return {"selected": True, "reason": None}
+
+
+@router.post("/ai/select", summary="Select a provider (fills empty preset defaults)")
+async def select_provider(body: AISelectRequest):
+    """Select a provider explicitly — the UI's "Use <provider>" action.
+
+    Unlike saving a key, this *is* the user asking to switch, so the persisted
+    provider becomes ``body.provider``. ``model``/``base_url`` are preserved when
+    they already belong to this provider; on a switch the new preset's defaults
+    replace **both** (including an empty default, so the old provider's model or
+    endpoint is never reused). A first selection preserves values already typed
+    and fills only the gaps. Only the file is written: environment overrides are
+    runtime values, never persisted. The full public config is returned so the
+    caller can re-render in one round trip.
+    """
+    provider = body.provider.strip()
+    if provider not in ai_presets.PRESETS:
+        raise errors.validation(f"unknown provider: {provider!r}")
+    preset = ai_presets.preset(provider)
+    saved = _persisted_config()
+    candidate = saved.patch({"provider": provider})
+    if saved.provider is None:
+        # Nothing was selected before: a model/base_url already in the file was
+        # typed for this pending choice, so preserve it and fill only the gaps.
+        candidate = _fill_preset_defaults(candidate, preset)
+    elif saved.provider != provider:
+        # Switching: both fields belonged to the old provider, so replace both
+        # with the new preset's defaults — even when they are empty.
+        candidate = candidate.patch({"model": preset.default_model or "",
+                                     "base_url": preset.default_base_url or None})
+    else:
+        candidate = _fill_preset_defaults(candidate, preset)
+    if _needs_base_url(candidate, preset):
+        raise errors.validation("a base URL is required for this provider")
+    try:
+        updated = candidate.validate()
+    except (ValueError, TypeError) as exc:
+        raise errors.validation(_safe_reason(exc)) from exc
+    try:
+        updated.save()
+    except ai_keys.KeyStoreError as exc:
+        raise errors.ApiError("key_store", "validation", _safe_reason(exc),
+                              http_status=400) from exc
+    if saved.provider != updated.provider or saved.base_url != updated.base_url:
+        ai_models.clear(updated.provider)
+    return _public_config(_load_config(), _keystore())
 
 
 @router.post("/ai/keys", summary="Set a provider key (write-only; returns a hint)")
@@ -209,8 +431,12 @@ async def set_key(body: AIKeyRequest):
         ai_models.clear(provider)
     except ai_keys.KeyStoreError as exc:
         raise errors.ApiError("key_store", "validation", str(exc), http_status=400) from exc
-    # Never echo the key back; a masked hint only.
-    return {"provider": provider, "key": store.masked(provider)}
+    selection = _select_provider_for_key(provider)
+    # Never echo the key back; a masked hint only. `selected`/`reason` are additive
+    # (the response keeps `provider` and `key`), so an older client still works and
+    # a newer one can offer "Use <label> instead" when the switch was refused.
+    return {"provider": provider, "key": store.masked(provider),
+            "selected": selection["selected"], "reason": selection["reason"]}
 
 
 @router.delete("/ai/keys/{provider}", summary="Remove a provider key")
@@ -253,6 +479,28 @@ async def test_connection(body: AITestRequest):
 
     found = config.preset()
     store = _keystore()
+
+    # A stored key must never be sent to an endpoint the user has not saved. The
+    # test is "would this send my key?" — so an unsaved base URL is refused rather
+    # than probed, and the UI is told to save the change first. Without this the
+    # endpoint is a credential-exfiltration primitive: the caller chooses the URL
+    # and the server attaches the key (adversarial review, highest-risk finding).
+    if config.provider and store.get(config.provider) and base.url() != config.url():
+        return {
+            "ok": False,
+            "checks": checks + [{
+                "name": "endpoint", "ok": False,
+                "detail": "the base URL differs from the saved one and a key is "
+                          "stored; save it before testing so the key is only sent "
+                          "to the endpoint you configured",
+            }],
+            "models": [],
+            "provider": config.provider,
+            "base_url": config.url(),
+            "error": {"code": "endpoint_not_saved",
+                      "message": "save the base URL before testing with a stored key"},
+        }
+
     redact = store.redactor()
     key = store.get(config.provider) if config.provider else None
     result = {
@@ -439,8 +687,11 @@ async def list_models(provider: str | None = None, base_url: str | None = None,
                                  f"no API key is configured for {preset.label}",
                                  http_status=400)
         models, supported, reason = await _discover_models(config)
-        entry = ai_models.store(config.provider, config.url(), models=models or [],
-                                supported=supported, reason=reason)
+        entry = ai_models.store(
+            config.provider, config.url(),
+            models=[{"id": info.id, "name": getattr(info, "name", None)}
+                    for info in (models or [])],
+            supported=supported, reason=reason)
         payload["source"] = "live"
 
     if entry is not None:
@@ -530,7 +781,9 @@ def _preview(config, message: str) -> dict:
     redact = ai_keys.KeyStore().redactor()
     system = ai_prompts.SYSTEM_PROMPT
     return {
-        "provider": config.provider,
+        # A provider id is normally a known token, but a key can be pasted into
+        # any free-text field; scrub it like the model and URL below.
+        "provider": redact(config.provider) if config.provider else config.provider,
         "provider_label": ai_presets.preset_label(config.provider),
         "model": redact(effective_model(config)),
         "base_url": redact(config.url()) if config.url() and not config.is_local() else None,

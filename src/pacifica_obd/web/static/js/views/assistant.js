@@ -91,9 +91,11 @@ export function render(root, ctx) {
     clear(chipRow);
     try {
       const config = await api.aiConfig();
+      const presetLabel = config.preset?.label || null;
+      const model = config.effective_model || config.model || "—";
       const chips = [
-        `provider: ${config.provider || "none"}`,
-        `model: ${config.model || "—"}`,
+        `provider: ${presetLabel || config.provider || "none"}`,
+        `model: ${model}`,
         config.is_local ? "local model" : "remote model",
         config.redact_vin ? "VIN redacted" : "VIN visible",
         config.persist_conversations ? "history saved" : "history off",
@@ -211,11 +213,29 @@ export function render(root, ctx) {
   }
 
   function showError(error) {
-    const message = error instanceof ApiError ? `${error.code}: ${error.message}`
+    let code = error instanceof ApiError ? error.code : error?.code;
+    let message = error instanceof ApiError ? `${error.code}: ${error.message}`
       : (error?.message || String(error));
-    const retry = error?.detail?.retry_after_s || error?.retry_after_s;
-    notice.appendChild(banner(retry ? `${message} (retry in ${retry}s)` : message, "err"));
-    toast(message, "err", 0);
+    let retry = error?.detail?.retry_after_s || error?.retry_after_s;
+    // postStream surfaces a non-2xx body as a plain Error whose message is the
+    // raw error envelope; decode it so a no_key/no_provider failure is recognised.
+    if (!code && typeof message === "string" && message.trim().startsWith("{")) {
+      try {
+        const parsed = JSON.parse(message);
+        if (parsed && parsed.error) {
+          code = parsed.error.code;
+          message = `${parsed.error.code}: ${parsed.error.message}`;
+          retry = parsed.error.detail?.retry_after_s || retry;
+        }
+      } catch { /* not an envelope: keep the raw text */ }
+    }
+    // A missing provider or key is a setup problem, not a failure of this turn:
+    // point at Settings instead of leaving a bare error with no next step.
+    const needsSetup = code === "no_key" || code === "no_provider";
+    const text = retry ? `${message} (retry in ${retry}s)` : message;
+    notice.appendChild(banner(text, needsSetup ? "warn" : "err",
+      needsSetup ? h("a.btn.btn--sm", { href: "#/settings", text: "Open Settings" }) : null));
+    toast(text, needsSetup ? "warn" : "err", 0);
   }
 
   function startButtonState(running) {

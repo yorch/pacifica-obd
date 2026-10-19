@@ -305,7 +305,11 @@ class AIConfig:
             raw = read_json_file(path)
         except Exception:  # noqa: BLE001
             raw = {}
-        data = self.to_dict(include_keys=False)
+        # Start from what is already on disk and overlay the fields this class
+        # owns: the file also holds the model-list cache, which must survive a
+        # config save (an earlier version dropped it on every Save AI settings).
+        data = dict(raw)
+        data.update(self.to_dict(include_keys=False))
         data["keys"] = raw.get("keys") or self.keys or {}
         write_json_file(data, path)
 
