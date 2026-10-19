@@ -533,6 +533,13 @@ rejects a smuggled second command (`;`, a newline, a backtick). The CLI is the
 expert path, so `--force` really does send: a wrong write can lock a module and
 this tool cannot undo a change.
 
+*Residual risk, stated plainly:* the web console refuses `ATCAF0` and `ATCEA` and
+re-asserts `ATCAF1` before every hex request, but it cannot undo *extended
+addressing* that another application left enabled on the same adapter — a
+different program can change how the first data byte is interpreted. Reconnect the
+adapter (or reset it) after using another tool with it. This is a limitation of a
+shared serial adapter, not something the HTTP layer can see.
+
 !!! danger "`--force` is unfiltered"
 
     `--force` reaches the deny tier on purpose. Prefer read services

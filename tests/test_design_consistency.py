@@ -7,10 +7,13 @@ invariants so the next drift is caught by a command instead of by eye. It needs
 no browser, no Node and no new dependency — it reads the shipped CSS and ES
 modules as text.
 
-What is enforced
-----------------
-1. **Token resolution.** Every `var(--token)` used anywhere in the CSS or the
-   modules resolves to a custom property defined in `app.css` (`:root` or
+What is enforced (and what is not)
+----------------------------------
+The checks are textual, not a CSS parser: they are strong enough to catch drift,
+but they are not a proof. Two known limits are called out where they apply.
+
+1. **Token resolution.** Every literal `var(--token)` in the CSS or the modules
+   resolves to a custom property defined in `app.css` (`:root` or
    `[data-theme="dark"]`) or in `print.css` (the paper re-map). A `var()` with a
    silent fallback to a made-up name is how a palette quietly forks.
 2. **No colour literals outside the tokens.** A hex/rgb/hsl colour is allowed
@@ -24,10 +27,11 @@ What is enforced
    Deliberately excluded pairs are listed in `DECORATIVE_PAIRS` with a reason
    each: they are tint or hairline only, and the information they sit behind is
    carried by a passing pair (the word on a pill, the major tick on a gauge).
-4. **Component reuse.** Every view imports the shared primitives and hand-rolls
-   none of them: no `h("div.card")`, no `card__body`/`card__head` markup, no
-   hand-assembled `pill` class. `BESPOKE_VIEWS` documents any view allowed to
-   skip the primitives it genuinely does not need.
+4. **Component reuse.** Each view imports `card` and a shared state primitive and
+   contains none of the hand-rolled patterns the check knows about (`div.card`,
+   `card__body`/`card__head` markup, a hand-assembled `pill`). *Limit:* this is a
+   pattern check, not a proof that no view re-implements a component some other
+   way; `BESPOKE_VIEWS` documents any view allowed to skip a primitive.
 5. **Spacing and radius discipline.** Literal `px` in a spacing property
    (padding/margin/gap) and any `border-radius` outside the token scale must be
    on the documented allowlist; inline `style` objects may not set spacing at

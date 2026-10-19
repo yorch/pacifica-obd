@@ -88,6 +88,9 @@ export function render(root, ctx) {
   async function updateTier() {
     const command = input.value.trim();
     if (!command) { mount(holders.badge); return; }
+    // Clear the previous verdict while the new one is being classified: the badge
+    // must never describe a command that is no longer in the box.
+    mount(holders.badge, h("p.sub", { role: "status", text: "Classifying the command…" }));
     try {
       const payload = await api.rawAllowlist(command);
       if (input.value.trim() !== command) return; // a newer keystroke won

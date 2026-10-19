@@ -920,9 +920,14 @@ def _gather_context(cache, task: str | None, body,
         add("E7", "Readiness (stored, may be absent)", "read_readiness",
             cache.call("read_readiness", {}))
 
-    if task == "report" and getattr(body, "session_id", None):
-        add("E8", "Session", "get_session",
-            cache.call("get_session", {"session_id": int(body.session_id)}))
+    if task == "report":
+        # The UI's "write a report" start sends no explicit session, so use the
+        # scoped one (the newest, unless the caller chose). Without this the report
+        # was written with no session evidence at all.
+        report_session = getattr(body, "session_id", None) or scope.get("session_id")
+        if report_session:
+            add("E8", "Session", "get_session",
+                cache.call("get_session", {"session_id": int(report_session)}))
     if task == "compare" and getattr(body, "a", None) and getattr(body, "b", None):
         add("E6", "Session diff", "compare_sessions",
             cache.call("compare_sessions", {"a": int(body.a), "b": int(body.b)}))
