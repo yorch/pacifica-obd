@@ -6,10 +6,10 @@ import { h, clear, mount, on, download } from "../dom.js";
 import { api, ApiError } from "../api.js";
 import { openStream } from "../stream.js";
 import {
-  card, cardBody, pill, emptyState, errorState, toast, gaugeRadial, gaugeBar,
-  digitalReadout, select, checkbox, field,
+  card, emptyState, toast, gaugeRadial, gaugeBar,
+  digitalReadout, select, checkbox, field, icon,
 } from "../components.js";
-import { seriesColorValue, numberText, timeOf } from "../format.js";
+import { seriesColorValue, timeOf } from "../format.js";
 import { TimeSeriesChart, smallMultiples } from "../charts.js";
 
 const DEFAULT_PIDS = ["RPM", "SPEED", "COOLANT_TEMP", "ENGINE_LOAD", "CONTROL_MODULE_VOLTAGE"];
@@ -74,18 +74,19 @@ export function render(root, ctx) {
       { value: "gauges", label: "Gauges" }, { value: "bars", label: "Bars" },
       { value: "digital", label: "Digital" }, { value: "chart", label: "Chart" },
     ] });
-  const busSelect = select({ id: "bus", label: "Bus", value: "can-c",
+  const busSelect = select({ id: "bus", label: "Bus", value: "can-c", mono: true,
     options: [{ value: "can-c", label: "can-c" }, { value: "can-ihs", label: "can-ihs" }] });
   const intervalField = field({ id: "interval", label: "Poll interval (ms)", value: "1000", mono: true, type: "number", min: 50 });
   const storeBox = checkbox({ id: "store", label: "Store to DB", checked: false });
-  const ecuSelect = select({ id: "ecu", label: "ECU", value: "", options: [{ value: "", label: "loading…" }] });
+  const ecuSelect = select({ id: "ecu", label: "ECU", value: "", mono: true, options: [{ value: "", label: "loading…" }] });
   const moduleField = field({ id: "module-id", label: "Module request ID (optional)", placeholder: "7E0", mono: true });
 
   const filterField = field({ id: "filter", label: "Filter values", placeholder: "type to filter…" });
   const chipsHolder = h("div.chips.chips--picker");
-  const didFreeEntry = h("div.row.row--spaced",
+  const didFreeEntry = h("div.row", null,
     field({ id: "free-did", label: "Add DID (hex)", placeholder: "F190", mono: true }),
     h("button.btn.btn--sm", { type: "button", text: "Add", onClick: addFreeDid }));
+  didFreeEntry.hidden = true;   // DID-only control: hidden until the DID source is chosen
 
   const recordBar = h("div.recording", null,
     h("span.recording__dot", { "aria-hidden": "true" }),
@@ -118,8 +119,13 @@ export function render(root, ctx) {
 
   const instruments = h("div", { id: "instruments" });
   const chartWrap = h("div", null, h("div.legend"), h("div.chart-holder", { id: "chart-holder" }));
+  // One placeholder, two stories: no signals picked, or signals picked and the
+  // first sample still on its way (a blank 320px plot reads as broken).
+  const chartPlaceholder = { title: "Nothing plotted yet",
+    hint: "Choose signals above; a selection of more than six becomes small multiples." };
+  const chartEmpty = emptyState({ icon: "activity", ...chartPlaceholder });
 
-  const controls = card({ eyebrow: "Configuration", title: "Signals", body: h("div", null,
+  const controls = card({ eyebrow: "Configuration", title: "Signals", body: h("div.stack", null,
     h("div.row", null, sourceSelect, displaySelect, busSelect, intervalField, storeBox, startButton),
     h("div.row", { id: "ecu-row", hidden: true }, ecuSelect, moduleField),
     filterField, chipsHolder, didFreeEntry) });
@@ -130,7 +136,7 @@ export function render(root, ctx) {
   const instrumentsCard = card({ eyebrow: "Live", title: "Instruments",
     body: h("div", null, recordBar, instruments) });
   const chartCard = card({ eyebrow: "Time series", title: "Chart",
-    body: h("div", null, chartWrap) });
+    body: h("div", null, chartEmpty, chartWrap) });
 
   const head = h("div.view__head", null,
     h("div", null, h("h1", { text: "Live data" }),
@@ -184,16 +190,17 @@ export function render(root, ctx) {
       chipsHolder.appendChild(h("span.sub", { text: available.length ? "no match" : "nothing available" }));
     }
     for (const row of rows.slice(0, 80)) {
-      const active = selection.includes(row.key);
+      const index = selection.indexOf(row.key);
+      const active = index >= 0;
       const label = row.label === row.key ? row.key : `${row.label} (${row.key})`;
       chipsHolder.appendChild(h("button.chip", {
         type: "button", "aria-pressed": active ? "true" : "false",
         title: label,
         onClick: () => toggleSelection(row.key),
       },
-        h("span.chip__swatch", { style: { background: seriesColorValue(selection.indexOf(row.key) >= 0 ? selection.indexOf(row.key) : 0) } }),
+        h("span.chip__swatch", { style: { background: active ? seriesColorValue(index) : "var(--idle-line)" } }),
         h("span.chip__label", { text: label }),
-        active ? h("span", { text: "✓" }) : null));
+        active ? icon("check", { size: 12 }) : null));
     }
   }
 
@@ -279,7 +286,12 @@ export function render(root, ctx) {
     for (const chart of charts.splice(0)) chart.destroy();
     clear(chartWrap.querySelector(".legend"));
     clear(document.getElementById("chart-holder"));
-    if (!defs.length) { chartWrap.hidden = true; return; }
+    if (!defs.length) { setChartPlaceholder(chartPlaceholder); return; }
+    // A plot with no samples yet is blank, so the placeholder stays until the
+    // first sample actually lands.
+    if (!sampleCount) { setChartPlaceholder({ title: "Waiting for the first sample",
+      hint: "The stream is running; the plot appears as soon as data arrives." }); return; }
+    chartEmpty.hidden = true;
     chartWrap.hidden = false;
     if (defs.length > 6) {
       const holder = document.getElementById("chart-holder");
@@ -289,6 +301,15 @@ export function render(root, ctx) {
     const chart = new TimeSeriesChart(document.getElementById("chart-holder"), { height: 320 });
     chart.setSeries(defs);
     charts.push(chart);
+  }
+
+  function setChartPlaceholder({ title, hint }) {
+    clear(chartEmpty);
+    chartEmpty.appendChild(h("div.empty__icon", { "aria-hidden": "true" }, icon("activity", { size: 20 })));
+    chartEmpty.appendChild(h("div.empty__title", { text: title }));
+    chartEmpty.appendChild(h("p.sub", { text: hint }));
+    chartEmpty.hidden = false;
+    chartWrap.hidden = true;
   }
 
   /* ------------------------------------------------------------ recording */
@@ -329,6 +350,7 @@ export function render(root, ctx) {
   function onStreamEvent(event, data) {
     if (frozen) return;
     if (event === "sample") {
+      const first = sampleCount === 0;
       sampleCount += 1;
       const now = Date.now();
       for (const [key, entry] of Object.entries(data.values || {})) {
@@ -340,6 +362,7 @@ export function render(root, ctx) {
       }
       const text = document.getElementById("rec-count");
       if (text) text.textContent = `${sampleCount} samples`;
+      if (first) { chartEmpty.hidden = true; chartWrap.hidden = false; }
       for (const chart of charts) chart.update(data);
       updateInstrumentValues();
     } else if (event === "status" && data.achieved_hz) {
@@ -400,6 +423,8 @@ export function render(root, ctx) {
     document.getElementById("record-bar").classList.add("recording--on");
     document.getElementById("live-start").disabled = true;
     document.getElementById("live-start").textContent = "Recording…";
+    const rate = document.getElementById("rec-rate");
+    if (rate) rate.textContent = "starting…";
     for (const id of ["rec-stop", "rec-bookmark", "rec-csv"]) {
       const node = document.getElementById(id);
       if (node) node.disabled = false;

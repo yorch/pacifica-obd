@@ -12,16 +12,13 @@
 import { h, clear, mount, on } from "../dom.js";
 import { api } from "../api.js";
 import {
-  card, kpi, emptyState, errorState, toast, banner, field, checkbox,
+  card, kpi, emptyState, errorState, toast, banner, field, checkbox, loadingState,
+  verdict, tonePill,
 } from "../components.js";
-import { escapeControls, numberText } from "../format.js";
-
-const ROUTE_NOTE =
-  "This screen reads the BPCM (7E7) and HCP (7E2) on CAN-C with UDS 0x22 only. "
-  + "No write, no routine, no security access.";
+import { escapeControls, numberText, timeOf } from "../format.js";
 
 export function render(root, ctx) {
-  const state = { schema: null, preset: null, snapshot: null, busy: false, record: false };
+  const state = { schema: null, preset: null, snapshot: null, busy: false, record: false, readAt: null };
 
   const head = h("div.view__head", null,
     h("div", null, h("h1", { text: "HV battery" }),
@@ -70,7 +67,8 @@ export function render(root, ctx) {
     clear(noticeHolder);
     noticeHolder.appendChild(card({
       eyebrow: "Unverified", title: "The pack DID map is not confirmed",
-      body: h("div", null,
+      actions: tonePill("unverified DID map", "untested"),
+      body: h("div.stack", null,
         banner("No pack DID was recovered for this vehicle: the analysis database lists the "
           + "quantities and units but no identifiers. Every DID below is unverified, and an "
           + "unverified DID may read nothing — or the wrong quantity.", "warn"),
@@ -118,15 +116,14 @@ export function render(root, ctx) {
     on(recordBox.querySelector("input"), "change", (event) => { state.record = event.target.checked; });
 
     const saveButton = h("button.btn", { type: "button", text: "Save preset", onClick: () => savePreset() });
-    const readButton = h("button.btn.btn--primary", { type: "button", text: "Read snapshot", onClick: () => read() });
 
     mount(controlsHolder, card({
       eyebrow: "Pack preset", title: "DID map",
-      actions: h("div.row", null, saveButton, readButton),
-      body: h("div", null,
+      actions: h("div.row", null, saveButton),
+      body: h("div.stack", null,
         h("div.grid.grid--2", null,
-          h("div", null, cellsDid, firstIndex, count, scale),
-          h("div", null, packDid, packScale, socDid, socScale, tempDid, tempScale)),
+          h("div.stack", null, cellsDid, firstIndex, count, scale),
+          h("div.stack", null, packDid, packScale, socDid, socScale, tempDid, tempScale)),
         h("div.row", null, moduleField, socModuleField, timeoutField),
         h("p.sub", { text: "An unverified DID may read nothing. Confirm one column against the Raw console first; save the map once it matches." }),
         recordBox),
@@ -172,8 +169,10 @@ export function render(root, ctx) {
     if (state.busy) { toast("a snapshot is already running", "warn"); return; }
     state.busy = true;
     readButton.disabled = true;
+    state.readAt = new Date().toISOString();
     const body = { preset: currentPreset(), store: state.record, timeout_ms: Number(document.getElementById("batt-timeout")?.value || 100) };
-    mount(heroHolder, card({ eyebrow: "Snapshot", title: "Reading the pack…", body: h("div.pad", null, h("span.sub", { text: "Addressing the BPCM and HCP and reading 0x22." })) }));
+    mount(heroHolder, card({ eyebrow: "Snapshot", title: "Reading the pack…",
+      body: loadingState("Addressing the BPCM and HCP and reading 0x22.") }));
     clear(chartHolder);
     try {
       state.snapshot = await api.batteryRead(body);
@@ -187,30 +186,33 @@ export function render(root, ctx) {
   }
 
   function renderEmpty() {
-    mount(heroHolder, h("div.card", null, h("div.card__body", null,
-      emptyState({
-        icon: "gauge", title: "No snapshot yet",
+    mount(heroHolder, card({
+      eyebrow: "Snapshot", title: "No snapshot yet",
+      body: emptyState({
+        icon: "gauge",
         hint: "The pack DID map is unverified, so nothing is read until you supply an identifier "
           + "and press Read snapshot. If a read returns nothing, check the identifier in the Raw console.",
-      }))));
+      }),
+    }));
     clear(chartHolder);
   }
 
   /* -------------------------------------------------------------- render */
 
   function verdictCard(snapshot) {
-    const verdict = snapshot.verdict || { band: "unknown", text: "" };
+    const pack = snapshot.verdict || { band: "unknown", text: "" };
     const kind = { balanced: "ok", watch: "warn", imbalanced: "warn", severe: "crit",
-                   incomplete: "warn", unknown: "warn" }[verdict.band] || "warn";
+                   incomplete: "warn", unknown: "warn" }[pack.band] || "warn";
     const imbalance = snapshot.imbalance_mv;
     const cells = snapshot.cells || {};
-    return h("div", { class: `verdict verdict--${kind}` },
-      h("div", null,
-        h("div.eyebrow", { text: "Pack imbalance" }),
-        h("div.verdict__word", { text: imbalance === null || imbalance === undefined ? "—" : `${numberText(imbalance)} mV` }),
-        h("div.verdict__meta", { text: `max − min across ${cells.values_mv?.length || 0} cell(s)` }),
-        h("p", { text: verdict.text })),
-      h("div", { class: "verdict__meta", text: verdict.note || "A spread is only meaningful with the pack at rest." }));
+    return verdict({
+      kind,
+      eyebrow: "Pack imbalance",
+      word: imbalance === null || imbalance === undefined ? "—" : `${numberText(imbalance)} mV`,
+      meta: `max − min across ${cells.values_mv?.length || 0} cell(s)`,
+      body: h("p", { text: pack.text }),
+      aside: pack.note || "A spread is only meaningful with the pack at rest.",
+    });
   }
 
   function statCards(snapshot) {
@@ -235,15 +237,13 @@ export function render(root, ctx) {
     const cells = snapshot.cells || {};
     mount(heroHolder, null,
       h("div.grid.grid--2", null,
-        h("div.card", null, h("div.card__body", null, verdictCard(snapshot))),
-        h("div.card", null, h("div.card__body", null, statCards(snapshot)))),
+        card({ body: verdictCard(snapshot) }),
+        card({ body: statCards(snapshot) })),
       snapshot.warnings?.length
-        ? h("div", { style: { marginTop: "var(--space-5)" } },
-            snapshot.warnings.map((warning) => banner(warning, "warn")))
+        ? h("div.stack", null, snapshot.warnings.map((warning) => banner(warning, "warn")))
         : null,
       snapshot.recorded
-        ? h("div", { style: { marginTop: "var(--space-4)" } },
-            banner(`Recorded ${snapshot.recorded.rows} row(s) to session ${snapshot.recorded.session_id}.`, "ok"))
+        ? banner(`Recorded ${snapshot.recorded.rows} row(s) to session ${snapshot.recorded.session_id}.`, "ok")
         : null);
 
     clear(chartHolder);
@@ -258,7 +258,7 @@ export function render(root, ctx) {
     }
     chartHolder.appendChild(card({
       eyebrow: "Per-cell voltages", title: "Pack cells (mV)",
-      meta: `${cells.values_mv.length} cell(s) · mean ${numberText(cells.mean_mv)} mV · min ${numberText(cells.min_mv, 0)} · max ${numberText(cells.max_mv, 0)} · cells > ${cells.away_mv} mV from the mean highlighted`,
+      meta: `${state.readAt ? `read ${timeOf(state.readAt)} · ` : ""}${cells.values_mv.length} cell(s) · mean ${numberText(cells.mean_mv)} mV · min ${numberText(cells.min_mv, 0)} · max ${numberText(cells.max_mv, 0)} · cells > ${cells.away_mv} mV from the mean highlighted`,
       body: h("div", null, cellChart(cells)),
     }));
   }

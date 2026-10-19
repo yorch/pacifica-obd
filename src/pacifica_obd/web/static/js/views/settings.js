@@ -4,17 +4,18 @@
 import { h, clear, mount } from "../dom.js";
 import { api } from "../api.js";
 import {
-  card, pill, emptyState, errorState, toast, banner, select, dataTable, checkbox,
+  card, pill, emptyState, errorState, toast, banner, select, checkbox,
+  field, keyValues, loadingState, tonePill,
 } from "../components.js";
 
 export function render(root, ctx) {
-  const adapterHolder = h("div");
-  const portsHolder = h("div");
-  const datasetHolder = h("div");
-  const dataHolder = h("div");
+  const adapterHolder = h("div", null, loadingState("Reading adapter info…"));
+  const portsHolder = h("div", null, loadingState("Enumerating serial ports…"));
+  const datasetHolder = h("div", null, loadingState("Reading the bundled dataset…"));
+  const dataHolder = h("div", null, loadingState("Looking at the local database…"));
   const busHolder = h("div");
-  const safetyHolder = h("div");
-  const aiHolder = h("div");
+  const safetyHolder = h("div", null, loadingState("Reading the safety posture…"));
+  const aiHolder = h("div", null, loadingState("Reading the AI configuration…"));
 
   const head = h("div.view__head", null,
     h("div", null, h("h1", { text: "Settings" }),
@@ -41,10 +42,8 @@ export function render(root, ctx) {
       const toggle = checkbox({ id: "strict-seed", label: "Strict 0x27 seed re-read (opt-in)",
         checked: info.strict_seed_reread });
       clear(safetyHolder);
-      safetyHolder.appendChild(h("div", null,
-        h("div.row", null,
-          pill(info.read_only ? "read-only" : "writes enabled", info.read_only ? "ok" : "warn"),
-          info.read_only ? null : banner("Write mode", "warn")),
+      safetyHolder.appendChild(h("div.stack", null,
+        h("div.row", null, pill(info.read_only ? "read-only" : "writes enabled", info.read_only ? "ok" : "warn")),
         h("p.sub", { text: `Enabled by: ${info.safety?.enabled_by || "—"}` }),
         h("p.sub", { text: info.safety?.sgw || "" }),
         toggle,
@@ -72,11 +71,10 @@ export function render(root, ctx) {
       const model = textField("ai-model", "Model", config.model || "", "model id");
       const baseUrl = textField("ai-base", "Base URL (compatible APIs)", config.base_url || "",
         "https://… or a local endpoint");
-      const key = h("div.field", null,
-        h("label", { for: "ai-key", text: "API key (write-only; never shown again)" }),
-        h("input.mono", { id: "ai-key", type: "password", autocomplete: "new-password", placeholder: "paste a key" }),
-        h("div.sub", { text: "Stored 0600 under the tool's home directory — never logged, never returned." }));
-      const keyState = h("div.row", null);
+      const key = textField("ai-key", "API key (write-only; never shown again)", "",
+        "paste a key", { type: "password", autocomplete: "new-password",
+          hint: "Stored 0600 under the tool's home directory — never logged, never returned." });
+      const keyState = h("div.row");
       const builds = [];
       for (const [id, label, value] of [
         ["send-remote", "Send bus data to a remote model", config.send_bus_data_to_remote],
@@ -86,7 +84,7 @@ export function render(root, ctx) {
         ["local-only", "Local models only (block remote providers)", config.force_local_only],
       ]) builds.push(checkbox({ id, label, checked: value }));
 
-      const save = h("button.btn", { type: "button", text: "Save AI settings", onClick: async () => {
+      const save = h("button.btn.btn--primary", { type: "button", text: "Save AI settings", onClick: async () => {
         try {
           await api.aiSetConfig({
             provider: providerSelect.querySelector("select").value || null,
@@ -104,11 +102,11 @@ export function render(root, ctx) {
       } });
       const saveKey = h("button.btn.btn--sm", { type: "button", text: "Save key", onClick: async () => {
         const provider = providerSelect.querySelector("select").value;
-        const value = key.querySelector("input").value;
+        const value = key.input.value;
         if (!provider || !value) { toast("Choose a provider and paste a key", "warn"); return; }
         try {
           const result = await api.aiSetKey({ provider, key: value });
-          key.querySelector("input").value = "";
+          key.input.value = "";
           toast(`Key saved (${result.key.hint})`);
           loadAI();
         } catch (error) { toast(`${error.code || "error"}: ${error.message}`, "err", 0); }
@@ -121,20 +119,19 @@ export function render(root, ctx) {
       } });
 
       for (const [name, info] of Object.entries(config.keys || {})) {
-        keyState.appendChild(h("span.pill.pill--idle", {
-          text: `${name}: ${info.configured ? `configured ${info.hint}` : "no key"}${info.source ? ` (${info.source})` : ""}` }));
+        keyState.appendChild(pill(`${name}: ${info.configured ? `configured ${info.hint}` : "no key"}${info.source ? ` (${info.source})` : ""}`, "idle"));
       }
 
-      aiHolder.appendChild(h("div", null,
+      aiHolder.appendChild(h("div.stack", null,
         banner(config.provider
           ? (config.is_local ? "Local model: vehicle data does not leave this machine."
             : "Remote model: enable 'send bus data to a remote model' before a task can attach vehicle data.")
           : "No provider configured. Paste a key, or point the base URL at a local model.", config.provider ? "info" : "warn"),
-        providerSelect, model.node, baseUrl.node, key,
+        providerSelect, model.node, baseUrl.node, key.node,
         h("div.row", null, saveKey, removeKey), keyState,
         h("div.grid.grid--form", null, builds),
         h("div.row", null, save,
-          h("button.btn.btn--sm.btn--ghost", { type: "button", text: "Delete saved conversations",
+          h("button.btn.btn--sm.btn--danger", { type: "button", text: "Delete saved conversations",
             onClick: async () => {
               try { await api.aiDeleteConversations(); toast("Saved conversations deleted"); }
               catch (error) { toast(error.message, "err"); }
@@ -145,24 +142,25 @@ export function render(root, ctx) {
     } catch (error) { clear(aiHolder); aiHolder.appendChild(errorState(error, { onRetry: loadAI })); }
   }
 
-  function textField(id, label, value, placeholder) {
-    const input = h("input.mono", { id, type: "text", value: value || "", placeholder });
-    return { input, node: h("div.field", null, h("label", { for: id, text: label }), input) };
+  function textField(id, label, value, placeholder, extra = {}) {
+    const node = field({ id, label, value, placeholder, mono: true, ...extra });
+    return { node, input: node.querySelector("input") };
   }
 
   /* ------------------------------------------------------------- adapter */
 
   async function readInfo() {
     clear(adapterHolder);
-    adapterHolder.appendChild(h("span.sub", { text: "Reading adapter info…" }));
+    adapterHolder.appendChild(loadingState("Reading adapter info…"));
     try {
       const info = await api.info();
       clear(adapterHolder);
-      adapterHolder.appendChild(h("dl.kv", null, [
+      adapterHolder.appendChild(keyValues([
         ["Port", info.port], ["Status", info.status], ["Protocol", info.protocol],
-        ["Adapter", info.adapter], ["Voltage", info.voltage ? `${info.voltage.value ?? info.voltage} ${info.voltage.unit || ""}` : "—"],
+        ["Adapter", info.adapter],
+        ["Voltage", info.voltage ? `${info.voltage.value ?? info.voltage} ${info.voltage.unit || ""}` : "—"],
         ["VIN", info.vin || "—"],
-      ].flatMap(([key, value]) => [h("dt", { text: key }), h("dd", { text: String(value ?? "—") })])));
+      ]));
     } catch (error) {
       clear(adapterHolder);
       adapterHolder.appendChild(errorState(error, { onRetry: readInfo }));
@@ -183,24 +181,25 @@ export function render(root, ctx) {
       const payload = await api.ports();
       clear(portsHolder);
       if (!payload.ports.length) {
-        portsHolder.appendChild(emptyState({ icon: "🔌", title: "No candidate serial ports",
+        portsHolder.appendChild(emptyState({ icon: "plug", title: "No candidate serial ports",
           hint: "Plug in the vLinker FS and check `ls /dev/cu.usb*`." }));
         return;
       }
-      portsHolder.appendChild(h("div.row", null, payload.ports.map((port) => h("span.pill.pill--idle.mono", { text: port }))));
+      portsHolder.appendChild(h("div.row", null, payload.ports.map((port) => tonePill(port, "idle"))));
     } catch (error) { clear(portsHolder); portsHolder.appendChild(errorState(error, { onRetry: loadPorts })); }
   }
 
   /* ------------------------------------------------------------------ bus */
 
-  const busSelect = select({ id: "set-bus", label: "Default bus", value: "can-c",
+  const busSelect = select({ id: "set-bus", label: "Default bus", value: "can-c", mono: true,
     options: [{ value: "can-c", label: "can-c (HS 500k, pins 6/14)" }, { value: "can-ihs", label: "can-ihs (MS 125k, pins 3/11)" }] });
-  busHolder.appendChild(h("div.row", null, busSelect,
-    h("button.btn.btn--sm", { type: "button", text: "Apply", onClick: async () => {
-      try { await api.bus(busSelect.querySelector("select").value); toast("Bus updated"); ctx.refreshStatus(); }
-      catch (error) { toast(error.message, "err"); }
-    } })));
-  busHolder.appendChild(h("p.sub", { text: "Reads use an ATCRA receive filter pointing at the responder; ISO-TP flow control is always left automatic." }));
+  busHolder.appendChild(h("div.stack", null,
+    h("div.row", null, busSelect,
+      h("button.btn.btn--sm", { type: "button", text: "Apply", onClick: async () => {
+        try { await api.bus(busSelect.querySelector("select").value); toast("Bus updated"); ctx.refreshStatus(); }
+        catch (error) { toast(error.message, "err"); }
+      } })),
+    h("p.sub", { text: "Reads use an ATCRA receive filter pointing at the responder; ISO-TP flow control is always left automatic." })));
 
   /* -------------------------------------------------------------- dataset */
 
@@ -208,12 +207,12 @@ export function render(root, ctx) {
     try {
       const info = await api.datasetInfo();
       clear(datasetHolder);
-      datasetHolder.appendChild(h("dl.kv", null, [
+      datasetHolder.appendChild(keyValues([
         ["Path", info.path], ["Modules", info.modules], ["Buses", (info.buses || []).join(", ")],
         ["Powertrains", (info.powertrains || []).join(", ")], ["ECUs with DIDs", info.ecus_with_dids],
         ["DIDs", info.dids], ["Adaptations", info.adaptations], ["DTC texts", info.dtc_texts],
         ["seed_key", info.seed_key ? "present" : "absent"],
-      ].flatMap(([key, value]) => [h("dt", { text: key }), h("dd", { text: String(value ?? "—") })])));
+      ]));
     } catch (error) { clear(datasetHolder); datasetHolder.appendChild(errorState(error, { onRetry: loadDataset })); }
   }
 
@@ -223,14 +222,14 @@ export function render(root, ctx) {
     try {
       const [schema, info] = await Promise.all([api.dbSchema(), api.health().catch(() => null)]);
       clear(dataHolder);
-      dataHolder.appendChild(h("dl.kv", null, [
+      dataHolder.appendChild(keyValues([
         ["Database", schema.db_path || "—"],
         ["Available", schema.available ? "yes" : "no"],
         ["Tables", (schema.tables || []).map((table) => `${table.name} (${table.rows})`).join(", ") || "—"],
         ["Server", `${location.origin} · v${info?.version || "?"}`],
         ["Write surface", info?.write_enabled ? "enabled" : "read-only"],
         ["Auth", info?.auth_required ? "bearer token required" : "none (loopback only)"],
-      ].flatMap(([key, value]) => [h("dt", { text: key }), h("dd", { text: String(value ?? "—") })])));
+      ]));
       dataHolder.appendChild(h("p.sub", { text: "The database browser opens SQLite read-only (mode=ro) and issues SELECTs only." }));
     } catch (error) { clear(dataHolder); dataHolder.appendChild(errorState(error, { onRetry: loadData })); }
   }

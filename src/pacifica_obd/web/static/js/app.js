@@ -6,30 +6,30 @@
 import { h, clear, mount, on } from "./dom.js";
 import { api, ingestTokenFromFragment, ApiError } from "./api.js";
 import { navigate, onRoute, parseHash } from "./router.js";
-import { toast, banner, icon, loadingRows } from "./components.js";
+import { toast, banner, icon, loadingRows, card, emptyState, errorState } from "./components.js";
 
 // Icons are names into components.js's SVG set: 16px, 1.5px stroke, currentColor.
 const NAV = [
-  ["READ", [
+  ["Read", [
     { path: "/", label: "Dashboard", glyph: "table" },
     { path: "/live", label: "Live data", glyph: "activity" },
     { path: "/modules", label: "Modules & DTCs", glyph: "layers" },
     { path: "/dids", label: "DIDs / ID block", glyph: "tag" },
   ]],
-  ["GUARDED", [
+  ["Guarded", [
     { path: "/security", label: "Security 0x27", glyph: "lock", guarded: true },
     { path: "/writes", label: "Writes", glyph: "pencil", writes: true, guarded: true },
   ]],
   ["AI", [
     { path: "/assistant", label: "Assistant", glyph: "sparkles" },
   ]],
-  ["DATA", [
+  ["Data", [
     { path: "/battery", label: "HV battery", glyph: "gauge" },
     { path: "/capture", label: "Capture", glyph: "download" },
     { path: "/db", label: "Database", glyph: "database" },
     { path: "/reports", label: "Reports", glyph: "file" },
   ]],
-  ["SYSTEM", [
+  ["System", [
     { path: "/raw", label: "Raw console", glyph: "terminal" },
     { path: "/settings", label: "Settings", glyph: "sliders" },
     { path: "/help", label: "Help", glyph: "help" },
@@ -55,6 +55,11 @@ const VIEWS = {
 
 // Screens that are read like prose, not like a data grid.
 const PROSE = new Set(["/help", "/assistant", "/settings"]);
+
+// `#/dashboard` is accepted as an alias for the dashboard, so a hand-typed or
+// bookmarked URL never lands on "Not found" while the rail still highlights the
+// canonical route.
+const ALIASES = { "/dashboard": "/" };
 
 const state = {
   view: null,          // active view module ({dispose?})
@@ -199,9 +204,7 @@ function findLabel(path) {
 
 function mountPlaceholder(root, path) {
   root.dataset.entering = "";
-  mount(root, h("div.card", null,
-    h("div.card__head", null, h("h2", { text: "Loading" })),
-    h("div.card__body", null, loadingRows(4))));
+  mount(root, card({ title: "Loading", body: loadingRows(4) }));
   const title = document.getElementById("page-title");
   if (title) title.textContent = findLabel(path);
   window.scrollTo({ top: 0 });
@@ -219,10 +222,12 @@ async function renderView({ path, params }) {
   renderNav(path);
   mountPlaceholder(root, path);
   if (!loader) {
-    mount(root, h("div.card", null, h("div.card__body", null,
-      h("h1", { text: "Not found" }),
-      h("p.sub", { text: `No screen for ${path}.` }),
-      h("a.btn.btn--primary", { href: "#/", text: "Back to the dashboard" }))));
+    mount(root, h("div.view__head", null, h("div", null, h("h1", { text: "Not found" }))),
+      card({ body: emptyState({
+        icon: "help", title: `No screen for ${path}`,
+        hint: "The navigation rail lists every screen this server serves.",
+        action: h("a.btn.btn--primary", { href: "#/", text: "Back to the dashboard" }),
+      }) }));
     return;
   }
   try {
@@ -234,9 +239,8 @@ async function renderView({ path, params }) {
     });
     state.view = result || {};
   } catch (error) {
-    mount(root, h("div.card", null, h("div.card__body", null,
-      h("h1", { text: "Could not load this screen" }),
-      h("p.sub", { text: String(error?.message || error) }))));
+    mount(root, h("div.view__head", null, h("div", null, h("h1", { text: "Could not load this screen" }))),
+      card({ body: errorState(error) }));
     return;
   }
   root.classList.toggle("view--prose", PROSE.has(path));
@@ -316,7 +320,11 @@ async function boot() {
     if (state.settings.theme === "system") applyTheme();
   });
   wireTopBar();
-  onRoute((route) => { renderView(route); renderViewTitle(route.path); });
+  onRoute((route) => {
+    const path = ALIASES[route.path] || route.path;
+    renderView({ ...route, path });
+    renderViewTitle(path);
+  });
   refreshStatus();
   setInterval(refreshStatus, 4000);
   window.addEventListener("resize", () => state.view?.resize?.());

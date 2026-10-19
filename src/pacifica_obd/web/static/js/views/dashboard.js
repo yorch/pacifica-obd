@@ -1,14 +1,14 @@
 // Dashboard (#/) — the app's front door: live status, the "Scan all modules"
 // call to action, the pre-trip health check, KPI tiles and recent sessions.
 
-import { h, clear, mount, on } from "../dom.js";
+import { h, clear, mount } from "../dom.js";
 import { api } from "../api.js";
 import { navigate } from "../router.js";
 import {
-  card, cardBody, kpi, pill, emptyState, errorState, toast, banner,
-  dataTable, progressBar,
+  card, cardBody, kpi, pill, emptyState, errorState, toast, feed, feedRow,
+  dataTable, verdict, loadingState, keyValues, tonePill,
 } from "../components.js";
-import { valueText, unitOf, timeOf, agoOf, dateTimeOf } from "../format.js";
+import { dateTimeOf } from "../format.js";
 
 const HINTS = {
   adapter: "Plug in the vLinker FS and check `ls /dev/cu.usb*`; then Connect.",
@@ -16,20 +16,11 @@ const HINTS = {
   internal: "Something went wrong server-side; the message is above.",
 };
 
-function feedRow(text, status) {
-  return h("div.feed__row", null,
-    h("span.feed__ts", { text: timeOf(new Date().toISOString()) }),
-    h("span", { text: text }),
-    status ? pill(status, status) : null);
-}
-
-function verdictBlock(verdict, reasons) {
-  const kind = verdict === "READY" ? "ok" : verdict === "DO NOT DRIVE" ? "crit" : "warn";
-  return h("div", { class: `verdict verdict--${kind}` },
-    h("div", null,
-      h("div.verdict__word", { text: verdict }),
-      h("div.verdict__meta", { text: `checked ${dateTimeOf(new Date().toISOString())}` }),
-      h("ul", null, reasons.map((reason) => h("li", { text: reason })))));
+function verdictBlock(word, reasons) {
+  const kind = word === "READY" ? "ok" : word === "DO NOT DRIVE" ? "crit" : "warn";
+  return verdict({
+    kind, word, meta: `checked ${dateTimeOf(new Date().toISOString())}`, reasons,
+  });
 }
 
 function computeVerdict(readiness, dtc) {
@@ -57,15 +48,15 @@ export function render(root, ctx) {
       h("button.btn.btn--primary", { type: "button", id: "scan-cta", text: "Scan all modules",
         onClick: () => runScan() })));
 
-  const kpis = h("div.grid.grid--kpi");
-  const statusCard = card({ eyebrow: "Adapter", title: "Connection", body: h("div", { id: "adapter-body" }, h("span.sub", { text: "Loading…" })),
+  const kpis = h("div.grid.grid--kpi", { hidden: true });
+  const statusCard = card({ eyebrow: "Adapter", title: "Connection", body: h("div", { id: "adapter-body" }, loadingState("Reading adapter status…")),
     actions: h("a.btn.btn--sm.btn--ghost", { href: "#/settings", text: "Settings" }) });
   const ctaCard = card({
     eyebrow: "Primary action", title: "All-module scan",
     actions: h("button.btn.btn--sm.btn--danger", { type: "button", id: "scan-cancel", text: "Cancel", disabled: true, onClick: cancelActive }),
     body: h("div", null,
       h("p.sub", { text: "Discovers every UDS module on the selected buses (1003 / 22F100 / 22F190), then reads DTCs from each of them. Reads only — nothing is cleared or written." }),
-      h("div", { id: "scan-progress" }, h("div.feed", { id: "scan-feed" }, h("div.sub", { text: "Not run yet." })))),
+      h("div", { id: "scan-progress" }, feed({ id: "scan-feed", placeholder: "Not run yet." }))),
   });
   const pretripCard = card({
     eyebrow: "Pre-trip", title: "Health check",
@@ -73,6 +64,7 @@ export function render(root, ctx) {
     body: h("div", { id: "pretrip-body" }, h("p.sub", { text: "Readiness + all-module DTCs + a live snapshot, judged into one verdict." })),
   });
   const sessionsCard = card({ eyebrow: "Local database", title: "Recent sessions", flush: true,
+    body: h("div", null, loadingState("Reading recent sessions…", { panel: true })),
     actions: h("a.btn.btn--sm.btn--ghost", { href: "#/db", text: "Open database" }) });
 
   mount(root, head, h("div", null, kpis), h("div.grid.grid--2", null, statusCard, ctaCard),
@@ -82,19 +74,20 @@ export function render(root, ctx) {
 
   function setKpis(status, dtc, pids) {
     clear(kpis);
+    kpis.hidden = false;
     const adapter = status?.health?.adapter || {};
     const voltage = adapter.voltage;
     kpis.appendChild(kpi({ label: "Adapter voltage", value: voltage ? voltage.value : null,
-      unit: voltage ? voltage.unit : "V", foot: pill(adapter.attached ? "attached" : "not connected",
-        adapter.attached ? "ok" : "no_response") }));
+      unit: voltage ? voltage.unit : "V", foot: tonePill(adapter.attached ? "attached" : "not connected",
+        adapter.attached ? "ok" : "idle") }));
     kpis.appendChild(kpi({ label: "Stored DTCs", value: dtc ? dtc.total_dtcs : null,
-      foot: dtc ? (dtc.total_dtcs ? pill("faults present", "negative") : h("span.sub", { text: "none" })) : h("span.sub", { text: "not read" }) }));
+      foot: dtc ? (dtc.total_dtcs ? tonePill("faults present", "crit") : h("span.sub", { text: "none" })) : h("span.sub", { text: "not read" }) }));
     kpis.appendChild(kpi({ label: "Modules seen", value: dtc ? (dtc.modules?.length ?? 0) : null,
       foot: h("span.sub", { text: dtc ? `${(dtc.modules || []).filter((m) => m.status === "ok").length} answered ok` : "not scanned" }) }));
     kpis.appendChild(kpi({ label: "Supported PIDs", value: pids ?? null,
-      foot: h("a.sub", { href: "#/live", text: "open live data" }) }));
+      foot: h("a", { href: "#/live", text: "open live data" }) }));
     kpis.appendChild(kpi({ label: "Powertrain", value: adapter.powertrain || null,
-      foot: h("span.sub", { text: adapter.powertrain ? "detected from responding modules" : "not detected" }) }));
+      foot: h("span.sub", { text: adapter.powertrain ? "detected from responding modules" : "no hybrid-only module answered" }) }));
   }
 
   function setAdapterBody(status, error) {
@@ -104,7 +97,7 @@ export function render(root, ctx) {
     const adapter = status?.health?.adapter || {};
     if (!adapter.attached) {
       holder.appendChild(emptyState({
-        icon: "🔌", title: "vLinker FS not detected",
+        icon: "plug", title: "vLinker FS not detected",
         hint: "Plug the adapter into the OBD-II port, turn the ignition on, then press Connect.",
         action: h("div.row", null,
           h("button.btn.btn--primary", { type: "button", text: "Connect", onClick: async () => {
@@ -115,12 +108,13 @@ export function render(root, ctx) {
       }));
       return;
     }
-    holder.appendChild(h("dl.kv", null,
-      h("dt", { text: "Port" }), h("dd", { text: adapter.port || "—" }),
-      h("dt", { text: "Status" }), h("dd", { text: adapter.status || "—" }),
-      h("dt", { text: "Protocol" }), h("dd", { text: adapter.protocol || "—" }),
-      h("dt", { text: "Adapter" }), h("dd", { text: adapter.adapter || "—" }),
-      h("dt", { text: "Bus" }), h("dd", { text: status?.status?.bus || "can-c" })));
+    holder.appendChild(keyValues([
+      ["Port", adapter.port || "—"],
+      ["Status", adapter.status || "—"],
+      ["Protocol", adapter.protocol || "—"],
+      ["Adapter", adapter.adapter || "—"],
+      ["Bus", status?.status?.bus || "can-c"],
+    ]));
   }
 
   function setSessions(payload, error) {
@@ -128,7 +122,7 @@ export function render(root, ctx) {
     clear(holder);
     if (error) { holder.appendChild(errorState(error, { onRetry: () => load() })); return; }
     if (!payload.available) {
-      holder.appendChild(emptyState({ icon: "▦", title: "No local database found",
+      holder.appendChild(emptyState({ icon: "database", title: "No local database found",
         hint: payload.db_path ? `Looked at ${payload.db_path}` : "Persistence may be disabled (--no-log)." }));
       return;
     }
@@ -141,6 +135,7 @@ export function render(root, ctx) {
         { key: "vin", label: "VIN", mono: true, render: (row) => row.vin || "—" },
       ],
       rows: payload.rows, empty: "No sessions recorded yet.",
+      emptyTitle: "No sessions yet",
       onRowClick: (row) => navigate("/db", { table: "sessions", highlight: row.id }),
     }));
   }
@@ -164,32 +159,32 @@ export function render(root, ctx) {
   async function runScan({ silent = false } = {}) {
     if (scanning) return null;
     scanning = true;
-    const feed = document.getElementById("scan-feed");
+    const feed_ = document.getElementById("scan-feed");
     const cancelButton = document.getElementById("scan-cancel");
-    clear(feed);
+    clear(feed_);
     if (cancelButton) cancelButton.disabled = false;
-    feed.appendChild(feedRow("scanning modules on can-c…"));
+    feedRow(feed_, "scanning modules on can-c…");
     pollJobs((jobs) => {
       for (const job of jobs) {
         if (job.progress && Object.keys(job.progress).length) {
-          feed.appendChild(feedRow(`${job.name}: ${JSON.stringify(job.progress)}`));
+          feedRow(feed_, `${job.name}: ${JSON.stringify(job.progress)}`);
         }
       }
     });
     try {
       const modules = await api.udsModules({ bus: "can-c", start: "700", end: "7FF", timeout_ms: 100 });
-      feed.appendChild(feedRow(`discovery: ${modules.modules.length} module(s) responded`, "ok"));
+      feedRow(feed_, `discovery: ${modules.modules.length} module(s) responded`, "ok");
       ctx.refreshStatus();
       const dtc = await api.udsDtcAll({ bus: "can-c", start: "700", end: "7FF", timeout_ms: 100 });
-      feed.appendChild(feedRow(`DTCs: ${dtc.total_dtcs} across ${dtc.modules.length} module(s)`,
-        dtc.total_dtcs ? "negative" : "ok"));
+      feedRow(feed_, `DTCs: ${dtc.total_dtcs} across ${dtc.modules.length} module(s)`,
+        dtc.total_dtcs ? "negative" : "ok");
       lastDtc = dtc;
       lastModules = modules;
       setKpis(ctx.status, dtc, lastPids);
       if (!silent) toast(`Scan complete: ${dtc.total_dtcs} DTC(s)`, dtc.total_dtcs ? "warn" : "ok");
       return { modules, dtc };
     } catch (error) {
-      feed.appendChild(errorState(error));
+      feed_.appendChild(errorState(error));
       if (!silent) toast(error.message, "err", 0);
       return null;
     } finally {
@@ -208,8 +203,7 @@ export function render(root, ctx) {
   async function runPretrip() {
     const holder = document.getElementById("pretrip-body");
     clear(holder);
-    holder.appendChild(h("div.row", null, h("span.spinner", { "aria-hidden": "true" }),
-      h("span.sub", { text: "Running readiness, all-module DTCs and a live snapshot…" })));
+    holder.appendChild(loadingState("Running readiness, all-module DTCs and a live snapshot…"));
     try {
       const [readiness, dtc, scan] = await Promise.all([
         api.obdReadiness().catch((error) => ({ available: false, reason: error.message })),
@@ -221,8 +215,7 @@ export function render(root, ctx) {
       holder.appendChild(verdictBlock(verdict, reasons));
       if (readiness?.monitors?.length) {
         holder.appendChild(h("div.row", null, readiness.monitors.map((m) =>
-          h("span", { class: `chip`, "aria-pressed": m.complete ? "true" : "false" },
-            `${m.name} · ${m.complete ? "complete" : "incomplete"}`))));
+          tonePill(`${m.name} · ${m.complete ? "complete" : "incomplete"}`, m.complete ? "ok" : "warn"))));
       }
       if (scan?.stored_dtcs?.length) {
         holder.appendChild(h("div.sub", { text: `PCM codes: ${scan.stored_dtcs.map((d) => d.code).join(", ")}` }));
@@ -246,7 +239,6 @@ export function render(root, ctx) {
     try {
       const [status, health] = await Promise.all([api.status(), api.health()]);
       setAdapterBody({ status, health }, null);
-      setSessions({ available: false, rows: [] }, null);
     } catch (error) {
       setAdapterBody(null, error);
     }

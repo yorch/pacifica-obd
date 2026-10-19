@@ -95,6 +95,13 @@ export function pill(text, status) {
                      title: status ? `status: ${status}` : "" });
 }
 
+// A pill whose tone the caller chooses (a count, a configuration fact) rather
+// than one derived from a machine status. Same shape as a status pill, minus the
+// "status:" tooltip, which would be a lie on a count.
+export function tonePill(text, tone = "idle") {
+  return h("span", { class: `pill ${statusClass(tone)}`, text: String(text ?? "—") });
+}
+
 // The raw console's tier badge. Bigger than a status pill and always worded, so
 // read / confirm / deny can never be confused, in a screenshot or at a glance.
 export function tierPill(tier) {
@@ -141,6 +148,21 @@ export function emptyState({ icon: glyph = "circle", title, hint, action } = {})
     action || null);
 }
 
+// The loudest block the app can print: a left-ruled verdict with a word, the
+// provenance of the judgement and the reasons behind it. Every screen that
+// resolves to a judgement uses this one shape.
+export function verdict({ kind = "warn", word, eyebrow = null, meta = null,
+                          reasons = [], body = null, aside = null } = {}) {
+  return h("div", { class: `verdict verdict--${kind}` },
+    h("div", null,
+      eyebrow ? h("div.eyebrow", { text: eyebrow }) : null,
+      h("div.verdict__word", { text: word }),
+      meta ? h("div.verdict__meta", { text: meta }) : null,
+      reasons.length ? h("ul", null, reasons.map((line) => h("li", { text: line }))) : null,
+      body || null),
+    aside ? h("div.verdict__meta", { text: aside }) : null);
+}
+
 export function loadingRows(rows = 5, { title = true } = {}) {
   const wrap = h("div.skeleton-stack", { "aria-busy": "true", "aria-live": "polite" },
     h("span.sr-only", { text: "Loading" }));
@@ -172,6 +194,25 @@ export function errorState(error, { onRetry } = {}) {
 }
 
 export function spinner() { return h("span.spinner", { "aria-label": "loading" }); }
+
+// The one loading treatment for a panel that is waiting on the adapter. Callers
+// pass a sentence ("Reading the seed…"), never a bare "Loading…".
+export function loadingState(text = "Loading…", { panel = false } = {}) {
+  return h("div", { class: `loading${panel ? " loading--panel" : ""}`, role: "status", "aria-live": "polite" },
+    spinner(), h("span", { text }));
+}
+
+// A definition list of label/value pairs. `.kv dd` is mono because most of these
+// values came off the wire; `sans` is for prose values (provider names, notes).
+export function keyValues(pairs, { sans = false } = {}) {
+  return h("dl", { class: `kv${sans ? " kv--sans" : ""}` },
+    pairs
+      .filter(([key, value]) => key !== null && key !== undefined && value !== undefined)
+      .flatMap(([key, value]) => [
+        h("dt", { text: String(key) }),
+        value instanceof Node ? h("dd", null, value) : h("dd", { text: escapeControls(String(value ?? "—")) }),
+      ]));
+}
 
 /* ------------------------------------------------------------------ tables */
 
@@ -227,8 +268,7 @@ export function dataTable({ columns, rows, rowClass: rowClassFn, onRowClick,
   return h("div.table-wrap", null, h("table.data", null, thead, tbody));
 }
 
-export function cellWithCopy(text, { mono = true } = {}) {
-  const span = h("span", { class: mono ? "mono" : "", text: escapeControls(valueText(text)) });
+export function cellWithCopy(text, { mono = true } = {}) {  const span = h("span", { class: mono ? "mono" : "", text: escapeControls(valueText(text)) });
   const button = h("button.cellcopy", {
     type: "button", title: "Copy", "aria-label": "Copy this value",
     onClick: (event) => {
@@ -237,6 +277,25 @@ export function cellWithCopy(text, { mono = true } = {}) {
     },
   }, icon("copy", { size: 13 }));
   return h("span", null, span, " ", button);
+}
+
+/* -------------------------------------------------------------------- feed */
+
+// The running log a long read writes into. One row shape for the scan, the
+// capture and the DTC sweep, so a scan in progress looks the same everywhere.
+export function feed({ placeholder = "Not run yet.", id = null } = {}) {
+  return h("div.feed", { id: id || undefined }, h("div.sub", { text: placeholder }));
+}
+
+export function feedRow(node, text, status) {
+  if (!node) return null;
+  const row = h("div.feed__row", null,
+    h("span.feed__ts", { text: new Date().toLocaleTimeString([], { hour12: false }) }),
+    h("span", { text }),
+    status ? pill(status, status) : null);
+  node.appendChild(row);
+  node.scrollTop = node.scrollHeight;
+  return row;
 }
 
 /* ------------------------------------------------------------------ gauges */
@@ -275,6 +334,10 @@ export function gaugeRadial(props = {}) {
   const outer = r + band / 2 + 3;
   let state = { ...props };
   const frac = (v) => {
+    // `Number(null)` is 0, which would draw a phantom arc from the scale minimum
+    // up to zero on any gauge whose minimum is below zero. An absent reading is
+    // absent, not zero.
+    if (v === null || v === undefined || v === "" || typeof v === "boolean") return 0;
     const value_ = Number(v);
     const lo = Number(state.min ?? 0);
     const hi = Number(state.max ?? 100);
@@ -323,11 +386,10 @@ export function gaugeRadial(props = {}) {
   // for the scale labels; the first real sample may fill it in place.
   const unitText = h("text", { class: "gauge__unit gauge__center", x: cx, y: cy - 22,
     text: unit || "" });
-  // Scale ends sit *inside* the arc, so they never collide with the ticks or
-  // the redline band outside it.
-  const labelR = r - band - 12;
-  const [minX, minY] = polar(cx, cy, labelR, START + 5);
-  const [maxX, maxY] = polar(cx, cy, labelR, START + SWEEP - 5);
+  // Scale ends sit *inside* the arc, clear of the ticks and the redline band.
+  const labelR = r - band - 16;
+  const [minX, minY] = polar(cx, cy, labelR, START + 14);
+  const [maxX, maxY] = polar(cx, cy, labelR, START + SWEEP - 14);
   const minLabel = h("text", { class: "gauge__scale", x: minX, y: minY + 8,
     "text-anchor": "middle", text: numberText(min) });
   const maxLabel = h("text", { class: "gauge__scale", x: maxX, y: maxY + 8,
@@ -444,7 +506,7 @@ export function digitalReadout({ label = "", value = null, unit = "", stale = fa
     h("div", null,
       h("span.digital__num", { text: value === null ? "—" : numberText(value) }),
       unit ? h("span.digital__unit", { text: unit }) : null,
-      status !== "ok" ? h("span", { class: `pill ${statusClass(status)}`, style: { marginLeft: "6px" }, text: status }) : null),
+      status !== "ok" ? h("span.digital__status", null, pill(status, status)) : null),
     spark);
 }
 
@@ -522,23 +584,27 @@ export function toast(message, kind = "ok", timeout = 4000) {
 /* ------------------------------------------------------------ form pieces */
 
 export function field({ label, value = "", placeholder = "", mono = false, type = "text",
-                        id = null, min = null, max = null, hint = null } = {}) {
+                        id = null, min = null, max = null, step = null, autocomplete = null,
+                        hint = null } = {}) {
   return h("div.field", null,
     h("label", { for: id || undefined, text: label }),
-    h("input", { id: id || undefined, class: mono ? "mono" : "", type, value, placeholder, min, max }),
+    h("input", { id: id || undefined, class: mono ? "mono" : "", type, value, placeholder,
+                 min, max, step, autocomplete }),
     hint ? h("div.field__hint", { text: hint }) : null);
 }
 
-export function select({ label, options, value, id = null }) {
-  const node = h("select", { id: id || undefined, class: "mono" },
+// Machine-valued options (a bus, an ECU, a module id) read as data and get the
+// mono face; a prose option ("Gauges", "any") does not.
+export function select({ label, options, value, id = null, mono = false }) {
+  const node = h("select", { id: id || undefined, class: mono ? "mono" : "" },
     options.map((opt) => h("option", {
       value: opt.value, text: opt.label, selected: String(opt.value) === String(value) ? true : undefined,
     })));
   return h("div.field", null, label ? h("label", { for: id || undefined, text: label }) : null, node);
 }
 
-export function checkbox({ label, checked = false, id = null }) {
-  return h("div.field.field--check", null,
+export function checkbox({ label, checked = false, id = null, flush = false }) {
+  return h("div", { class: `field field--check${flush ? " field--check--flush" : ""}` },
     h("input", { id: id || undefined, type: "checkbox", checked: checked ? true : undefined }),
     h("label", { for: id || undefined, text: label }));
 }
@@ -637,7 +703,7 @@ export function typedConfirm({ title, request, module, warning, hint, onConfirm,
   });
   const content = h("div", null,
     warning ? h("div.banner.banner--warn", null, icon("alert-triangle"), h("span", { text: warning })) : null,
-    h("div.modal__request", null,
+    h("div.wirerequest", null,
       h("span.eyebrow", { text: "exact wire request — nothing has been sent" }),
       h("code.mono.dialog__wire", { text: request })),
     h("p.sub", { text: hint || `Type ${module} to confirm. This tool cannot undo the change.` }),

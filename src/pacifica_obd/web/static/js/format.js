@@ -26,9 +26,17 @@ const STATUS_CLASS = {
   permanent: "pill--crit",
 };
 
+// The semantic ramps, as a pass-through for callers that already know the tone.
+const RAMP_CLASS = {
+  ok: "pill--ok", info: "pill--info", warn: "pill--warn", crit: "pill--crit",
+  danger: "pill--crit", idle: "pill--idle", untested: "pill--untested",
+  ghost: "pill--ghost",
+};
+
 export function statusClass(status) {
   if (!status) return "pill--idle";
-  return STATUS_CLASS[String(status).toLowerCase()] || "pill--idle";
+  const key = String(status).toLowerCase();
+  return STATUS_CLASS[key] || RAMP_CLASS[key] || "pill--idle";
 }
 
 export function rowClass(status) {
@@ -120,7 +128,11 @@ export function seriesColor(index) {
 }
 
 export function seriesColorValue(index) {
+  // Resolved (not `var(...)`) because uPlot draws onto a canvas, which cannot
+  // resolve custom properties. Callers must not hardcode a palette: `currentColor`
+  // is the only fallback, and the consistency test guarantees every `--series-N`
+  // is defined in both themes.
   const value = getComputedStyle(document.documentElement)
     .getPropertyValue(`--series-${(index % 8) + 1}`).trim();
-  return value || "#2451d6";
+  return value || "currentColor";
 }

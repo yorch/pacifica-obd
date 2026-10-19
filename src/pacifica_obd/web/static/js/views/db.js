@@ -7,10 +7,10 @@ import { h, clear, mount, on, download } from "../dom.js";
 import { api, rawResponse, query } from "../api.js";
 import { navigate } from "../router.js";
 import {
-  card, cardBody, pill, emptyState, errorState, toast, dataTable, field, select,
-  drawer, cellWithCopy,
+  card, pill, emptyState, errorState, toast, dataTable, field,
+  drawer, icon, loadingState,
 } from "../components.js";
-import { dateTimeOf, truncate, timeOf } from "../format.js";
+import { dateTimeOf, truncate } from "../format.js";
 import { TimeSeriesChart } from "../charts.js";
 
 const FIELD_SPECS = {
@@ -111,7 +111,7 @@ export async function render(root, ctx) {
       filtersHolder.appendChild(input);
     }
     filtersHolder.appendChild(h("div.field.field--tight", null, h("label", { text: "Rows" }),
-      h("select", { id: "db-limit" },
+      h("select.mono", { id: "db-limit" },
         [25, 50, 100, 250].map((n) => h("option", { value: n, text: String(n), selected: n === state.limit ? true : undefined })))));
     on(document.getElementById("db-limit"), "change", (event) => { state.limit = Number(event.target.value); state.offset = 0; load(); });
     filtersHolder.appendChild(h("button.btn.btn--sm.btn--ghost", { type: "button", text: "Clear filters",
@@ -127,7 +127,7 @@ export async function render(root, ctx) {
       return;
     }
     clear(gridHolder);
-    gridHolder.appendChild(h("div.pad", null, h("span.sub", { text: "Loading…" })));
+    gridHolder.appendChild(loadingState("Reading rows…", { panel: true }));
     try {
       const payload = await api.dbTable(state.table, {
         ...state.filters, limit: state.limit, offset: state.offset,
@@ -138,7 +138,7 @@ export async function render(root, ctx) {
       renderPager();
     } catch (error) {
       clear(gridHolder);
-      gridHolder.appendChild(h("div", { class: "pad" }, errorState(error, { onRetry: load })));
+      gridHolder.appendChild(errorState(error, { onRetry: load }));
     }
   }
 
@@ -152,14 +152,17 @@ export async function render(root, ctx) {
       state.dir = state.order === name && state.dir === "desc" ? "asc" : "desc";
       state.order = name; state.offset = 0; load();
     };
-    const columns = (state.columns || Object.keys(state.rows[0])).map((name) => ({
-      key: name, label: name, mono: /id|vin|did|code|bus|module|request|ts|hex|raw|ftb|type/i.test(name),
-      num: /^(id|session_id)$/.test(name),
-      render: (row) => renderCell(name, row),
-      sortable: true,
-      sorted: state.order === name ? state.dir : null,
-      onSort: () => sortBy(name),
-    }));
+    const columns = (state.columns || Object.keys(state.rows[0])).map((name) => {
+      const mono = /id|vin|did|code|bus|module|request|ts|hex|raw|ftb|type/i.test(name);
+      return {
+        key: name, label: headerOf(name), mono,
+        num: /^(id|session_id)$/.test(name),
+        render: (row) => renderCell(name, row, mono),
+        sortable: true,
+        sorted: state.order === name ? state.dir : null,
+        onSort: () => sortBy(name),
+      };
+    });
     if (state.table === "samples") {
       columns.push({ key: "__chart", label: "", render: (row) => h("button.btn.btn--sm", {
         type: "button", text: "Chart",
@@ -171,19 +174,31 @@ export async function render(root, ctx) {
     }));
   }
 
-  function renderCell(name, row) {
+  // A database column is snake_case; the header shows words, with the acronyms
+  // the rest of the UI already uses (VIN, DID, DTC, FTB).
+  const ACRONYMS = new Set(["vin", "id", "did", "dtc", "ftb", "uds", "ecu", "gps", "url", "api"]);
+  function headerOf(name) {
+    return name.split("_").map((word) => (ACRONYMS.has(word) ? word.toUpperCase()
+      : word.charAt(0).toUpperCase() + word.slice(1))).join(" ");
+  }
+
+  function renderCell(name, row, mono) {
     const value = row[name];
     if (value === null || value === undefined) return h("span.sub", { text: "—" });
     if (BIG_COLUMNS.has(name)) {
       const text = String(value);
       return h("span", null, h("span.mono", { text: truncate(text, 60), title: text }), " ",
-        h("button.cellcopy", { type: "button", text: "⧉",
-          onClick: (event) => { event.stopPropagation(); navigator.clipboard?.writeText(text); } }));
+        h("button.cellcopy", { type: "button", title: "Copy", "aria-label": "Copy this value",
+          onClick: (event) => { event.stopPropagation(); navigator.clipboard?.writeText(text); } },
+          icon("copy", { size: 13 })));
     }
-    if (/^(started_at|ended_at|last_seen|ts)$/.test(name)) return h("span.mono", { text: dateTimeOf(value) });
+    // A timestamp reads as prose time, the same shape the dashboard shows.
+    if (/(^|_)(at|seen|ts)$/.test(name)) return h("span", { text: dateTimeOf(value) });
     if (/status/.test(name)) return pill(value, value);
-    if (typeof value === "string" && value.length > 60) return h("span.mono", { text: truncate(value, 60), title: value });
-    return h("span.mono", { text: String(value) });
+    if (typeof value === "string" && value.length > 60) {
+      return h("span.mono", { text: truncate(value, 60), title: value });
+    }
+    return mono ? h("span.mono", { text: String(value) }) : h("span", { text: String(value) });
   }
 
   function renderPager() {
@@ -191,12 +206,14 @@ export async function render(root, ctx) {
     const from = state.total ? state.offset + 1 : 0;
     const to = Math.min(state.offset + state.limit, state.total);
     pagerHolder.appendChild(h("span", { text: `${from}–${to} of ${state.total}` }));
-    pagerHolder.appendChild(h("button.btn.btn--sm", { type: "button", text: "← Prev",
-      disabled: state.offset <= 0 ? true : undefined,
-      onClick: () => { state.offset = Math.max(0, state.offset - state.limit); load(); } }));
-    pagerHolder.appendChild(h("button.btn.btn--sm", { type: "button", text: "Next →",
-      disabled: to >= state.total ? true : undefined,
-      onClick: () => { state.offset += state.limit; load(); } }));
+    pagerHolder.appendChild(h("button.btn.btn--sm", { type: "button", disabled: state.offset <= 0 ? true : undefined,
+      title: "Previous page", "aria-label": "Previous page",
+      onClick: () => { state.offset = Math.max(0, state.offset - state.limit); load(); } },
+      icon("chevron-left", { size: 13 }), h("span", { text: "Prev" })));
+    pagerHolder.appendChild(h("button.btn.btn--sm", { type: "button", disabled: to >= state.total ? true : undefined,
+      title: "Next page", "aria-label": "Next page",
+      onClick: () => { state.offset += state.limit; load(); } },
+      h("span", { text: "Next" }), icon("chevron-right", { size: 13 })));
   }
 
   /* ---------------------------------------------------------------- drawer */
@@ -209,7 +226,7 @@ export async function render(root, ctx) {
         h("dd", { text: truncate(String(value ?? "—"), 400) }),
       ])));
     if (state.table === "sessions") {
-      const holder = h("div", null, h("span.sub", { text: "loading children…" }));
+      const holder = h("div", null, loadingState("Loading children…"));
       content.appendChild(h("h3", { text: "Children" }));
       content.appendChild(holder);
       api.dbSession(row.id).then((payload) => {
@@ -218,24 +235,24 @@ export async function render(root, ctx) {
           holder.appendChild(h("div.sub", { text: `${name}: ${rows.length}` }));
           if (rows.length) holder.appendChild(h("pre.json", { text: JSON.stringify(rows.slice(0, 20), null, 2) }));
         }
-      }).catch((error) => { clear(holder); holder.appendChild(h("span.sub", { text: error.message })); });
+      }).catch((error) => { clear(holder); holder.appendChild(errorState(error)); });
     }
     if (state.table === "vehicles" && row.vin) {
-      const holder = h("div", null, h("span.sub", { text: "loading summary…" }));
+      const holder = h("div", null, loadingState("Loading summary…"));
       content.appendChild(h("h3", { text: "Summary" }));
       content.appendChild(holder);
       api.dbVehicleSummary(row.vin).then((payload) => {
         clear(holder);
         holder.appendChild(h("div.sub", { text: Object.entries(payload.counts || {}).map(([key, n]) => `${key}: ${n}`).join(" · ") }));
         holder.appendChild(h("pre.json", { text: JSON.stringify(payload.dtcs?.slice(0, 20) || [], null, 2) }));
-      }).catch((error) => { clear(holder); holder.appendChild(h("span.sub", { text: error.message })); });
+      }).catch((error) => { clear(holder); holder.appendChild(errorState(error)); });
     }
     content.appendChild(h("pre.json", { text: JSON.stringify(row, null, 2) }));
     drawer({ title: `${state.table} row #${row.id ?? ""}`, content });
   }
 
   async function chartRow(row) {
-    const holder = h("div", null, h("span.sub", { text: "loading series…" }));
+    const holder = h("div", null, loadingState("Loading the stored series…"));
     drawer({ title: `Series · ${row.module || "?"}:${row.did || "?"}`, content: holder });
     try {
       const payload = await api.dbSeries({ vin: row.vin, module: row.module, did: row.did, max_points: 2000 });
@@ -243,7 +260,7 @@ export async function render(root, ctx) {
       if (!series.length) { clear(holder); holder.appendChild(emptyState({ icon: "◉", title: "No numeric samples", hint: "This signal has no stored numbers to chart." })); return; }
       clear(holder);
       series.forEach((serie) => {
-        const wrap = h("div", { class: "mb-6" },
+        const wrap = h("div", { class: "mb-8" },
           h("div.eyebrow", { text: `${serie.name || serie.id}${serie.unit ? " (" + serie.unit + ")" : ""} · ${serie.raw_count} raw → ${serie.points.length} points${serie.downsampled ? " (lttb)" : ""}` }),
           h("div.legend"), h("div.chart-holder"));
         holder.appendChild(wrap);

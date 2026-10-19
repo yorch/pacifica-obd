@@ -4,10 +4,10 @@
 // send. The server holds one seed under a 30 s lease; the page never causes a
 // second seed request unless the operator turned on strict seed re-read.
 
-import { h, clear, mount, on } from "../dom.js";
+import { h, mount, on } from "../dom.js";
 import { api, ApiError } from "../api.js";
 import {
-  card, pill, banner, errorState, toast, dataTable, typedConfirm,
+  card, pill, banner, errorState, toast, dataTable, typedConfirm, field, keyValues, loadingState,
 } from "../components.js";
 
 const NUM = (value) => (value === null || value === undefined ? "—" : String(value));
@@ -44,7 +44,7 @@ export function render(root, ctx) {
       : "Read-only: explain and seed work; the send step is disabled on this server.", writesEnabled ? "warn" : "info"),
     card({ eyebrow: "Target", title: "Explain the algorithm choice (offline)", actions:
       h("button.btn.btn--sm", { type: "button", text: "Explain", onClick: explain }),
-      body: h("div", null, form(Object.values(fields)), hold.explain) }),
+      body: h("div.stack", null, form(Object.values(fields)), hold.explain) }),
     card({ eyebrow: "Read", title: "Read the seed (nothing is sent)", actions:
       h("button.btn.btn--sm", { type: "button", text: "Read seed", onClick: readSeed }),
       body: hold.seed }),
@@ -64,9 +64,7 @@ export function render(root, ctx) {
   }
 
   function input(id, label, placeholder, value, type = "text") {
-    const node = h("div.field", null,
-      h("label", { for: `sec-${id}`, text: label }),
-      h("input.mono", { id: `sec-${id}`, type, placeholder, value: value || "" }));
+    const node = field({ id: `sec-${id}`, label, value: value || "", placeholder, mono: true, type });
     return { id, node, get: () => node.querySelector("input").value.trim() };
   }
 
@@ -90,7 +88,7 @@ export function render(root, ctx) {
 
   /* ------------------------------------------------------------- explain */
   async function explain() {
-    note(hold.explain, h("span.sub", { text: "Explaining…" }));
+    note(hold.explain, loadingState("Explaining the algorithm choice…"));
     try {
       const body = target();
       delete body.bus;
@@ -105,9 +103,9 @@ export function render(root, ctx) {
     if (status === "resolved") {
       return h("div", null,
         pill("resolved", "ok"),
-        h("dl.kv", null, [
+        keyValues([
           ["ECU", info.ecu], ["Request ID", info.request_id], ["Algorithm", info.algorithm],
-        ].flatMap(([k, v]) => [h("dt", { text: k }), h("dd.mono", { text: NUM(v) })])));
+        ]));
     }
     const rows = (info.candidates || []).map((candidate) => ({
       algorithm: candidate.algorithm,
@@ -126,16 +124,16 @@ export function render(root, ctx) {
 
   /* ---------------------------------------------------------------- seed */
   async function readSeed() {
-    note(hold.seed, h("span.sub", { text: "Reading seed…" }));
+    note(hold.seed, loadingState("Reading the seed (nothing is sent)…"));
     try {
       const result = await api.securitySeed(target());
-      note(hold.seed, resultCard(result, "seed"));
+      note(hold.seed, resultCard(result));
     } catch (error) { note(hold.seed, errorState(error, { onRetry: readSeed })); }
   }
 
   /* ------------------------------------------------------------- preview */
   async function preview() {
-    note(hold.preview, h("span.sub", { text: "Reading the seed and computing the key…" }));
+    note(hold.preview, loadingState("Reading the seed and computing the key…"));
     try {
       const result = await api.securityPreview(target());
       note(hold.preview, previewCard(result));
@@ -148,12 +146,12 @@ export function render(root, ctx) {
       type: "button", text: "Confirm and send", disabled: !writesEnabled ? true : undefined,
       onClick: () => ask(result),
     });
-    return h("div", null,
+    return h("div.stack", null,
       pill(result.status, "warn"),
-      h("dl.kv", null, [
+      keyValues([
         ["Algorithm", result.algorithm], ["Seed", result.seed], ["Key", result.key],
-      ].flatMap(([k, v]) => [h("dt", { text: k }), h("dd.mono", { text: NUM(v) })])),
-      h("div.modal__request", null,
+      ]),
+      h("div.wirerequest", null,
         h("div.eyebrow", { text: "exact wire request (nothing sent yet)" }),
         h("code.mono.code-line", { text: result.request })),
       h("p.sub", { text: `Token expires in ${result.expires_in_s || 30}s; the seed is held, not re-read.` }),
@@ -174,7 +172,7 @@ export function render(root, ctx) {
   }
 
   async function send(result) {
-    note(hold.result, h("span.sub", { text: "Sending…" }));
+    note(hold.result, loadingState("Sending the reviewed key…"));
     try {
       const response = await api.securityUnlock({
         confirm_token: result.confirm_token, acknowledgement: result.module,
@@ -193,20 +191,21 @@ export function render(root, ctx) {
     const ok = result.unlocked === true;
     return h("div", null,
       pill(result.status, ok ? "ok" : "warn"),
-      h("dl.kv", null, [
+      keyValues([
         ["Module", result.module], ["Level", result.level], ["Unlocked", ok ? "yes" : "no"],
         ["Seed now", result.seed], ["Raw", result.raw],
         ["Strict re-read", result.re_read ? "yes" : "no"],
-      ].flatMap(([k, v]) => [h("dt", { text: k }), h("dd.mono", { text: NUM(v) })])),
+      ]),
       !ok && result.sent ? h("p.sub", { text: "The key was refused. The module is not left unlocked." }) : null);
   }
 
-  function resultCard(result, kind) {
+  // The seed-only card: no key was computed, so none is claimed.
+  function resultCard(result) {
     return h("div", null,
       pill(result.status, result.status === "ok" || result.status === "no_key_provider" ? "warn" : "crit"),
-      h("dl.kv", null, [
+      keyValues([
         ["Module", result.module], ["Seed", result.seed], ["Raw", result.raw],
         ["Note", "seed dumped only; no key was computed or sent"],
-      ].flatMap(([k, v]) => [h("dt", { text: k }), h("dd.mono", { text: NUM(v) })])));
+      ]));
   }
 }

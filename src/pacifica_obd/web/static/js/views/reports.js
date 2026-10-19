@@ -1,18 +1,18 @@
 // Reports (#/reports) — generate a dump from the vehicle or from a stored
 // session, preview/print/download it (json/xml/html/zip), and compare sessions.
 
-import { h, clear, mount, on, downloadBlob } from "../dom.js";
+import { h, clear, mount, downloadBlob } from "../dom.js";
 import { api, rawResponse } from "../api.js";
 import {
-  card, cardBody, pill, emptyState, errorState, toast, dataTable, field, select,
-  checkbox,
+  card, pill, emptyState, errorState, toast, dataTable, field, select,
+  checkbox, loadingState,
 } from "../components.js";
 import { dateTimeOf, timeOf } from "../format.js";
 
 export function render(root, ctx) {
   const state = { reports: [], sessions: [] };
 
-  const busField = select({ id: "rep-bus", label: "Bus", value: "both",
+  const busField = select({ id: "rep-bus", label: "Bus", value: "both", mono: true,
     options: [{ value: "both", label: "both" }, { value: "can-c", label: "can-c" }, { value: "can-ihs", label: "can-ihs" }] });
   const startField = field({ id: "rep-start", label: "Start ID", value: "700", mono: true });
   const endField = field({ id: "rep-end", label: "End ID", value: "7FF", mono: true });
@@ -27,14 +27,14 @@ export function render(root, ctx) {
     } }, h("span", { text: fmt }))));
 
   const generateButton = h("button.btn.btn--primary", { type: "button", text: "Generate from vehicle", onClick: generate });
-  const sessionField = select({ id: "rep-session", label: "Stored session", value: "", options: [{ value: "", label: "loading…" }] });
+  const sessionField = select({ id: "rep-session", label: "Stored session", value: "", mono: true, options: [{ value: "", label: "loading…" }] });
   const fromSessionButton = h("button.btn", { type: "button", text: "From stored session", onClick: fromSession });
 
   const listHolder = h("div", { id: "rep-list" });
   const previewHolder = h("div");
 
-  const compareA = select({ id: "cmp-a", label: "Session A", value: "", options: [] });
-  const compareB = select({ id: "cmp-b", label: "Session B", value: "", options: [] });
+  const compareA = select({ id: "cmp-a", label: "Session A", value: "", mono: true, options: [] });
+  const compareB = select({ id: "cmp-b", label: "Session B", value: "", mono: true, options: [] });
   const compareButton = h("button.btn", { type: "button", text: "Compare", onClick: compare });
   const compareHolder = h("div");
 
@@ -48,9 +48,11 @@ export function render(root, ctx) {
       h("div.row.row--spaced", formatRow, generateButton)) }),
     card({ eyebrow: "Generate", title: "From a stored session (no adapter)", body: h("div.row", null, sessionField, fromSessionButton) }),
     card({ eyebrow: "This session", title: "Generated reports", flush: true, body: listHolder }),
-    card({ eyebrow: "Preview", title: "Review report", body: previewHolder }),
-    card({ eyebrow: "Compare", title: "Structural diff of two sessions", body: h("div", null,
+    card({ eyebrow: "Preview", title: "Review report", body: previewHolder }),    card({ eyebrow: "Compare", title: "Structural diff of two sessions", body: h("div", null,
       h("div.row", null, compareA, compareB, compareButton), compareHolder) }));
+
+  previewHolder.appendChild(emptyState({ icon: "file", title: "No report to review",
+    hint: "Generate one from the vehicle or from a stored session, then press Preview." }));
 
   /* ------------------------------------------------------------------ list */
 
@@ -62,10 +64,9 @@ export function render(root, ctx) {
     } catch (error) { toast(error.message, "err", 0); }
   }
 
-  function renderList() {
-    clear(listHolder);
+  function renderList() {    clear(listHolder);
     if (!state.reports.length) {
-      listHolder.appendChild(emptyState({ icon: "⎙", title: "Nothing captured yet",
+      listHolder.appendChild(emptyState({ icon: "file", title: "No reports yet",
         hint: "Generate a report from the vehicle or from a stored session." }));
       return;
     }
@@ -96,7 +97,6 @@ export function render(root, ctx) {
       renderList();
     } catch (error) { toast(error.message, "err", 0); }
   }
-
   /* -------------------------------------------------------------- generate */
 
   async function generate() {
@@ -154,16 +154,13 @@ export function render(root, ctx) {
         rel: "noopener", text: "Open in a tab" }),
       h("button.btn.btn--sm", { type: "button", text: "Print / Save as PDF", onClick: () => printReport(row) })));
     previewHolder.appendChild(h("iframe", { title: `Report ${row.id}`,
-      src: reportDocumentUrl(row, "html"),
-      style: { width: "100%", height: "620px", border: "1px solid var(--border)",
-               borderRadius: "8px", background: "#fff" } }));
+      class: "report-frame", src: reportDocumentUrl(row, "html") }));
   }
 
   function printReport(row) {
     // window.print() on the report document itself, via a same-origin iframe.
-    const frame = h("iframe", { title: "print", src: reportDocumentUrl(row, "html"),
-      style: { position: "fixed", right: "0", bottom: "0", width: "1px", height: "1px",
-               opacity: "0", border: "0" } });
+    const frame = h("iframe", { title: "print", class: "report-frame report-frame--print",
+      src: reportDocumentUrl(row, "html") });
     frame.addEventListener("load", () => {
       try { frame.contentWindow.focus(); frame.contentWindow.print(); }
       catch (error) { toast(`could not print: ${error.message}`, "warn"); }
@@ -191,14 +188,13 @@ export function render(root, ctx) {
     try {
       const payload = await api.dbTable("sessions", { limit: 50, order: "id", dir: "desc" });
       state.sessions = payload.rows;
-      for (const [node, extra] of [[sessionField, false], [compareA, false], [compareB, false]]) {
+      for (const node of [sessionField, compareA, compareB]) {
         const select_ = node.querySelector("select");
         clear(select_);
         select_.appendChild(h("option", { value: "", text: payload.rows.length ? "— choose —" : "no sessions" }));
         for (const row of payload.rows) {
           select_.appendChild(h("option", { value: row.id, text: `#${row.id} · ${row.command} · ${timeOf(row.started_at)}` }));
         }
-        void extra;
       }
       if (payload.rows.length >= 2) {
         compareB.querySelector("select").value = String(payload.rows[0].id);
@@ -212,7 +208,7 @@ export function render(root, ctx) {
     const b = compareB.querySelector("select").value;
     if (!a || !b) { toast("choose two sessions", "warn"); return; }
     clear(compareHolder);
-    compareHolder.appendChild(h("span.sub", { text: "Comparing…" }));
+    compareHolder.appendChild(loadingState("Comparing two sessions…"));
     try {
       const diff = await api.reportCompare(Number(a), Number(b));
       clear(compareHolder);
@@ -242,8 +238,6 @@ export function render(root, ctx) {
       compareHolder.appendChild(errorState(error, { onRetry: compare }));
     }
   }
-
-  on(document.getElementById("rep-bus"), "change", () => {});
 
   refreshMeta();
   loadSessions();

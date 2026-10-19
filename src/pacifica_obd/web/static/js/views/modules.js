@@ -3,12 +3,11 @@
 
 import { h, clear, mount, on } from "../dom.js";
 import { api } from "../api.js";
-import { navigate } from "../router.js";
 import {
-  card, cardBody, pill, emptyState, errorState, toast, dataTable, field, select,
-  checkbox, progressBar, cellWithCopy, untrustedBadge,
+  card, pill, emptyState, errorState, toast, dataTable, field, select,
+  checkbox, progressBar, cellWithCopy, untrustedBadge, tonePill, feed, feedRow,
 } from "../components.js";
-import { escapeControls, statusClass, seriesColorValue } from "../format.js";
+import { escapeControls, statusClass } from "../format.js";
 
 export function render(root, ctx) {
   const timers = [];
@@ -18,14 +17,14 @@ export function render(root, ctx) {
     busy: false,
   };
 
-  const busField = select({ id: "disc-bus", label: "Bus", value: "can-c",
+  const busField = select({ id: "disc-bus", label: "Bus", value: "can-c", mono: true,
     options: [{ value: "can-c", label: "can-c (HS 500k)" }, { value: "can-ihs", label: "can-ihs (MS 125k)" }] });
   const startField = field({ id: "disc-start", label: "Start ID", value: "700", mono: true });
   const endField = field({ id: "disc-end", label: "End ID", value: "7FF", mono: true });
   const timeoutField = field({ id: "disc-timeout", label: "Timeout (ms)", value: "100", mono: true, type: "number", min: 1, max: 65535 });
   const identifyBox = checkbox({ id: "disc-identify", label: "Identify (VIN/part)" });
   const progress = progressBar();
-  const feed = h("div.feed", null, h("div.sub", { text: "No scan yet." }));
+  const feed_ = feed({ placeholder: "No scan yet." });
 
   const discoverButton = h("button.btn.btn--primary", { type: "button", text: "Discover", onClick: () => run("modules") });
   const dtcButton = h("button.btn", { type: "button", text: "All-module DTCs", onClick: () => run("dtc") });
@@ -34,9 +33,9 @@ export function render(root, ctx) {
   const cancelButton = h("button.btn.btn--danger.btn--sm", { type: "button", text: "Cancel", disabled: true, onClick: cancelActive });
 
   const filterText = field({ id: "mod-filter", label: "Filter", placeholder: "module, code, name…" });
-  const filterBus = select({ id: "mod-bus", label: "Bus", value: "",
+  const filterBus = select({ id: "mod-bus", label: "Bus", value: "", mono: true,
     options: [{ value: "", label: "all" }, { value: "can-c", label: "can-c" }, { value: "can-ihs", label: "can-ihs" }] });
-  const filterStatus = select({ id: "mod-status", label: "Status", value: "",
+  const filterStatus = select({ id: "mod-status", label: "Status", value: "", mono: true,
     options: [{ value: "", label: "any" }, { value: "ok", label: "ok" }, { value: "no_response", label: "no response" },
       { value: "negative", label: "negative" }, { value: "malformed", label: "malformed" }] });
   const filterDtc = checkbox({ id: "mod-hasdtc", label: "has DTC only" });
@@ -52,7 +51,7 @@ export function render(root, ctx) {
     h("div.row", null, busField, startField, endField, timeoutField, identifyBox),
     h("div.row.row--spaced", discoverButton, dtcButton, infoButton, scanButton, cancelButton),
     h("div.row--spaced", progress),
-    h("div.row--spaced", feed)) });
+    h("div.row--spaced", feed_)) });
 
   const filterCard = card({ eyebrow: "Filter", title: "Results", body: h("div.row", null,
     filterText, filterBus, filterStatus, filterDtc),
@@ -61,6 +60,8 @@ export function render(root, ctx) {
   const mapCard = card({ eyebrow: "Offline", title: "Module map (bundled dataset)",
     body: mapHolder,
     actions: h("button.btn.btn--sm", { type: "button", text: "Load map", onClick: loadMap }) });
+  mapHolder.appendChild(emptyState({ icon: "layers", title: "No module map loaded",
+    hint: "Press Load map to list the module addresses the bundled dataset knows." }));
 
   mount(root, head, formCard, filterCard, card({ eyebrow: "Tree", title: "Modules & codes", body: treeHolder }),
     mapCard, card({ eyebrow: "DTCs", title: "Flat list", flush: true, body: h("div", { id: "dtc-flat" }) }));
@@ -84,11 +85,7 @@ export function render(root, ctx) {
   }
 
   function log(text, status) {
-    feed.appendChild(h("div.feed__row", null,
-      h("span.feed__ts", { text: new Date().toLocaleTimeString([], { hour12: false }) }),
-      h("span", { text }),
-      status ? pill(status, status) : null));
-    feed.scrollTop = feed.scrollHeight;
+    feedRow(feed_, text, status);
   }
 
   function pollProgress() {
@@ -134,7 +131,7 @@ export function render(root, ctx) {
       renderTree();
     } catch (error) {
       log(`${error.code || "error"}: ${error.message}`);
-      feed.appendChild(errorState(error, { onRetry: () => run(which) }));
+      feed_.appendChild(errorState(error, { onRetry: () => run(which) }));
       toast(error.message, "err", 0);
     } finally {
       stopPolling();
@@ -229,7 +226,7 @@ export function render(root, ctx) {
         h("span.mono", { text: `${row.request_id} → ${row.response_id || "?"}` }),
         " ", h("span.sub", { text: row.kind || "module" }),
         " ", row.status ? pill(row.status, row.status) : null,
-        " ", h("span", { class: `pill ${dtcCount ? "pill--crit" : "pill--ok"}`, text: `${dtcCount} DTC` })));
+        " ", tonePill(`${dtcCount} DTC`, dtcCount ? "crit" : "ok")));
     const body = h("div.module-body");
     if (row.dtcs?.length) {
       body.appendChild(dataTable({
@@ -239,7 +236,7 @@ export function render(root, ctx) {
           { key: "description", label: "Description", render: (dtc) => dtc.description || h("span.sub", { text: "no dataset text" }) },
           { key: "status", label: "Status", render: (dtc) => pill(dtc.status, dtc.status) },
           { key: "flags", label: "Flags", render: (dtc) => h("span", null,
-            (dtc.flags || []).map((flag) => h("span", { class: `pill ${statusClass(flag)}`, text: flag }))) },
+            (dtc.flags || []).map((flag) => pill(flag))) },
           { key: "action", label: "AI", render: (dtc) => h("a.pill.pill--ghost", {
             title: "ask the read-only assistant", text: "explain",
             href: `#/assistant?ask=${encodeURIComponent(`Explain DTC ${dtc.code} in one or two sentences.`)}` }) },

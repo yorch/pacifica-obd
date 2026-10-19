@@ -22,43 +22,64 @@
     --info-fg: #000000; --info-bg: #ffffff; --info-line: #999999;
     --idle-fg: #000000; --idle-bg: #ffffff; --idle-line: #999999;
     --untested-fg: #000000; --untested-bg: #ffffff; --untested-line: #999999;
+    /* the "solid" ramp is the chart/verdict mark colour: keep print greyscale
+       rather than printing a dark-theme hue on white paper. */
+    --ok-solid: #333333; --warn-solid: #666666; --danger-solid: #000000;
+    --info-solid: #555555; --idle-solid: #888888; --untested-solid: #666666;
     --shadow-xs: none; --shadow-sm: none; --shadow: none; --shadow-md: none;
     --shadow-lg: none; --focus-ring: none;
     --gauge-track: #dddddd; --gauge-tick: #666666; --gauge-tick-major: #333333;
     --gauge-value: #000000; --gauge-redline: #999999;
+    --gauge-crit: #000000; --gauge-stale: #666666;
     --gauge-warn-zone: #eeeeee; --gauge-redline-zone: #dddddd;
     --chart-grid: #dddddd; --chart-axis: #333333;
+    /* the semantic set that only exists for the dark theme would otherwise
+       print with its on-screen (dark-theme) values on white paper: re-point
+       every one of them, including the series ramp the charts are drawn from. */
+    --inverse: #ffffff; --text-inverse: #000000; --on-danger: #ffffff;
+    --on-accent: #ffffff;
+    --shade: #000000; --paper: #ffffff;
+    --signal: #000000; --chart-crosshair: #666666;
+    --chart-band: rgba(0, 0, 0, .08);
+    --gauge-stale: #666666;
+    --selection: #dddddd; --focus-color: #000000;
+    --series-1: #000000; --series-2: #333333; --series-3: #1a1a1a;
+    --series-4: #444444; --series-5: #555555; --series-6: #222222;
+    --series-7: #666666; --series-8: #777777;
   }
-  html, body { background: #fff; color: #000; font-size: 11pt; }
+  html, body { background: var(--panel); color: var(--text); font-size: 11pt; }
   .rail, .topbar, .toasts, .card__actions, .toolbar, .pager, .view__head .btn,
   .view__head .row, .recording, .legend, .skip-link, .cellcopy, .tabs,
-  .drawer-backdrop, .modal-backdrop, .progress { display: none !important; }
+  .drawer-backdrop, .modal-backdrop, .progress, .loading .spinner { display: none !important; }
   .shell { display: block; }
-  .view, .view--prose { padding: 0; max-width: none; }
+  /* print is a stack of blocks: the screen's flex gap would double the card
+     margin below (24px gap + 12pt margin). */
+  .view, .view--prose { display: block; padding: 0; max-width: none; }
   .banners { padding: 0 0 10pt; }
   .card {
-    break-inside: avoid; border: 1px solid #ccc; box-shadow: none;
+    break-inside: avoid; border: 1px solid var(--border); box-shadow: none;
     margin: 0 0 12pt; border-radius: 0;
   }
-  .card__head { background: #fff; border-bottom: 1px solid #ccc; min-height: 0; }
+  .card__head { background: var(--panel); border-bottom: 1px solid var(--border); min-height: 0; }
   .grid--kpi { display: flex; flex-wrap: wrap; gap: 10pt; border: 0; }
-  .kpi { flex: 1 1 140pt; box-shadow: none; border: 1px solid #ccc; padding: 6pt; }
-  .kpi__label, .eyebrow { color: #000; }
+  .kpi { flex: 1 1 140pt; box-shadow: none; border: 1px solid var(--border); padding: 6pt; }
+  .kpi__label, .eyebrow { color: var(--text); }
   .pill, .untrusted, .posture, .tiernote {
-    background: #fff !important; color: #000 !important; border: 1px solid #999;
-    font-weight: 400;
+    background: var(--panel) !important; color: var(--text) !important;
+    border: 1px solid var(--border-strong); font-weight: 400;
   }
   .pill::before { content: "["; }
   .pill::after { content: "]"; }
   .pill .icon, .untrusted .icon, .posture .icon, .banner .icon { display: none; }
   .pill::before, .pill::after { font-weight: 400; }
-  .verdict { border: 1px solid #999; background: #fff; }
-  .verdict__word { color: #000; }
+  .verdict { border: 1px solid var(--border-strong); background: var(--panel); }
+  .verdict__word { color: var(--text); }
   table.data { font-size: 9.5pt; }
   table.data thead th {
-    position: static; background: #fff; color: #000; border-bottom: 1pt solid #000;
+    position: static; background: var(--panel); color: var(--text);
+    border-bottom: 1pt solid var(--text);
   }
-  table.data tbody td { border-bottom: 1px solid #ddd; height: auto; }
+  table.data tbody td { border-bottom: 1px solid var(--border-subtle); height: auto; }
   table.data tr { break-inside: avoid; }
   table.data tr.row--crit td:first-child,
   table.data tr.row--warn td:first-child,
@@ -66,12 +87,13 @@
   .table-wrap { max-height: none; overflow: visible; }
   .chart { break-inside: avoid; }
   .chart-holder { break-inside: avoid; }
-  a { color: #000; text-decoration: none; }
+  a { color: var(--text); text-decoration: none; }
   a[href]::after { content: ""; }
-  .banner { border: 1px solid #999; background: #fff; color: #000; break-inside: avoid; }
-  .feed { max-height: none; border: 1px solid #ccc; background: #fff; }
-  pre.json, pre.code-block, code.code-line, .dialog__wire {
-    background: #fff; border: 1px solid #ccc; color: #000; max-height: none;
+  .banner { border: 1px solid var(--border-strong); background: var(--panel); color: var(--text); break-inside: avoid; }
+  .feed { max-height: none; border: 1px solid var(--border); background: var(--panel); }
+  pre.json, pre.code-block, code.code-line, .dialog__wire, .wirerequest {
+    background: var(--panel); border: 1px solid var(--border); color: var(--text);
+    max-height: none;
   }
   .empty { padding: 8pt; }
   .empty__icon { display: none; }

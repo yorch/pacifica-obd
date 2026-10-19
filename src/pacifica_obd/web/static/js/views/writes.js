@@ -7,7 +7,7 @@
 import { h, mount } from "../dom.js";
 import { api, ApiError } from "../api.js";
 import {
-  card, pill, banner, errorState, toast, typedConfirm,
+  card, pill, banner, errorState, toast, typedConfirm, emptyState, keyValues, loadingState, field, select,
 } from "../components.js";
 
 const SGW = "The Security Gateway usually blocks writes on 2018+ vehicles. "
@@ -26,56 +26,69 @@ export function render(root, ctx) {
   };
 
   const write = {
-    module: field("w-module", "Module request ID", "744", params.get("module") || "744"),
-    did: field("w-did", "DID (4 hex)", "F190", params.get("did") || "F190"),
-    data: field("w-data", "Data (even-length hex)", "01", params.get("data") || "01"),
+    module: field_("w-module", "Module request ID", "744", params.get("module") || "744"),
+    did: field_("w-did", "DID (4 hex)", "F190", params.get("did") || "F190"),
+    data: field_("w-data", "Data (even-length hex)", "01", params.get("data") || "01"),
   };
   const routine = {
-    module: field("r-module", "Module request ID", "744", "744"),
-    rid: field("r-rid", "Routine ID (4 hex)", "0203", "0203"),
+    module: field_("r-module", "Module request ID", "744", "744"),
+    rid: field_("r-rid", "Routine ID (4 hex)", "0203", "0203"),
     sub: selectField("r-sub", "Sub-function", [
       ["1", "1 start"], ["2", "2 stop"], ["3", "3 request results"], ["0", "0 (unsigned)"]], "1"),
-    data: field("r-data", "Data (optional hex)", "", ""),
+    data: field_("r-data", "Data (optional hex)", "", ""),
   };
+
+  const writeCard = card({ eyebrow: "Service 2E", title: "Write data identifier", actions:
+    h("button.btn.btn--sm", { type: "button", text: "Preview", onClick: previewWrite }),
+    body: h("div.stack", null, h("div.grid.grid--form", null,
+      [write.module.node, write.did.node, write.data.node]),
+    holders.writePreview, holders.writeResult) });
+
+  const routineCard = card({ eyebrow: "Service 31", title: "Routine control", actions:
+    h("button.btn.btn--sm", { type: "button", text: "Preview", onClick: previewRoutine }),
+    body: h("div.stack", null, h("div.grid.grid--form", null,
+      [routine.module.node, routine.rid.node, routine.sub.node, routine.data.node]),
+    holders.routinePreview, holders.routineResult) });
 
   mount(root,
     h("div.view__head", null,
       h("div", null, h("h1", { text: "Guarded writes" }),
         h("div.sub", { text: "0x2E write-data-by-identifier and 0x31 routine-control. Each is previewed, then confirmed by typing the module id." }))),
     banner(writesEnabled ? `Write mode. ${SGW}`
-      : "Read-only: the write routes are not registered on this server. Restart with --allow-writes to enable them.",
-      writesEnabled ? "warn" : "info"),
-    card({ eyebrow: "0x2E", title: "Write data identifier", actions:
-      h("button.btn.btn--sm", { type: "button", text: "Preview", onClick: previewWrite }),
-      body: h("div", null, form([write.module.node, write.did.node, write.data.node]),
-        holders.writePreview, holders.writeResult) }),
-    card({ eyebrow: "0x31", title: "Routine control", actions:
-      h("button.btn.btn--sm", { type: "button", text: "Preview", onClick: previewRoutine }),
-      body: h("div", null, form([routine.module.node, routine.rid.node, routine.sub.node,
-        routine.data.node]), holders.routinePreview, holders.routineResult) }));
+      : "Read-only: the write routes are not registered on this server.",
+      writesEnabled ? "warn" : "info"));
 
-  if (params.get("auto") === "1") previewWrite();
-  if (params.get("auto") === "routine") previewRoutine();
+  // In read-only mode the routes do not exist, so the screen shows a refusal
+  // rather than two forms whose Preview button would only ever 404.
+  if (writesEnabled) {
+    root.appendChild(writeCard);
+    root.appendChild(routineCard);
+    if (params.get("auto") === "1") previewWrite();
+    if (params.get("auto") === "routine") previewRoutine();
+  } else {
+    root.appendChild(card({
+      eyebrow: "Writes", title: "Not available on this server",
+      body: emptyState({
+        icon: "ban",
+        hint: "Restart the server with --allow-writes to register 0x2E and 0x31. Every write then needs a typed confirmation, and the Security Gateway may still refuse it.",
+      }),
+    }));
+  }
 
   return { dispose() {}, resize() {} };
 
-  function field(id, label, placeholder, value) {
-    const node = h("div.field", null, h("label", { for: id, text: label }),
-      h("input.mono", { id, type: "text", placeholder, value: value || "" }));
+  function field_(id, label, placeholder, value) {
+    const node = field({ id, label, value: value || "", placeholder, mono: true });
     return { node, get: () => node.querySelector("input").value.trim() };
   }
 
   function selectField(id, label, options, value) {
-    const node = h("div.field", null, h("label", { for: id, text: label }),
-      h("select", { id }, options.map(([optValue, optLabel]) =>
-        h("option", { value: optValue, text: optLabel, selected: optValue === value ? true : undefined }))));
+    const node = select({ id, label, value, options: options.map(([optValue, optLabel]) => ({ value: optValue, label: optLabel })) });
     return { node, get: () => node.querySelector("select").value };
   }
 
-  function form(nodes) { return h("div.grid.grid--form", null, nodes); }
-
   async function previewWrite() {
-    mount(holders.writePreview, h("span.sub", { text: "Previewing…" }));
+    mount(holders.writePreview, loadingState("Previewing the write (nothing is written)…"));
     try {
       const body = {
         module: write.module.get(), did: write.did.get(), data: write.data.get(),
@@ -90,7 +103,7 @@ export function render(root, ctx) {
   }
 
   async function previewRoutine() {
-    mount(holders.routinePreview, h("span.sub", { text: "Previewing…" }));
+    mount(holders.routinePreview, loadingState("Previewing the routine…"));
     try {
       const preview = await api.routinePreview({
         module: routine.module.get(), rid: routine.rid.get(),
@@ -104,17 +117,14 @@ export function render(root, ctx) {
 
   function previewCard(preview, onConfirm) {
     const current = preview.current
-      ? h("div", null, h("span.sub", { text: "current value" }),
+      ? h("div", null, h("div.eyebrow", { text: "current value" }),
         h("code.mono.code-line", { text: preview.current }))
       : h("p.sub", { text: "The current value is not readable; record it by other means before writing." });
-    return h("div", null,
+    return h("div.stack", null,
       pill(preview.service || "preview", "warn"),
-      h("div.modal__request", null, h("div.eyebrow", { text: "exact wire request" }),
+      h("div.wirerequest", null, h("div.eyebrow", { text: "exact wire request" }),
         h("code.mono.code-line", { text: preview.request })),
-      h("dl.kv", null, [["Module", preview.module], ["Bus", preview.bus],
-        ["Response", preview.response_id]]
-        .flatMap(([key, value]) => [h("dt", { text: key }),
-                                    h("dd.mono", { text: String(value ?? "—") })])),
+      keyValues([["Module", preview.module], ["Bus", preview.bus], ["Response", preview.response_id]]),
       current,
       h("p.sub", { text: `Token expires in ${preview.expires_in_s || 120}s.` }),
       h("button.btn.btn--danger", { type: "button", text: "Confirm and send",
@@ -140,34 +150,32 @@ export function render(root, ctx) {
   }
 
   async function runWrite(preview) {
-    mount(holders.writeResult, h("span.sub", { text: "Writing…" }));
+    mount(holders.writeResult, loadingState("Writing the value…"));
     try {
       const result = await api.writeDidConfirm({
         confirm_token: preview.confirm_token, acknowledgement: preview.module,
       });
-      mount(holders.writeResult, resultCard("Write DID result", result));
+      mount(holders.writeResult, resultCard(result));
       toast(`Write: ${result.status}`, result.status === "ok" ? "ok" : "warn");
     } catch (error) { fail(holders.writeResult, error); }
   }
 
   async function runRoutine(preview) {
-    mount(holders.routineResult, h("span.sub", { text: "Running…" }));
+    mount(holders.routineResult, loadingState("Running the routine…"));
     try {
       const result = await api.routineConfirm({
         confirm_token: preview.confirm_token, acknowledgement: preview.module,
       });
-      mount(holders.routineResult, resultCard("Routine result", result));
+      mount(holders.routineResult, resultCard(result));
       toast(`Routine: ${result.status}`, result.status === "ok" ? "ok" : "warn");
     } catch (error) { fail(holders.routineResult, error); }
   }
 
-  function resultCard(title, result) {
+  function resultCard(result) {
     return h("div", null,
       pill(result.status, result.status === "ok" ? "ok" : "crit"),
-      h("dl.kv", null, [["Module", result.module], ["Bus", result.bus],
-        ["Request", result.request], ["Raw", result.raw]]
-        .flatMap(([key, value]) => [h("dt", { text: key }),
-                                    h("dd.mono", { text: String(value ?? "—") })])),
+      keyValues([["Module", result.module], ["Bus", result.bus],
+        ["Request", result.request], ["Raw", result.raw]]),
       h("p.sub", { text: "The outcome was written to the local audit log." }));
   }
 

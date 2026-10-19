@@ -3,21 +3,20 @@
 
 import { h, clear, mount } from "../dom.js";
 import { api } from "../api.js";
-import { navigate } from "../router.js";
-import { card, pill, emptyState, errorState, toast, field, select, progressBar } from "../components.js";
+import { card, pill, emptyState, errorState, toast, field, select, progressBar, banner, tonePill, feed, feedRow } from "../components.js";
 import { dateTimeOf } from "../format.js";
 
 export function render(root, ctx) {
-  const state = { result: null, busy: false };
+  const state = { result: null, busy: false, startedAt: null };
 
-  const busField = select({ id: "cap-bus", label: "Bus", value: "both",
+  const busField = select({ id: "cap-bus", label: "Bus", value: "both", mono: true,
     options: [{ value: "both", label: "both" }, { value: "can-c", label: "can-c" }, { value: "can-ihs", label: "can-ihs" }] });
   const startField = field({ id: "cap-start", label: "Start ID", value: "700", mono: true });
   const endField = field({ id: "cap-end", label: "End ID", value: "7FF", mono: true });
   const timeoutField = field({ id: "cap-timeout", label: "Timeout (ms)", value: "100", mono: true, type: "number" });
-  const vinField = field({ id: "cap-vin", label: "VIN tag (optional)", mono: true, placeholder: "attach stored rows to this VIN" });
+  const vinField = field({ id: "cap-vin", label: "VIN tag (optional)", mono: true, placeholder: "optional" });
   const progress = progressBar();
-  const feed = h("div.feed", null, h("div.sub", { text: "No capture yet." }));
+  const feed_ = feed({ placeholder: "No capture yet." });
   const resultHolder = h("div");
 
   const runButton = h("button.btn.btn--primary", { type: "button", text: "Start capture", onClick: run });
@@ -32,14 +31,11 @@ export function render(root, ctx) {
       h("div.row", null, busField, startField, endField, timeoutField, vinField),
       h("div.row.row--spaced", runButton, cancelButton),
       h("div.row--spaced", progress),
-      h("div.row--spaced", feed)) }),
+      h("div.row--spaced", feed_)) }),
     card({ eyebrow: "Result", title: "Summary", body: resultHolder }));
 
   function log(text, status) {
-    feed.appendChild(h("div.feed__row", null,
-      h("span.feed__ts", { text: new Date().toLocaleTimeString([], { hour12: false }) }),
-      h("span", { text }), status ? pill(status, status) : null));
-    feed.scrollTop = feed.scrollHeight;
+    feedRow(feed_, text, status);
   }
 
   async function cancelActive() {
@@ -51,6 +47,7 @@ export function render(root, ctx) {
   async function run() {
     if (state.busy) return;
     state.busy = true;
+    state.startedAt = new Date().toISOString();
     runButton.disabled = true;
     cancelButton.disabled = false;
     const tick = setInterval(async () => {
@@ -79,7 +76,7 @@ export function render(root, ctx) {
       toast(result.aborted ? `Partial capture: ${result.aborted}` : "Capture complete", result.aborted ? "warn" : "ok");
     } catch (error) {
       log(`${error.code || "error"}: ${error.message}`);
-      feed.appendChild(errorState(error, { onRetry: run }));
+      feed_.appendChild(errorState(error, { onRetry: run }));
       toast(error.message, "err", 0);
     } finally {
       clearInterval(tick);
@@ -99,17 +96,17 @@ export function render(root, ctx) {
       return;
     }
     const dtcs = (result.dtcs || []).reduce((sum, item) => sum + (item.dtcs || []).length, 0);
-    if (result.aborted) {
-      resultHolder.appendChild(h("div.banner.banner--warn", { class: "mb-5" },
-        h("span", { text: `Partial capture — the adapter stopped mid-run: ${result.aborted}` })));
-    }
-    resultHolder.appendChild(h("div.row", null,
-      h("span", { class: "pill pill--info", text: `${result.modules.length} modules` }),
-      h("span", { class: `pill ${dtcs ? "pill--crit" : "pill--ok"}`, text: `${dtcs} DTCs` }),
-      h("span", { class: "pill pill--idle", text: `${result.readings.length} readings` }),
-      result.vin ? h("span.mono", { text: result.vin }) : null,
-      result.powertrain ? pill(result.powertrain, "ok") : null,
-      h("span.sub", { text: dateTimeOf(new Date().toISOString()) })));
+    resultHolder.appendChild(h("div.stack", null,
+      result.aborted
+        ? banner(`Partial capture — the adapter stopped mid-run: ${result.aborted}`, "warn")
+        : null,
+      h("div.row", null,
+        tonePill(`${result.modules.length} modules`, "info"),
+        tonePill(`${dtcs} DTCs`, dtcs ? "crit" : "ok"),
+        tonePill(`${result.readings.length} readings`, "idle"),
+        result.vin ? h("span.mono", { text: result.vin }) : null,
+        result.powertrain ? pill(result.powertrain, "ok") : null,
+        h("span.sub", { text: `captured ${dateTimeOf(state.startedAt || new Date().toISOString())}` }))));
     resultHolder.appendChild(h("div.row.row--spaced",
       h("a.btn.btn--sm", { href: "#/db?table=dtcs", text: "Open DTCs in the database" }),
       h("a.btn.btn--sm", { href: "#/reports", text: "Build a report" }),

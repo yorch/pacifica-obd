@@ -7,7 +7,7 @@
 import { h, clear, mount, on } from "../dom.js";
 import { api, post, ApiError } from "../api.js";
 import { postStream } from "../stream.js";
-import { card, pill, banner, errorState, toast, modal, untrustedBadge, emptyState } from "../components.js";
+import { card, pill, banner, toast, modal, untrustedBadge, emptyState, keyValues, checkbox } from "../components.js";
 
 const SUGGESTED = [
   ["Pre-trip health check", "pretrip"],
@@ -44,14 +44,17 @@ export function render(root, ctx) {
         stopButton = h("button.btn.btn--sm.btn--danger", { type: "button", text: "Stop", disabled: true, onClick: stop }),
         h("button.btn.btn--sm", { type: "button", text: "New", onClick: reset })),
       body: h("div", null, transcript) }),
-    h("div.grid.grid--two", null,
+    h("div.grid.grid--2", null,
       card({ eyebrow: "Cost", title: "Token meter", body: meter }),
       card({ eyebrow: "Tools", title: "Activity (read-only)", body: timeline })),
     card({ eyebrow: "Start", title: "Suggested starts",
-      body: h("div.row", null, SUGGESTED.map(([label, task]) =>
-        h("button.btn.btn--sm.btn--ghost", { type: "button", text: label,
+      body: h("div.chips", null, SUGGESTED.map(([label, task]) =>
+        h("button.chip", { type: "button", text: label,
           onClick: () => send("", task) }))) }),
     composer());
+
+  timeline.appendChild(emptyState({ icon: "sparkles", title: "No tool calls yet",
+    hint: "Turn on the bounded tool loop and ask a question; every read-only call is listed here." }));
 
   loadChips();
   renderMeter(null);
@@ -66,12 +69,12 @@ export function render(root, ctx) {
 
   function composer() {
     const input = h("textarea.composer__input", { rows: 3, placeholder: "Ask a question about the codes, a module, a DID or your stored sessions…" });
-    const toolsToggle = h("input", { type: "checkbox" });
-    return card({ eyebrow: "Prompt", title: "Message", body: h("div", null,
+    const toolsBox = checkbox({ id: "assistant-tools", flush: true,
+      label: "Use the bounded tool loop (opt-in; read-only tools)" });
+    const toolsToggle = toolsBox.querySelector("input");
+    return card({ eyebrow: "Prompt", title: "Message", body: h("div.stack", null,
       input,
-      h("div.row.row--between", null,
-        h("label.field.field--check.field--check--flush", null, toolsToggle,
-          h("span", { text: "Use the bounded tool loop (opt-in; read-only tools)" })),
+      h("div.row.row--between", null, toolsBox,
         h("button.btn.btn--primary", { type: "button", text: "Send", onClick: () => send(input.value, null, toolsToggle.checked) })),
       h("p.sub", { text: "Vehicle data is fenced as untrusted before it reaches any model." })) });
   }
@@ -95,9 +98,9 @@ export function render(root, ctx) {
         config.redact_vin ? "VIN redacted" : "VIN visible",
         config.persist_conversations ? "history saved" : "history off",
       ];
-      for (const text of chips) chipRow.appendChild(h("span.pill.pill--idle", { text }));
+      for (const text of chips) chipRow.appendChild(pill(text, "idle"));
     } catch {
-      chipRow.appendChild(h("span.pill.pill--idle", { text: "no provider configured" }));
+      chipRow.appendChild(pill("no provider configured", "idle"));
     }
   }
 
@@ -193,14 +196,17 @@ export function render(root, ctx) {
 
   function renderMeter(usage) {
     clear(meter);
-    if (!usage) { meter.appendChild(h("span.sub", { text: "No usage yet." })); return; }
-    meter.appendChild(h("dl.kv", null, [
+    if (!usage) {
+      mount(meter, emptyState({ icon: "gauge", title: "No usage yet",
+        hint: "Token counts and an estimated cost appear after the first answer." }));
+      return;
+    }
+    meter.appendChild(keyValues([
       ["Input tokens", usage.input_tokens], ["Output tokens", usage.output_tokens],
       ["Total", usage.total_tokens],
       ["Est. USD", typeof usage.usd_estimate === "number" ? usage.usd_estimate.toFixed(4) : "—"],
       ["Requests", usage.requests],
-    ].flatMap(([key, value]) => [h("dt", { text: key }),
-                                 h("dd.mono", { text: String(value ?? "—") })])));
+    ]));
     meter.appendChild(h("p.sub", { text: "An estimate, not a bill. Local models are free." }));
   }
 
@@ -238,12 +244,12 @@ export function render(root, ctx) {
     try {
       const preview = await api.aiWhatWillBeSent("(next message)");
       const body = h("div", null,
-        h("dl.kv", null, [["Provider", preview.provider_label || preview.provider],
+        keyValues([
+          ["Provider", preview.provider_label || preview.provider],
           ["Model", preview.model], ["Local", preview.local ? "yes" : "no"],
           ["VIN redaction", preview.redact_vin ? "on" : "off"],
-          ["Remote bus data", preview.send_bus_data_to_remote ? "allowed" : "off"]]
-          .flatMap(([key, value]) => [h("dt", { text: key }),
-                                      h("dd", { text: String(value ?? "—") })])),
+          ["Remote bus data", preview.send_bus_data_to_remote ? "allowed" : "off"],
+        ], { sans: true }),
         h("div.eyebrow", { text: "system prompt" }),
         h("pre.code-block", { text: preview.system }),
         h("div.eyebrow", { text: "user message" }),

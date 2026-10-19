@@ -982,6 +982,7 @@ Legend: **R** = read-only, **W** = write/guarded, **S** = streaming.
 | GET/PUT | `/api/ai/config` | provider/model/base_url/toggles/caps |
 | POST | `/api/ai/keys` | set a key (write-only; returns a hint) |
 | DELETE | `/api/ai/keys/{provider}` | remove |
+| POST | `/api/ai/test` | validate + probe a configuration, no chat |
 | POST | `/api/ai/chat` | **SSE** token+tool stream |
 | GET | `/api/ai/conversations` | list stored conversations |
 | GET | `/api/ai/conversations/{id}` | one conversation |
@@ -1197,6 +1198,11 @@ Two small, high-value changes the two design cross-checks both raised:
 ---
 
 ## 5. AI layer specification
+
+!!! note "Operator setup guide"
+    The user-facing setup flow, the provider-preset table and the environment
+    variables are documented in [AI assistant setup](ai-setup.md). This section
+    is the internal design.
 
 ### 5.1 Principles
 
@@ -2776,3 +2782,433 @@ A second pass reviewed the components against the direction and found:
   recovered). The other 13 routes are unchanged.
 - The pre-existing `?auto=…`, `?replay=…`, `?start=1` deep links and the
   `?collect=1` screenshot drain are unchanged.
+
+---
+
+# Appendix: the 2026 consistency audit (second pass)
+
+This appendix records a **UI/UX consistency pass** over
+`src/pacifica_obd/web/static/` and adds one test. It follows the redesign in the
+previous appendix and does not redesign anything: same tokens, same components,
+same density, same "red is earned" / "cyan means live" semantics. Where a screen
+had drifted it was brought back to the shared primitives rather than given new
+one-off styles.
+
+Scope and invariants, unchanged:
+
+- **No Python file under `src/pacifica_obd/` was touched.** The one new file is
+  `tests/test_design_consistency.py`.
+- `dom.js` / `api.js` / `stream.js` / `router.js` contracts are untouched, as are
+  every element id the JS reads, the read-only/writes posture logic, the
+  raw-console tiers, the typed-confirm semantics and the `?auto=…`/`?replay=…`/
+  `?start=1`/`?collect=1` deep links.
+- `views/raw.js`, `views/reports.js` and `views/modules.js` received
+  consistency-only edits that keep their behaviour.
+- Build-free is preserved: vanilla ES modules, hand-written CSS, the vendored
+  uPlot, no Node, no bundler, no CDN, no new dependency, no new vendor name in a
+  shipped string.
+
+## 1. Method
+
+1. **Capture.** A demo server (`--demo --allow-writes`) plus headless Chrome
+   captured all 14 routes in dark and light at 1600×1100, `#/` and `#/live` at
+   520 px and 820 px, and several states (the typed-confirm dialog, chart mode, a
+   read-only server). Theme is pinned deterministically with the app's own
+   deep-link parameter (`#/route?theme=light` → `setTheme(choice, persist=false)`),
+   so no `localStorage` seeding is needed. The dashboard's canonical route is
+   `#/`; `#/dashboard` was found to be a 404 during the audit and is now an alias.
+2. **Review.** Devin CLI with `claude-opus-5-5-high` read every source file and 25
+   of the screenshots and returned a ranked inconsistency list and a top-10 fix
+   list (§3, §4). A second, narrower call sanity-checked the fix plan against the
+   retaken screenshots (§9).
+3. **Implementation.** §5.
+4. **Mechanical proof.** `tests/test_design_consistency.py` enumerates five
+   invariants and fails loudly with `file:line` (§7).
+5. **Adversarial pass.** `codex exec -m gpt-6.1-sol -s read-only` over the CSS,
+   components and views (§8).
+
+## 2. What the screenshots showed
+
+The three most visible drifts were not in any single view:
+
+- **Cards touched.** `.card:last-child { margin-bottom: 0 }` meant every card that
+  was the only child of its holder lost its margin, so on battery, assistant,
+  security, writes and raw the panels were welded together edge to edge, and two
+  cards side by side in a `.grid` ended at different heights.
+- **Column bodies had no rhythm.** A body built as a bare `div` gave form fields
+  0 px between them (`Live data`'s "Filter values" sat on top of the row above);
+  `.row--spaced`/`p`/`ul` inside a `.stack` added their own margin on top of the
+  flex gap (double gaps); and a checkbox without `flex: none` shrank when its
+  label wrapped.
+- **Six screens opened blank**, and `dashboard.js` flashed a false "No local
+  database found" while it was still loading. A "Loading…" string was the only
+  loading treatment, and it was spelled differently in five files.
+
+Two functional-looking bugs were also found and fixed: `#/dashboard` was not a
+route, and a gauge with no reading drew a **phantom value arc** from its scale
+minimum up to zero (`Number(null) === 0`) on every instrument whose minimum is
+below zero — visible on COOLANT_TEMP.
+
+## 3. Devin/Opus 5.5: ranked inconsistencies (verbatim, abridged)
+
+1. **BLOCKER — audit coverage.** `dark-dashboard.png`, `light-dashboard.png` and
+   `dark-dashboard-820.png` were all the "Not found" page: the capture script used
+   `#/dashboard` but the dashboard route is `#/`. *Fixed: retaken at `#/`, and
+   `#/dashboard` is now an alias.*
+2. **MAJOR — spacing collapses.** `app.css:509-511` (`card:last-child`), `app.css:530`
+   (`.grid` with no bottom margin). Affects battery, assistant, dashboard, security,
+   writes, raw.
+3. **MAJOR — phantom gauge arc.** `gaugeRadial`'s `frac()` returns `Number(null) === 0`
+   for an absent reading, so COOLANT_TEMP draws a grey arc from −40 to 0 with no data.
+4. **MAJOR — the bookmark colour equals series 5.** `--signal: #e5bd45` is the same
+   as `--series-5` in dark, both are dashed, yet `app.css:76` claims the bookmark is
+   "deliberately outside every series hue". It is not.
+   *Fix proposed: `--signal: var(--text)` — ink, at 17.8:1 light / 14.9:1 dark.*
+5. **MAJOR — on the battery chart the max-cell bar is 1.13:1 against normal bars.**
+   `--accent` (`#0b6a8c`) vs `--series-1` (`#0b6fb0`), and it misuses the meanings:
+   cyan means live/selected, and the min cell is drawn in danger red though a low
+   cell is not a fault.
+6. **MAJOR — six screens open with a blank panel** (dids results, dids adaptations,
+   modules map, reports preview, assistant timeline, live chart), plus the false
+   "No local database found" flash at `dashboard.js:249`.
+7. **MAJOR — the guarded flows have no stale or denied state.** Token expiry is a
+   static string (`security.js:159`, `writes.js:119`, `raw.js:152`), and the writes
+   forms stay live in read-only (`writes.js:48-55`) even though the routes are not
+   registered.
+8. **MAJOR — fields stack with no gap and checkboxes shrink.** `app.css:766` and
+   `app.css:812-815`.
+9. **MAJOR (already fixed on disk mid-audit, needs a retake)** — pills given a ramp
+   name rendered grey: `settings.js:46`, `security.js:117/152/195/206`,
+   `writes.js:111/166`.
+10. **MINOR — 19 bare "…ing…" loading strings** instead of one shared treatment.
+11. **MINOR — mono misused or missing.** `select()` always mono, so "Gauges", "any"
+    and "both" were set in mono; `db.js:186` set every cell mono ("Chrysler",
+    "Demo van"); `.kv dd` is mono so prose values were too; `dids.js:107` showed
+    "F100 · F100" in sans; `raw.js:245-247` put hex service codes in sans.
+12. **MINOR — the posture is stated three times** on security, writes and raw
+    (top-bar badge, global banner, in-page banner).
+13. **MINOR — type-scale drift.** 13 distinct font sizes against a scale of 8; three
+    different `h2` sizes (15/16/17 px); five different uppercase letter-spacings
+    (.04/.06/.07/.08).
+14. **MINOR — the "read" tier is grey while "read-only" is green.** `app.css:632`.
+15. **MINOR — empty states are indented twice** (`.empty` padding inside a card body
+    that already pads), and the database filter row touched the card's bottom border
+    (`.pad-t` had no bottom padding).
+16. **MINOR — five action-placement patterns;** settings had no primary button and
+    battery had two "Read snapshot" primaries (31 and 121).
+17. **MINOR — centred prose columns under a left-aligned banner** (`app.css:495`):
+    on assistant/settings/help the content starts ~230 px right of the banner.
+18. **MINOR — unselected live chips carried the series-1 swatch** (`live.js:194`).
+19. **MINOR — the light warning-zone mark is 2.94:1** (`.gauge__zone__mark` at
+    `opacity:.8`) and the minor ticks are 1.86/1.76; the gauge min/max labels
+    overlapped the tick marks (`labelR = r - band - 12`).
+20. **COSMETIC.** `writes.js` eyebrows rendered "0X2E"/"0X31" through
+    `text-transform: uppercase`; nav group labels were written in capitals and then
+    uppercased again; reports' empty text said "Nothing captured yet"; db column
+    headers were raw snake_case; the pager used "←"/"→" text; the report iframe's
+    corner radius and `#fff`; `.grid--two` duplicated `.grid--2`; the `untested` ramp
+    was used by no view.
+
+## 4. Devin/Opus 5.5: top-10 fix list (verbatim, abridged)
+
+1. **Give the page one spacing rule** — `.view` as a flex column with
+   `gap: var(--space-6)`, `.view__head` `margin-bottom: 0`, `.card` `margin-bottom: 0`,
+   delete `.card:last-child`, add `.view > :empty { display: none }`. Fixes 2 and the
+   card drift on six screens.
+2. **Fix form rhythm** — `.card__body` column spacing, `.stack > .field { flex: none }`,
+   `.field input[type="checkbox"] { flex: none }`.
+3. **Fix the empty-state indent and the db filter row** — `.empty` supplies its own
+   gutter only in a flush body or a table cell; `.pad-t` regains its bottom padding.
+4. **Use the shared state helpers everywhere** — one `loadingState()` for every wait,
+   an `emptyState` for every panel that used to open blank, and delete the false
+   sessions flash.
+5. **Fix the gauge phantom arc and the chip swatch.**
+6. **Colour fixes** — `--signal: var(--text)`; the battery palette moves to
+   idle/series-1/series-2 with no red; drop `.gauge__zone__mark`'s `opacity: .8`;
+   `.tier--read` to the ok ramp; raise `--gauge-tick`.
+7. **Mono only for things that touch the wire** — `select({mono})` defaulting off,
+   db cells mono only for mono columns, settings/assistant kv blocks in sans.
+8. **Consolidate typography** in `app.css`.
+9. **Replace hand-built primitives** with `tonePill`, `keyValues`, `field`, `select`,
+   `cellWithCopy`, `verdict`, one `feedRow()`, and drop the hand-built cards in
+   battery.
+10. **Clean up page hierarchy** — no duplicate posture banners, a denied state for
+    writes in read-only, a primary button on settings, one primary on battery,
+    left-aligned prose columns, chips for suggestions, "Service 2E"/"Service 31",
+    "No reports yet".
+
+## 5. What changed
+
+**Spacing (one rule for the page).** `.view` is
+`display: flex; flex-direction: column; gap: var(--space-6)`; `.view__head` lost its
+`margin-bottom`; `.card` lost its margin and the `.card:last-child` rule is gone, so
+cards in a grid row are equal height; `.view > :empty` collapses an empty holder
+instead of leaving a double gap. `.stack > *` zeroes a child's own vertical margin so
+a `p`/`ul`/`.row--spaced`/`.composer__input` cannot double the column gap, and
+`.stack > .btn/.pill/.empty` keep their own width. `.field input[type="checkbox"]` is
+`flex: none`. `.pad-t` regained its bottom padding. Bodies that used a bare column
+div are now `.stack`: live, dids, battery, settings (safety, bus, AI), security,
+writes, assistant.
+
+**States.** New shared `loadingState(text, { panel })` (a spinner plus a sentence) is
+used for every wait — dashboard, battery, security, writes, raw, dids, db (grid and
+both drawers), reports, settings. Panels that used to open blank now seed an
+`emptyState`: dids results and adaptations, the modules module map, the reports
+preview, the assistant tool timeline, the live chart, the raw history. The dashboard's
+false "No local database found" flash is deleted. `writes.js` renders a **denied
+state** (`ban` + "Writes are disabled on this server") instead of two forms whose
+Preview could only ever 404 when the server is started without `--allow-writes`.
+
+**Components.** New shared primitives in `components.js`: `loadingState`, `keyValues`
+(a `dl.kv` factory, with `sans` for prose values), `tonePill` (a pill whose tone the
+caller chooses), `verdict` (the left-ruled verdict block), `feed`/`feedRow` (the
+running log used by dashboard, modules and capture), `select({ mono })`, `checkbox({
+flush })`, `field({ hint, step, autocomplete })`, and `icon()` used instead of the
+`⧉`/`←`/`→`/`✓` characters. `format.js` gained ramp pass-through in `statusClass`
+(so `pill(text, "warn")` is honest) and no longer carries a hardcoded palette
+fallback; `seriesColorValue` resolves a token and falls back to `currentColor`.
+`charts.js` resolves every chart colour from the tokens — with no hex fallback, so a
+missing token can never silently fork the palette.
+
+**Colour.** `--signal` is now `var(--text)` (the bookmark is ink, outside every series
+hue). The battery chart uses `--idle-solid` for the pack, `--series-1` for the
+weakest cell, `--series-2` for the strongest and `--warn-solid` for a cell away from
+the mean — no red, because a low cell is not a fault, and 4.5:1+ between the marks.
+`.tier--read` moved to the ok ramp so "this is allowed" is green on every screen. New
+tokens `--gauge-crit` (tuned against the gauge track rather than against `--panel`,
+because that is what it is drawn on), `--shade` and `--paper` (the `color-mix` anchor
+and the report paper) and `--dot`/`--icon`. `--gauge-stale`, `--gauge-tick` and
+`--gauge-tick-major` were re-tuned. `.gauge__zone__mark` lost its `opacity: .8`.
+`print.css` now re-points the **whole** semantic set — including the series ramp, the
+solid ramp, `--signal`, `--gauge-crit`, `--gauge-stale`, `--inverse`, `--on-danger`
+and `--focus-color` — so a dark-theme user printing gets paper, not a dark palette on
+white. `#000` in `color-mix` is now `var(--shade)`, and the report iframe's `#fff`
+and `8px` are now `var(--paper)` and a `.report-frame` class.
+
+**Typography.** `--type-h3` (13 px), `--type-h2-lg` (17 px, one overlay-title size for
+the modal and the drawer instead of 16 and 17), `--type-title` (the empty/error title),
+`--type-num-md` (the small gauge numeral). The standalone `code { font-size: 12.5px }`
+rule is deleted so `code` inherits `--type-mono`; `td.mono` and `.kv dd` are
+`--type-mono`; `.field label` and `thead th` are `--type-caption`; the off-scale
+10/10.5/11.5/12.5/13.5 px sizes are normalised; every uppercase tracked label uses
+`--track-label`.
+
+**Content and chrome.** Nav group labels are written in sentence case in the source
+(CSS still uppercases them for display, but the accessible name is now "Read", not
+"READ"). db column headers are title-cased and only mono values are mono; the pager
+uses chevron icons. `writes.js` eyebrows are "Service 2E"/"Service 31". reports says
+"No reports yet". The capture summary shows the capture time, not "now". The battery
+snapshot caption shows the read time. The top bar's bus chip is `.mono`, matching the
+port and protocol next to it. Prose columns are left-aligned under the banner instead
+of centred 230 px to the right of it.
+
+**Bugs fixed on the way** (both reported by the reviewer): the phantom gauge arc, and
+`#/dashboard` → 404 (now an alias for `/`). A third, found while testing: the Live
+screen showed the DID-only "Add DID" field while the source was OBD-II PIDs.
+
+Deliberately **not** changed: the in-page posture banner on security, writes and raw.
+The reviewer called it a duplicate of the top-bar badge and the global banner, but
+`app.js` states the invariant that "a screenshot can never imply a write surface that
+is not enabled"; the third statement is page-specific (which steps are read-only, and
+what a tier means) and is kept on purpose. Also unchanged: the static token-expiry
+sentence. A live countdown that disarms the confirm button is a behaviour change in a
+guarded write path, not a design-consistency fix.
+
+## 6. Measured contrast
+
+`tests/test_design_consistency.py` computes these with the WCAG 2.x formula
+(`L = 0.2126R + 0.7152G + 0.0722B` over linearised sRGB; ratio
+`(Lmax + 0.05) / (Lmin + 0.05)`) and prints the whole table. Text pairs must be
+≥ 4.5:1, marks/lines ≥ 3:1, in both themes. The current values:
+
+| pair | light | dark |
+|---|---|---|
+| `--text` on `--panel` | 17.83 | 14.90 |
+| `--text-2` on `--panel` | 9.57 | 9.17 |
+| `--text-muted` on `--panel` | 5.84 | 5.82 |
+| `--ok-fg` on `--ok-bg` / `--panel` | 5.93 / 6.73 | 8.47 / 9.51 |
+| `--warn-fg` on `--warn-bg` / `--panel` | 5.82 / 6.56 | 8.65 / 9.71 |
+| `--danger-fg` on `--danger-bg` / `--panel` | 5.78 / 6.66 | 7.69 / 8.16 |
+| `--info-fg` on `--info-bg` / `--panel` | 6.15 / 7.09 | 8.58 / 9.44 |
+| `--idle-fg` on `--idle-bg` / `--panel` | 5.93 / 6.79 | 6.41 / 7.03 |
+| `--untested-fg` on `--untested-bg` / `--panel` | 6.49 / 7.57 | 8.06 / 8.71 |
+| `--accent` on `--accent-soft` | 5.26 | 7.48 |
+| `--on-accent` on `--accent` | 6.08 | 8.72 |
+| `--on-danger` on `--danger-solid` | 5.69 | 4.81 |
+| `--text-inverse` on `--inverse` | 14.87 | 14.90 |
+| `--chart-axis` on `--panel` | 5.84 | 5.82 |
+| `--ok/warn/danger/info/idle/untested-solid` on `--panel` | 5.03 / 3.99 / 5.69 / 4.79 / 4.48 / 5.91 | 5.99 / 7.13 / 3.78 / 6.03 / 3.72 / 4.96 |
+| `--gauge-value` on `--gauge-track` | 4.89 | 6.73 |
+| `--gauge-stale` on `--gauge-track` | 3.36 | 3.75 |
+| `--gauge-crit` on `--gauge-track` | 4.58 | 3.40 |
+| `--warn-solid` on `--gauge-track` | 3.21 | 5.60 |
+| `--accent` on `--gauge-track` | 4.89 | 6.73 |
+| `--gauge-tick-major` on `--panel` | 3.69 | 3.21 |
+| `--border-input` on `--panel` | 3.27 | 3.21 |
+| `--chart-crosshair` on `--panel` | 3.27 | 3.21 |
+| `--signal` on `--panel` | 17.82 | 14.90 |
+| `--series-1…8` on `--panel` | 5.36 / 4.18 / 4.66 / 5.04 / 4.48 / 5.87 / 4.91 / 6.40 | 7.56 / 7.77 / 9.01 / 7.83 / 10.11 / 7.49 / 9.92 / 8.34 |
+
+Fixed by this pass: `--gauge-stale` was 2.58:1 (light) / 2.72:1 (dark) against the
+panel and **2.08:1 / 2.14:1 against the gauge track** it is actually drawn on; the crit
+arc was 2.96:1 against the dark track; the light warning-zone mark was 2.94:1 through
+`opacity: .8`; and `--signal` was the same hue as `--series-5` in dark.
+
+Measured and **deliberately exempt**, with the reason printed by the test next to each
+ratio: `--text-disabled` (2.34–2.99:1 — WCAG 1.4.3 exempts an inactive control);
+`--border`, `--border-subtle`, `--border-strong`, `--chart-grid`, `--gauge-track` and
+the `--*-line` pill borders (1.16–1.95:1 — tint and hairline only, never the sole
+carrier: the pill's word is 5.9–8.7:1, the button's label is 17.8:1, the major ticks
+carry the gauge scale); `--gauge-tick` (2.19:1 light / 2.25:1 dark — the minor
+subdivision of a scale whose 5 majors pass at 3.69:1 / 3.21:1; raising it to 3:1 would
+flatten the two steps into one tone); the warn and redline zone fills (the zone's outer
+mark and the redline are the state, and both pass 3:1); and
+`--gauge-warn-zone`/`--gauge-redline-zone`.
+
+## 7. The consistency test
+
+`tests/test_design_consistency.py` — standalone, `uv run python
+tests/test_design_consistency.py`, no browser, no Node, no dependency. It reads the
+shipped CSS and modules as text and enforces:
+
+1. **Every `var(--…)` resolves.** 161 tokens are defined across `:root`,
+   `[data-theme="dark"]` and `print.css`; every reference in every CSS and JS file
+   resolves. A template-built name (`var(--series-${i})`) deliberately does not match,
+   so the palette must be referenced literally for the check to mean anything.
+2. **No colour literal outside the tokens.** A hex/rgb/hsl is allowed only on a
+   custom-property definition line — in `app.css` (section 1, the palette) or in
+   `print.css` (which re-points the same names for paper). Offenders are reported
+   with `file:line`. This caught `#fff` in `reports.js`, four hex fallbacks in
+   `charts.js`, `#2451d6` in `format.js`, `#000` in a `color-mix()`, and thirteen
+   `#ccc`/`#fff`/`#999` literals that had drifted into `print.css`'s rules.
+3. **Measured contrast**, both themes, printed with the arithmetic (§6).
+4. **Component reuse.** Each of the 14 views must import `card` plus at least one of
+   `dataTable`/`emptyState`/`errorState`/`loadingState`/`feed`, and must not hand-roll
+   a card (`h("div.card")`, `card__body`, `card__head`), a pill
+   (`class: "pill…"`), or pad a card body by hand (`"pad"` inside a body). An
+   allowlist for a genuinely bespoke view exists and is **empty** today, documented in
+   the file.
+5. **Spacing and radius discipline.** Literal `px` in a spacing property
+   (padding/margin/gap) must be on a documented allowlist — currently exactly two
+   entries, and the total is capped at 4, so a new ad-hoc gap fails. Every
+   `border-radius` must be a `--radius-*` token (or a circle). Inline `style` objects
+   may not set spacing at all; this caught `marginLeft: "6px"` in
+   `components.js` and two `marginTop` wrappers in `battery.js`.
+
+Result: **all five checks pass** (`uv run python tests/test_design_consistency.py`,
+21 pre-existing test files and the out-of-repo TUI harness also pass).
+
+## 8. Adversarial pass (codex, `gpt-6.1-sol`, read-only)
+
+| finding | outcome |
+|---|---|
+| The guard measures selected token pairs, not rendered elements: the light stale arc passes against `--panel` at 3.15:1 but is **2.54:1 against the gauge track** it is drawn on | Real. `--gauge-stale` retuned against the track (3.36 / 3.75), and the *on-track* pairs — value, stale, crit, warn, accent — are now asserted. That exposed a second one: the dark crit arc was 2.96:1 against the track, fixed with the new `--gauge-crit` token. |
+| Doubled print spacing: `.view`'s flex gap (24 px) plus `.card`'s 12 pt margin | Real. `print.css` now sets `.view { display: block }`. Verified with a print-to-PDF of the dashboard. |
+| Doubled gaps in the assistant and DID forms | Real. `.stack > * { margin-top: 0; margin-bottom: 0 }`, which also fixed the security/writes/battery bodies where a `p`/`ul` added its own margin on top of the gap. |
+| Lost outer padding around error states in flush cards | Real. `.card__body--flush .error-state` and `td > .error-state` now take a `--space-6` margin (an error state is a bordered box, so it needs a margin rather than the padding an empty state takes). |
+| The guard claims to guarantee things it does not | Real. `print.css` was exempt from the colour rule while its own rules carried stray literals; the file is now within the rule (§7). The contrast pairs are still token pairs, not rendered elements — the *rendered* pairs that matter (arc on track, fill on track) were added explicitly. |
+| Ignored | Nothing was ignored outright. The static token-expiry string and the "posture stated three times" findings are deliberate (see §5). |
+
+## 9. Second review pass
+
+A narrower follow-up call with the same reviewer was given the retaken screenshots
+and the implemented fixes and asked, per item, whether the fix landed or merely moved
+the problem, which original findings remained visible, and what the fixes broke. It
+answered **"No"** to "is this one modern, attractive product now?" for two reasons it
+named: states and hierarchy still feel unedited (the posture is repeated, empty cards
+were taller than full ones, primaries were duplicated, the live chart sat blank), and
+"rules were applied per component, not by meaning" (mono set per control, eyebrows
+repeating titles, and — correctly — **dark `--signal` had been missed**: only the light
+half of that token was fixed).
+
+What that pass changed:
+
+| finding | outcome |
+|---|---|
+| dark `--signal` was still `#e5bd45`, i.e. still `--series-5` | Fixed: both themes are `var(--text)`. This was the single most important miss of the first pass. |
+| `.stack > :empty` still took a gap (the empty `writeResult`/`routineResult` divs), so the writes cards had dead space at the bottom | Fixed. |
+| `.field--check`'s `padding-top: var(--space-5)` doubled inside a `.stack` (settings' Safety and AI cards) | Fixed: `.stack > .field--check { padding-top: 0 }`. |
+| `.empty`'s vertical padding made an empty card taller than a full one | Reduced to `var(--space-6) 0`, so the block is exactly the card's own padding. |
+| the dashboard's sessions body was blank until the last of four sequential `await`s | Seeded with `loadingState`. |
+| the live chart was a blank 320 px box once signals were chosen but before the first sample | The placeholder now has two stories — "Nothing plotted yet" (no signals) and "Waiting for the first sample" — and swaps out on the first sample. |
+| `#rec-rate` stayed "idle" while recording | Set to "starting…" when recording begins. |
+| the gauge zone bands read as a statement (an empty SPEED gauge looked "in warning") now that the mark is at full opacity | The bands are a `0.55` tint; the mark/redline on the outer ring carries the state and the 3:1 contrast. |
+| a per-select `mono` flag made neighbours disagree ("all" in mono beside "any" in sans); the Status filter's values are machine tokens | Status filter is mono too. |
+| db columns read "Vin" next to a filter labelled "VIN", and dates were mono in db but sans on the dashboard | `headerOf()` has an acronym map (VIN, DID, DTC, FTB …) and timestamps render sans. |
+| the writes/security/raw preview card reused `.modal__request` — a modal-only class — outside a modal | Renamed to `.wirerequest` (it is a wire-request block, wherever it appears), with the same warn tint in a preview and danger tint inside a danger modal. "current value" became an `.eyebrow` like every other block label. |
+| `.tiernote--read` was on the idle ramp while the read tier pill is green | Moved to the ok ramp, so a tier reads the same in the badge and its note. |
+| two hand-rolled cards with no heading (battery's empty snapshot, the read-only writes refusal) | Both have a real card head now ("Snapshot / No snapshot yet", "Writes / Not available on this server"). |
+| battery showed two "Read snapshot" primaries | The DID-map card keeps "Save preset"; the read primary lives in the page heading. |
+| settings had no primary button and "Delete saved conversations" was ghost | "Save AI settings" is primary; deleting conversations is a danger button. |
+| the dashboard's "open live data" link was a muted `a.sub` | A plain accent link. |
+| print.css still carried `#ccc`/`#fff` literals outside its token re-map | All replaced with the tokens it already re-points, which let the guard's "no colour literal" rule cover print.css too (it previously exempted the file). |
+| leftover off-scale type: `12.5px` in five rules, `10px` in two, and two uppercase trackings (`.08`/`.07`) | All 12.5 → 12 px, 10 → 11 px, and `--track-eyebrow` unified to `.07em`. |
+
+Deliberately not adopted: deleting the in-page posture banner on security, writes and
+raw (see §5), and removing the modules tree's own "Discover" action (it is an empty
+state's call to action, not a duplicate control). Three findings were judged
+non-issues: the confirm dialog's "744" is the input's *placeholder*, so "type 744
+exactly to arm" is correct; `.modal__request` was renamed rather than the markup moved;
+and `dl.kv` stays mono by default because it is a table of machine-reported values,
+with `{ sans: true }` for the one list that is prose.
+
+## 10. Screenshot set
+
+```
+$ export PACIFICA_OBD_HOME=$(mktemp -d)
+$ uv run pacifica-obd web --demo --allow-writes --port 8795 &
+$ CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+$ "$CHROME" --headless=new --disable-gpu --hide-scrollbars --virtual-time-budget=9000 \
+    --window-size=1600,1100 --screenshot=dark-live.png \
+    "http://127.0.0.1:8795/#/live?theme=dark"
+```
+
+The directory holds 46 captures: `dark-<route>.png` / `light-<route>.png` for all 14
+routes (dashboard at `#/`) at 1600×1100; `dark|light-dashboard|live-520|820.png`; and
+the state shots `dark|light-writes-confirm.png` (the typed-confirm dialog),
+`light-dashboard-alias.png` (`#/dashboard`), `dark|light-readonly-writes|security|raw.png`
+(a server started without `--allow-writes`), and `dark-live-chart.png`. Two
+print-to-PDF captures (`print-dashboard.pdf`, `print-dashboard-light.pdf`) record the
+paper mapping.
+
+Two capture caveats, neither of them a UI state:
+
+- uPlot's plot is drawn on a `<canvas>` and does not paint under
+  `--headless=new --virtual-time-budget`; the canvas element is created and sized
+  (verified in the dumped DOM) but the plot area reads blank in a screenshot. That was
+  true of the pre-audit screenshots as well.
+- `--print-to-pdf` is flaky about waiting for the app's async fetches: the same URL
+  printed the full dashboard on one run and only the banner on the next. The layout is
+  correct in both; repeat the capture if the body is missing.
+
+## 11. What could not be made consistent
+
+- **The chart canvas in a screenshot**, and a flaky `--print-to-pdf` snapshot — both
+  capture limitations, above.
+- **The live token-expiry countdown.** Security, writes and raw show a static
+  "Token expires in Ns". A ticking countdown that disarms the confirm button would
+  change behaviour in a guarded write path, which is out of scope for a design pass.
+- **`.kv dd` is mono by default.** Prose values in a `dl.kv` (the assistant's provider
+  and model, "what will be sent") opt out with `keyValues(pairs, { sans: true })`; the
+  settings blocks stay mono because their values are paths, counts and versions. The
+  rule is documented in `components.js`: a `dl.kv` is a table of machine-reported
+  values, so it is mono unless a caller says otherwise.
+- **A per-select `mono` flag cannot split a mixed option label.** The ECU picker's
+  labels are `BODY_CHRYSLER — Body computer (153 DIDs)`: machine id plus prose name.
+  The field is mono because the identifier is the value.
+- **The three statements of the write posture** on security/writes/raw — kept on
+  purpose (§5).
+- **The modules tree's own "Discover" action** in its empty state — an empty state's
+  call to action, not a duplicate control.
+- **Popup/overlay titles are 17 px**, not the 20 px `--type-h1`. One size for both the
+  modal and the drawer is now consistent; raising them to 20 px would have made every
+  dialog shout.
+- **`--text-disabled` at 2.34–2.99:1** is intentionally below 4.5:1: it only ever
+  applies to a disabled control, which WCAG 1.4.3 exempts, and the disabled state also
+  carries `cursor: not-allowed` and a fill change. `--gauge-tick` is intentionally
+  below 3:1 for the same kind of reason: it is the subdivision of a scale whose major
+  ticks pass.
+- **`views/modules.js` renders the offline module map into a holder that is never
+  mounted**, and `views/reports.js`'s `save()` calls `rawResponse` correctly but the
+  two `refresh*` helpers are still similar. The first is a pre-existing functional bug
+  and stays out of a design pass; both are noted for the owner.

@@ -8,6 +8,10 @@
 import { h, clear } from "./dom.js";
 import { seriesColorValue } from "./format.js";
 
+// Resolve a design token to a concrete value. uPlot draws onto a canvas, which
+// cannot resolve `var(--…)`, so the value has to be read out of the document.
+// Never pass a colour as the fallback: the palette lives in app.css only, and
+// tests/test_design_consistency.py fails on a colour literal in any JS file.
 export function themeToken(name, fallback = "") {
   const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
   return value || fallback;
@@ -123,9 +127,9 @@ export class TimeSeriesChart {
 
   ensurePlot() {
     if (this.plot || !this.series.length || typeof window.uPlot !== "function") return;
-    const grid = themeToken("--chart-grid", "#eceef1");
-    const axis = themeToken("--chart-axis", "#5c6672");
-    const border = themeToken("--border", "#dde1e6");
+    const grid = themeToken("--chart-grid");
+    const axis = themeToken("--chart-axis");
+    const border = themeToken("--border");
     const font = themeToken("--font-sans", "sans-serif");
     const self = this;
     const axisBase = (extra) => ({
@@ -182,7 +186,7 @@ export class TimeSeriesChart {
           if (!self.bookmarks.length) return;
           const ctx = u.ctx;
           ctx.save();
-          ctx.strokeStyle = themeToken("--signal", "#e8a317");
+          ctx.strokeStyle = themeToken("--signal");
           ctx.setLineDash([4, 4]);
           ctx.lineWidth = 1;
           const top = u.bbox.top;

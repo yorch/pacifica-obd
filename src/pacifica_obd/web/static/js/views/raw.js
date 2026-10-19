@@ -11,6 +11,7 @@ import { api, ApiError } from "../api.js";
 import { escapeControls } from "../format.js";
 import {
   card, pill, banner, errorState, toast, typedConfirm, dataTable, emptyState, tierPill,
+  loadingState,
 } from "../components.js";
 
 // Read = neutral, confirm = amber, deny = red. Never colour alone: the badge
@@ -99,7 +100,7 @@ export function render(root, ctx) {
     const pointer = decision.pointer ? POINTERS[decision.pointer] : null;
     const word = decision.tier === "invalid" ? "deny" : decision.tier;
     return h("div", { class: `tiernote tiernote--${word}`, role: "status" },
-      h("div.row", null, tierBadge(decision.tier),
+      h("div.row", null, tierPill(decision.tier),
         h("span.sub", { text: escapeControls(decision.reason) })),
       decision.note ? h("p.sub", null, escapeControls(decision.note), " ",
         pointer ? h("a", { href: pointer.href, text: pointer.label }) : null) : null,
@@ -108,16 +109,12 @@ export function render(root, ctx) {
         : null);
   }
 
-  function tierBadge(tier) {
-    return tierPill(tier);
-  }
-
   /* -------------------------------------------------------------- sending */
   async function send() {
     const command = input.value.trim();
     if (!command) { toast("Type a command first", "warn"); return; }
     sendButton.disabled = true;
-    mount(holders.result, h("span.sub", { text: "Sending…" }));
+    mount(holders.result, loadingState("Sending one command to the adapter…"));
     try {
       const result = await api.raw({ command, timeout_ms: 100 });
       if (result.confirm_token) {
@@ -144,8 +141,8 @@ export function render(root, ctx) {
 
   function previewCard(result) {
     return h("div", null,
-      tierBadge("confirm"),
-      h("div.modal__request", null,
+      tierPill("confirm"),
+      h("div.wirerequest", null,
         h("div.eyebrow", { text: "exact bytes (nothing sent yet)" }),
         h("code.mono.code-line", { text: result.request })),
       h("p.sub", { text: escapeControls(result.note || result.reason || "") }),
@@ -166,7 +163,7 @@ export function render(root, ctx) {
   }
 
   async function runConfirm(result) {
-    mount(holders.result, h("span.sub", { text: "Sending…" }));
+    mount(holders.result, loadingState("Sending the confirmed bytes…"));
     try {
       const response = await api.rawConfirm({
         confirm_token: result.confirm_token, acknowledgement: result.acknowledgement,
@@ -186,7 +183,7 @@ export function render(root, ctx) {
     const frames = result.frames || [];
     const audit = result.audit;
     return h("div", null,
-      h("div.row", null, tierBadge(result.tier),
+      h("div.row", null, tierPill(result.tier),
         pill(result.sent ? "sent" : "not sent", result.sent ? "ok" : "idle")),
       h("pre.code-block", {
         text: (result.lines || []).map((line) => escapeControls(line)).join("\n") || "(no lines)",
@@ -211,14 +208,15 @@ export function render(root, ctx) {
 
   function renderHistory() {
     if (!history.length) {
-      mount(holders.history, h("p.sub", { text: "No commands sent in this session." }));
+      mount(holders.history, emptyState({ icon: "terminal", title: "No commands sent in this session",
+        hint: "Every command you send is listed here with its tier and outcome." }));
       return;
     }
     mount(holders.history, dataTable({
       columns: [
         { key: "at", label: "Time", render: (row) => row.at.toLocaleTimeString([], { hour12: false }) },
         { key: "command", label: "Command", mono: true },
-        { key: "tier", label: "Tier", render: (row) => tierBadge(row.tier) },
+        { key: "tier", label: "Tier", render: (row) => tierPill(row.tier) },
         { key: "outcome", label: "Outcome", mono: true },
       ],
       rows: history, empty: "no commands",
@@ -227,7 +225,7 @@ export function render(root, ctx) {
 
   /* ------------------------------------------------------------ allowlist */
   async function loadAllowlist() {
-    mount(holders.allowlist, h("span.sub", { text: "Loading the tiers…" }));
+    mount(holders.allowlist, loadingState("Loading the command tiers…"));
     try {
       const payload = await api.rawAllowlist();
       mount(holders.allowlist, allowlistPanel(payload));
@@ -241,16 +239,26 @@ export function render(root, ctx) {
     const deny = payload.deny || {};
     return h("div.stack", null,
       h("div", null,
-        h("div.row", null, tierBadge("read"), h("span.sub", { text: "allowed with no confirmation" })),
-        h("p.sub", { text: (read.obd_modes || []).map((row) => `${row.code} ${row.label}`).join(" · ") }),
-        h("p.sub", { text: (read.uds_services || []).map((row) => `0x${row.code} ${row.label}`).join(" · ") }),
-        h("p.sub", { text: `AT: ${(read.at_exact || []).join(" ")} ${(read.at_argument || []).join(" ")}` })),
+        h("div.row", null, tierPill("read"), h("span.sub", { text: "allowed with no confirmation" })),
+        h("p.sub", null, codeList((read.obd_modes || []).map((row) => `${row.code} ${row.label}`))),
+        h("p.sub", null, codeList((read.uds_services || []).map((row) => `0x${row.code} ${row.label}`))),
+        h("p.sub", null, "AT: ", codeList([...(read.at_exact || []), ...(read.at_argument || [])]))),
       h("div", null,
-        h("div.row", null, tierBadge("confirm"), h("span.sub", { text: "typed acknowledgement + confirm token" })),
+        h("div.row", null, tierPill("confirm"), h("span.sub", { text: "typed acknowledgement + confirm token" })),
         h("p.sub", { text: (payload.confirm || {}).rule || "" })),
       h("div", null,
-        h("div.row", null, tierBadge("deny"), h("span.sub", { text: "never sent, in any mode" })),
+        h("div.row", null, tierPill("deny"), h("span.sub", { text: "never sent, in any mode" })),
         denyTable(deny)));
+  }
+
+  // A list of wire tokens, set in mono so a hex code reads as data, not prose.
+  function codeList(items) {
+    const wrap = h("span");
+    items.forEach((item, index) => {
+      if (index) wrap.appendChild(h("span.sub", { text: " · " }));
+      wrap.appendChild(h("code.mono", { text: item }));
+    });
+    return wrap;
   }
 
   function denyTable(deny) {

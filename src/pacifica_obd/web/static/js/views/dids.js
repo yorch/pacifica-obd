@@ -3,8 +3,8 @@
 import { h, clear, mount, on } from "../dom.js";
 import { api } from "../api.js";
 import {
-  card, cardBody, pill, emptyState, errorState, toast, dataTable, field, select,
-  cellWithCopy, untrustedBadge,
+  card, pill, emptyState, errorState, toast, dataTable, field, select,
+  cellWithCopy, untrustedBadge, loadingState,
 } from "../components.js";
 import { escapeControls } from "../format.js";
 
@@ -17,9 +17,9 @@ export function render(root, ctx) {
   const state = { ecu: null, selection: ["F190", "F187"], results: null, adaptations: null,
                   dataset: [], busy: false };
 
-  const ecuSelect = select({ id: "did-ecu", label: "ECU", value: "", options: [{ value: "", label: "loading…" }] });
+  const ecuSelect = select({ id: "did-ecu", label: "ECU", value: "", mono: true, options: [{ value: "", label: "loading…" }] });
   const moduleField = field({ id: "did-module", label: "Module request ID", value: "7E0", mono: true });
-  const busField = select({ id: "did-bus", label: "Bus", value: "can-c",
+  const busField = select({ id: "did-bus", label: "Bus", value: "can-c", mono: true,
     options: [{ value: "can-c", label: "can-c" }, { value: "can-ihs", label: "can-ihs" }] });
   const timeoutField = field({ id: "did-timeout", label: "Timeout (ms)", value: "100", mono: true, type: "number" });
   const filterField = field({ id: "did-filter", label: "Filter DIDs", placeholder: "name or id…" });
@@ -41,7 +41,7 @@ export function render(root, ctx) {
       h("div.sub", { text: "Read data identifiers (UDS 0x22) from one module. Pick from the identification block or type any 4-hex DID — the bundled dataset names data items but carries no DID numbers." })));
 
   mount(root, head,
-    card({ eyebrow: "Target", title: "Module & DIDs", body: h("div", null,
+    card({ eyebrow: "Target", title: "Module & DIDs", body: h("div.stack", null,
       h("div.row", null, ecuSelect, moduleField, busField, timeoutField),
       filterField, chips, h("div.row.row--spaced", freeField,
         h("button.btn.btn--sm", { type: "button", text: "Add", onClick: addFree }),
@@ -50,6 +50,11 @@ export function render(root, ctx) {
     card({ eyebrow: "Results", title: "Data identifiers", flush: true, body: resultsHolder }),
     card({ eyebrow: "Offline · dataset", title: "Data items for this ECU", flush: true, body: datasetHolder }),
     card({ eyebrow: "Offline · dataset", title: "Adaptations (writable configuration — read-only listing)", flush: true, body: adaptationsHolder }));
+
+  resultsHolder.appendChild(emptyState({ icon: "tag", title: "Nothing read yet",
+    hint: "Choose a module and DIDs, then press Read DIDs." }));
+  adaptationsHolder.appendChild(emptyState({ icon: "sliders", title: "Adaptations not listed",
+    hint: "Press Show adaptations to list the writable configuration entries the dataset knows for this ECU." }));
 
   /* ------------------------------------------------------------------ data */
 
@@ -61,7 +66,7 @@ export function render(root, ctx) {
       node.appendChild(h("option", { value: "", text: "— choose —" }));
       for (const ecu of ecus) {
         node.appendChild(h("option", { value: ecu.ecu,
-          text: `${ecu.ecu}${ecu.name ? " — " + ecu.name : ""} (${ecu.dids} DID${ecu.dids === 1 ? "" : "s"})${ecu.request ? " · " + ecu.request : ""}` }));
+          text: `${ecu.ecu}${ecu.name ? " — " + ecu.name : ""} (${ecu.dids} DID${ecu.dids === 1 ? "" : "s"})` }));
       }
       const first = ecus.find((ecu) => ecu.request);
       if (first) { state.ecu = first.ecu; node.value = first.ecu; document.getElementById("did-module").value = first.request || "7E0"; }
@@ -104,7 +109,8 @@ export function render(root, ctx) {
       const active = state.selection.includes(row.key);
       chips.appendChild(h("button.chip", { type: "button", "aria-pressed": active ? "true" : "false",
         onClick: () => { toggle(row.key); } },
-        h("span", { text: `${row.key} · ${row.label}` })));
+        h("span.chip__label.mono", { text: row.key }),
+        row.label === row.key ? null : h("span.sub", { text: row.label })));
     }
     if (state.selection.length) {
       chips.appendChild(h("span.sub", { text: `selected: ${state.selection.join(", ")}` }));
@@ -137,7 +143,7 @@ export function render(root, ctx) {
     readButton.disabled = true;
     infoButton.disabled = true;
     clear(resultsHolder);
-    resultsHolder.appendChild(h("div", { class: "pad" }, h("span.sub", { text: "Reading…" })));
+    resultsHolder.appendChild(loadingState("Reading the DIDs…", { panel: true }));
     try {
       const payload = await api.udsReadDid({
         module: document.getElementById("did-module").value,
@@ -149,7 +155,7 @@ export function render(root, ctx) {
       renderResults();
     } catch (error) {
       clear(resultsHolder);
-      resultsHolder.appendChild(h("div", { class: "pad" }, errorState(error, { onRetry: () => read(list) })));
+      resultsHolder.appendChild(errorState(error, { onRetry: () => read(list) }));
       toast(error.message, "err", 0);
     } finally {
       state.busy = false;
@@ -188,7 +194,6 @@ export function render(root, ctx) {
         h("span.sub", { text: `${refused.length} DID(s) did not return ok — per-DID status is shown verbatim above.` })));
     }
   }
-
   async function loadAdaptations() {
     if (!state.ecu) return;
     try {
