@@ -28,6 +28,7 @@ from pacifica_obd.web.ai.providers import (
     iter_sse_data,
     map_http_error,
     read_capped,
+    temperature_rejected,
     retry_backoff,
     RETRYABLE_CODES,
 )
@@ -40,13 +41,18 @@ DEFAULT_BASE_URL = "https://api.example.invalid"
 _MAX_ATTEMPTS = 2
 
 
+#: Cap the listed models so a huge catalogue cannot bloat a form.
+MODEL_LIST_LIMIT = 200
+
+
 class AnthropicProvider:
     id = "anthropic"
     label = "Anthropic Messages API"
     requires_key = True
     local = False
     #: The Messages API has no model-discovery endpoint; the probe must ping.
-    supports_model_discovery = False
+    #: GET /v1/models lists the account's models (verified against the live API)
+    supports_model_discovery = True
 
     def __init__(self, config, *, key: str | None = None, transport=None):
         preset_id = getattr(config, "provider", None)
@@ -87,10 +93,40 @@ class AnthropicProvider:
         return headers
 
     async def list_models(self) -> list[ModelInfo]:
-        # The Messages API has no public model list; the model id is explicit by
-        # design (there is no silent fallback), so this returns just the one.
-        return [ModelInfo(self.model, self.model, context=200000, supports_tools=True,
-                          local=self.local)] if self.model else []
+        """The account's models, from the API (the Messages API does have a list).
+
+        Falls back to the configured model when the endpoint cannot be listed, so
+        the model field is never empty.
+        """
+        client = await self._client_()
+        try:
+            async with client.stream("GET", f"{self.base_url}/v1/models",
+                                     headers=self._headers()) as response:
+                if response.status_code >= 400:
+                    body = (await read_capped(response)).decode("utf-8", "replace")
+                    raise map_http_error(response.status_code, body)
+                raw = await response.aread()
+        except Exception:  # noqa: BLE001 - a listing failure must not break the form
+            return [ModelInfo(self.model, self.model, context=200000,
+                              supports_tools=True, local=self.local)] if self.model else []
+        try:
+            data = json.loads(raw.decode("utf-8", "replace"))
+            rows = data.get("data") if isinstance(data, dict) else None
+        except ValueError:
+            rows = None
+        out: list[ModelInfo] = []
+        for row in (rows or [])[:MODEL_LIST_LIMIT]:
+            if not isinstance(row, dict):
+                continue
+            identifier = str(row.get("id") or "").strip()
+            if not identifier:
+                continue
+            out.append(ModelInfo(identifier, row.get("display_name") or identifier,
+                                 context=200000, supports_tools=True, local=self.local))
+        if not out and self.model:
+            out = [ModelInfo(self.model, self.model, context=200000,
+                             supports_tools=True, local=self.local)]
+        return out
 
     async def stream(self, req: ChatRequest) -> AsyncIterator[Event]:
         payload = {
@@ -99,6 +135,8 @@ class AnthropicProvider:
                         "cache_control": {"type": "ephemeral"}}] if req.system else None,
             "messages": self._messages(req),
             "max_tokens": req.max_output_tokens or 1024,
+            # Only send it when set: several current models reject it outright
+            # ("`temperature` is deprecated for this model").
             "temperature": req.temperature,
             "stream": True,
         }
@@ -127,6 +165,15 @@ class AnthropicProvider:
                                          json=payload, headers=self._headers()) as response:
                     if response.status_code >= 400:
                         body = (await read_capped(response)).decode("utf-8", "replace")
+                        # Newer models reject `temperature` outright ("deprecated
+                        # for this model"). Drop it and retry once, rather than
+                        # failing a perfectly good configuration over a setting the
+                        # user never asked for.
+                        if (temperature_rejected(response.status_code, body)
+                                and "temperature" in payload and not emitted):
+                            payload.pop("temperature", None)
+                            self.temperature = None
+                            continue
                         raise map_http_error(response.status_code, body,
                                              retry_after=_retry_after(response))
                     async for data in iter_sse_data(response):

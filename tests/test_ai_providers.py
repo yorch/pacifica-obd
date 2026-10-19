@@ -153,14 +153,23 @@ def test_config_bounds_and_types():
         {"provider": "openai", "model": "m",
          "send_bus_data_to_remote": "false"}).validate()
     assert coerced.send_bus_data_to_remote is False
-    # A null temperature is a ValueError (a 400), never a raw TypeError (a 500).
-    try:
-        ai_config.AIConfig.from_dict(
-            {"provider": "fake", "model": "fake-1", "temperature": None}).validate()
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("temperature=None did not raise ValueError")
+    # A null temperature now means "let the provider decide" (several models reject
+    # the parameter outright), so it is accepted and normalised to None; a
+    # non-numeric value is still a clean ValueError (a 400), not a TypeError (a 500).
+    blank = ai_config.AIConfig.from_dict(
+        {"provider": "fake", "model": "fake-1", "temperature": None}).validate()
+    assert blank.temperature is None
+    empty = ai_config.AIConfig.from_dict(
+        {"provider": "fake", "model": "fake-1", "temperature": ""}).validate()
+    assert empty.temperature is None
+    for bad in ("warm", {"a": 1}):
+        try:
+            ai_config.AIConfig.from_dict(
+                {"provider": "fake", "model": "fake-1", "temperature": bad}).validate()
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"temperature={bad!r} did not raise ValueError")
 
 
 def test_patch_clears_on_explicit_null_and_keeps_omitted_fields():
@@ -440,14 +449,88 @@ def test_probe_model_listing_is_bounded_and_field_safe():
         raise AssertionError("a non-JSON model list was accepted")
 
 
-def test_anthropic_reports_no_model_discovery():
+def test_anthropic_model_discovery_is_available_and_falls_back():
+    """The Messages API does expose GET /v1/models — verified against the live API.
+
+    The old assumption ("no model list, so probe with a ping") left the user with
+    a bare `bad_request` and no way to see which model ids the key accepts.
+    """
     provider = build_provider(ai_config.AIConfig(provider="anthropic", model="claude-x"),
                               key="sk-ant-x-123456")
-    # A static model suggestion is not proof of reachability; the probe must ping.
-    assert getattr(provider, "supports_model_discovery", True) is False
+    assert getattr(provider, "supports_model_discovery", False) is True
     provider2 = build_provider(ai_config.AIConfig(provider="openai", model="gpt-4o-mini"),
                                key="sk-x-1234567890")
     assert getattr(provider2, "supports_model_discovery", False) is True
+
+
+def test_anthropic_listing_parses_the_api_and_falls_back_on_failure():
+    """A real listing is returned; an unreachable endpoint degrades to the model."""
+    import asyncio
+    import json as _json
+
+    import httpx
+
+    body = _json.dumps({"data": [
+        {"id": "claude-sonnet-5-5", "display_name": "Sonnet 5.5"},
+        {"id": "claude-opus-5-5", "display_name": "Opus 5.5"},
+        {"id": "", "display_name": "ignored"},
+    ]}).encode()
+
+    provider = build_provider(ai_config.AIConfig(provider="anthropic", model="claude-x"),
+                              key="sk-ant-x-123456")
+    provider._transport = httpx.MockTransport(lambda request: httpx.Response(200, content=body))
+    rows = asyncio.run(provider.list_models())
+    assert [row.id for row in rows] == ["claude-sonnet-5-5", "claude-opus-5-5"], rows
+
+    other = build_provider(ai_config.AIConfig(provider="anthropic", model="claude-x"),
+                           key="sk-ant-x-123456")
+    other._transport = httpx.MockTransport(
+        lambda request: httpx.Response(500, content=b"boom"))
+    fallback = asyncio.run(other.list_models())
+    assert [row.id for row in fallback] == ["claude-x"], fallback
+
+
+def test_a_model_that_rejects_temperature_is_retried_without_it():
+    """The live failure: 400 "`temperature` is deprecated for this model"."""
+    import asyncio
+
+    import httpx
+
+    seen: list[dict] = []
+    sse = (b'event: message_start\n'
+           b'data: {"type":"message_start","message":{"usage":{"input_tokens":3}}}\n\n'
+           b'event: content_block_start\n'
+           b'data: {"type":"content_block_start","index":0,"content_block":{"type":"text",'
+           b'"text":""}}\n\n'
+           b'event: content_block_delta\n'
+           b'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta",'
+           b'"text":"pong"}}\n\n'
+           b'event: message_stop\ndata: {"type":"message_stop"}\n\n')
+
+    def handler(request):
+        payload = __import__("json").loads(request.content)
+        seen.append(payload)
+        if len(seen) == 1:
+            return httpx.Response(400, json={"type": "error", "error": {
+                "type": "invalid_request_error",
+                "message": "`temperature` is deprecated for this model."}})
+        return httpx.Response(200, content=sse,
+                              headers={"content-type": "text/event-stream"})
+
+    provider = build_provider(ai_config.AIConfig(provider="anthropic", model="claude-opus-5-5"),
+                              key="sk-ant-x-123456")
+    provider._transport = httpx.MockTransport(handler)
+    request = ChatRequest(model="claude-opus-5-5", system="s", messages=[
+        Message(role="user", content="ping")], temperature=0.2, max_output_tokens=1)
+
+    async def drain():
+        return [event async for event in provider.stream(request)]
+
+    events = asyncio.run(drain())
+    assert len(seen) == 2, seen
+    assert "temperature" in seen[0], "the first attempt should carry the setting"
+    assert "temperature" not in seen[1], "the retry must drop it"
+    assert any(getattr(event, "text", None) == "pong" for event in events), events
 
 
 def test_public_config_redacts_url_credentials():

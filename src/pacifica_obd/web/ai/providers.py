@@ -65,7 +65,7 @@ class ChatRequest:
     system: str
     messages: list[Message]
     tools: list[ToolSpec] = field(default_factory=list)
-    temperature: float = 0.2
+    temperature: float | None = None
     max_output_tokens: int | None = None
 
 
@@ -151,12 +151,13 @@ def map_http_error(status: int, body: str, *, retry_after: int | None = None) ->
     """Map an HTTP status onto a typed :class:`ProviderError`.
 
     The provider's response body is **never** used as the public message: it is
-    attacker-influenced in the sense that it is arbitrary text the user's key was
-    sent alongside, and it routinely echoes the credential or the request (a 500
-    can quote the whole payload, VIN included). A short readable class of error
-    is enough for the user; the body stays out of the event stream, the logs and
-    the transcript.
+    arbitrary text that can quote the credential or the request. But "the provider
+    rejected the request" is useless when the real reason is a parameter the model
+    no longer accepts, so the body is *inspected* for a few known, safe signals and
+    turned into a fixed, actionable sentence.
     """
+    lowered = (body or "").lower()
+
     if status in (401, 403):
         return ProviderError("auth", "the provider rejected the key or permissions",
                              status=status)
@@ -167,7 +168,26 @@ def map_http_error(status: int, body: str, *, retry_after: int | None = None) ->
         return ProviderError("bad_request", "the provider has no such model or path",
                              status=status)
     if status in (400, 422):
-        lowered = (body or "").lower()
+        if "temperature" in lowered and any(
+                word in lowered for word in ("deprecat", "unsupported",
+                                             "not supported", "not allowed")):
+            return ProviderError(
+                "bad_request",
+                "this model no longer accepts a temperature setting — clear the "
+                "temperature (leave it blank) and test again",
+                status=status)
+        if "max_tokens" in lowered or "max output" in lowered:
+            return ProviderError(
+                "bad_request", "the provider rejected the output-token limit",
+                status=status)
+        if "model" in lowered and any(
+                word in lowered for word in ("not found", "does not exist",
+                                             "unknown", "invalid", "no such")):
+            return ProviderError(
+                "bad_request",
+                "the provider does not recognise this model id — open the model "
+                "list and pick one it offers",
+                status=status)
         if "context" in lowered and ("length" in lowered or "token" in lowered):
             return ProviderError("context_length",
                                  "the request exceeded the model's context window",
@@ -178,6 +198,12 @@ def map_http_error(status: int, body: str, *, retry_after: int | None = None) ->
         return ProviderError("unavailable", f"the provider failed (HTTP {status})",
                              retry_after_s=retry_after, status=status)
     return ProviderError("internal", f"provider error {status}", status=status)
+
+
+def temperature_rejected(status: int, body: str) -> bool:
+    """True when a 400 names ``temperature``: newer models reject it outright."""
+    lowered = (body or "").lower()
+    return status in (400, 422) and "temperature" in lowered
 
 
 def estimate_tokens(text: str) -> int:

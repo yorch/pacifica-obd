@@ -207,7 +207,8 @@ class ChatEngine:
                 system=system,
                 messages=history,
                 tools=_tool_specs() if self.tools_enabled else [],
-                temperature=float(self.config.temperature),
+                temperature=(None if self.config.temperature is None
+                             else float(self.config.temperature)),
                 max_output_tokens=max_output_tokens,
             )
             self.meter.requests += 1

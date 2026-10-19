@@ -628,7 +628,7 @@ async def _ping(provider, model: str) -> None:
 
     request = ChatRequest(model=model, system="Reply with a single character.",
                           messages=[Message(role="user", content="ping")],
-                          temperature=0.0, max_output_tokens=1)
+                          max_output_tokens=1)
     async for event in provider.stream(request):
         if isinstance(event, ProviderError):
             raise event

@@ -111,9 +111,11 @@ PRESETS: dict[str, ProviderPreset] = {
             format=ANTHROPIC_FORMAT,
             default_base_url="https://api.anthropic.com",
             requires_key=True,
-            default_model="claude-3-5-sonnet-latest",
-            example_models=("claude-3-5-sonnet-latest", "claude-3-5-haiku-latest",
-                            "claude-sonnet-4-20250514"),
+            # Verified against GET /v1/models for a live key (the 3.5-era ids are
+            # retired and made "Test connection" fail with a bare bad_request).
+            default_model="claude-sonnet-5-5",
+            example_models=("claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5",
+                            "claude-opus-4-8", "claude-sonnet-4-6"),
             notes="Native Messages API. Paste an Anthropic API key.",
             key_env=("ANTHROPIC_API_KEY",),
             key_hint="sk-ant-…",

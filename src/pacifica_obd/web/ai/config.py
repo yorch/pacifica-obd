@@ -127,7 +127,9 @@ class AIConfig:
     provider: str | None = None
     model: str = ""
     base_url: str | None = None
-    temperature: float = 0.2
+    #: None means "leave it to the provider": newer models reject the
+    #: parameter outright, so it is only sent when the user sets one.
+    temperature: float | None = None
     send_bus_data_to_remote: bool = False
     redact_vin: bool = True
     allow_live_bus: bool = False
@@ -174,10 +176,13 @@ class AIConfig:
         for name in ("send_bus_data_to_remote", "redact_vin", "allow_live_bus",
                      "persist_conversations", "force_local_only"):
             setattr(self, name, _bool_field(getattr(self, name), name))
-        try:
-            self.temperature = float(self.temperature)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("temperature must be a number") from exc
+        if self.temperature is None or str(self.temperature).strip() == "":
+            self.temperature = None
+        else:
+            try:
+                self.temperature = float(self.temperature)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("temperature must be a number") from exc
         for name in _BOUNDS:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -213,8 +218,8 @@ class AIConfig:
                 )
         if self.provider and self.provider != "fake" and not self.effective_model():
             raise ValueError("a model id is required once a provider is chosen")
-        if not 0.0 <= float(self.temperature) <= 2.0:
-            raise ValueError("temperature must be between 0 and 2")
+        if self.temperature is not None and not 0.0 <= float(self.temperature) <= 2.0:
+            raise ValueError("temperature must be between 0 and 2, or blank")
         for name, (low, high) in _BOUNDS.items():
             value = int(getattr(self, name))
             if value < low or value > high:
