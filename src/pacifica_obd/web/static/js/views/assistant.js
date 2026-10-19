@@ -91,29 +91,122 @@ export function render(root, ctx) {
     clear(chipRow);
     try {
       const config = await api.aiConfig();
+      const state = configState(config);
+      const saved = savedProviders(config);
       const presetLabel = config.preset?.label || null;
       const model = config.effective_model || config.model || "—";
       const chips = [
         `provider: ${presetLabel || config.provider || "none"}`,
         `model: ${model}`,
-        config.is_local ? "local model" : "remote model",
+        config.is_local ? "local model" : (config.provider ? "remote model" : "no model"),
         config.redact_vin ? "VIN redacted" : "VIN visible",
         config.persist_conversations ? "history saved" : "history off",
       ];
+      // A saved key is not a configured provider: name the key instead of letting
+      // the "provider: none" chip imply there is nothing to act on.
+      if (state === "key_without_provider" && saved.length) {
+        chips.splice(1, 0, `key saved: ${saved.map((id) => providerShort(config, id)).join(", ")}`);
+      }
       for (const text of chips) chipRow.appendChild(pill(text, "idle"));
     } catch {
-      chipRow.appendChild(pill("no provider configured", "idle"));
+      chipRow.appendChild(pill("AI configuration unavailable", "idle"));
     }
+  }
+
+  // The server sends an explicit `state`; derive it from the payload when talking
+  // to an older server so a saved key is never misreported as "no provider".
+  function configState(config) {
+    if (config.state) return config.state;
+    const saved = savedProviders(config);
+    if (!config.provider) return saved.length ? "key_without_provider" : "unconfigured";
+    if (config.requires_key && !config.keys?.[config.provider]?.configured) {
+      return "provider_without_key";
+    }
+    return "ready";
+  }
+
+  function savedProviders(config) {
+    if (Array.isArray(config.saved_key_providers)) return config.saved_key_providers;
+    return Object.entries(config.keys || {})
+      .filter(([, info]) => info?.configured)
+      .map(([id]) => id);
+  }
+
+  function providerShort(config, provider) {
+    const label = config?.provider_labels?.[provider] || provider || "provider";
+    return String(label).replace(/\s*\(.*\)\s*$/, "");
+  }
+
+  function article(name) {
+    return /^(LM|LLM|[AEIOU])/i.test(String(name)) ? "An" : "A";
   }
 
   function renderNotice() {
     clear(notice);
     api.aiConfig().then((config) => {
-      if (!config.provider) {
+      const state = configState(config);
+      if (state === "key_without_provider") {
+        const provider = config.suggested_provider || savedProviders(config)[0];
+        const label = providerShort(config, provider);
+        // Selecting needs a model; a custom endpoint with no default model is
+        // sent to Settings where the model field lives. An existing saved model
+        // wins over the preset default, matching the server's preserve-nonempty
+        // selection rule.
+        const model = config.model || config.defaults?.models?.[provider] || "";
+        const action = model
+          ? h("button.btn.btn--sm", { type: "button", text: `Use ${label}`,
+              onClick: () => selectSavedProvider(config, provider) })
+          : h("a.btn.btn--sm", { href: "#/settings", text: "Open Settings" });
+        notice.appendChild(banner(
+          `${article(label)} ${label} key is saved, but no provider is selected — Use ${label}.`,
+          "warn", action));
+        return;
+      }
+      if (state === "provider_without_key") {
+        const label = providerShort(config, config.provider);
+        notice.appendChild(banner(`${label} is selected but has no key — add one.`, "warn",
+          h("a.btn.btn--sm", { href: "#/settings", text: "Add key" })));
+        return;
+      }
+      if (state === "invalid") {
+        notice.appendChild(banner(
+          `The AI configuration is incomplete — ${config.state_reason || "open Settings to fix it"}.`,
+          "warn", h("a.btn.btn--sm", { href: "#/settings", text: "Open Settings" })));
+        return;
+      }
+      if (state === "unconfigured") {
         notice.appendChild(banner("No provider is configured. Open Settings → AI to add a key or point at a local model.", "warn",
+          h("a.btn.btn--sm", { href: "#/settings", text: "Open Settings" })));
+        return;
+      }
+      // Ready, but two policy facts can still stop a request: local-only mode
+      // refuses a remote provider outright, and remote tasks need consent.
+      if (config.force_local_only && !config.is_local) {
+        notice.appendChild(banner("Local models only is on: this remote provider will be refused. Choose a local model or turn the setting off.", "warn",
+          h("a.btn.btn--sm", { href: "#/settings", text: "Open Settings" })));
+      } else if (!config.is_local && !config.send_bus_data_to_remote) {
+        notice.appendChild(banner("Remote model: enable 'send bus data to a remote model' before a task can attach vehicle data.", "info",
           h("a.btn.btn--sm", { href: "#/settings", text: "Open Settings" })));
       }
     }).catch(() => {});
+  }
+
+  async function selectSavedProvider(config, provider) {
+    try {
+      // Only the id: the server fills preset defaults and preserves any model or
+      // base URL already saved, so a redacted display value is never written back.
+      const updated = await api.aiSelectProvider(provider);
+      const label = providerShort(config, provider);
+      // An environment override can keep another provider effective; say so
+      // instead of claiming the click took effect.
+      if (updated && updated.provider && updated.provider !== provider) {
+        toast(`Saved ${label}; ${providerShort(updated, updated.provider)} is set by the environment`, "warn", 0);
+      } else {
+        toast(`${label} selected`);
+      }
+      loadChips();
+      renderNotice();
+    } catch (error) { showError(error); }
   }
 
   function bubble(role) {

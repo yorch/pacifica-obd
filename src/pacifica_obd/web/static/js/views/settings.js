@@ -68,13 +68,13 @@ export function render(root, ctx) {
     max_live_reads_per_turn: [0, 50],
   };
 
-  async function loadAI() {
+  async function loadAI(pendingProvider = null) {
     try {
       const [config, listing] = await Promise.all([api.aiConfig(), api.aiProviders()]);
       const providers = listing.providers || [];
       const byId = new Map(providers.map((row) => [row.id, row]));
       clear(aiHolder);
-      const view = aiCard(config, providers, byId);
+      const view = aiCard(config, providers, byId, pendingProvider);
       aiHolder.appendChild(view.root);
       await view.init();
       // Deterministic deep link for screenshot automation, matching the other
@@ -88,9 +88,30 @@ export function render(root, ctx) {
     }
   }
 
-  function aiCard(config, providers, byId) {
+  // A provider's human name without the parenthetical ("Anthropic (Claude)" ->
+  // "Anthropic"), for a sentence and a one-click button.
+  function shortLabel(config, provider) {
+    const label = config?.provider_labels?.[provider] || provider || "provider";
+    return String(label).replace(/\s*\(.*\)\s*$/, "");
+  }
+
+  function article(name) {
+    return /^(LM|LLM|[AEIOU])/i.test(String(name)) ? "An" : "A";
+  }
+
+  function savedProviders(config) {
+    if (Array.isArray(config.saved_key_providers)) return config.saved_key_providers;
+    return Object.entries(config.keys || {})
+      .filter(([, info]) => info?.configured)
+      .map(([id]) => id);
+  }
+
+  function aiCard(config, providers, byId, pendingProvider = null) {
     let preset = byId.get(config.provider || "") || null;
     let testInFlight = false;
+    // Set when "Save key" saved a key for a provider other than the configured
+    // one; cleared as soon as the person edits the provider choice.
+    let pending = pendingProvider;
     // A provider/model switch while a request is in flight must not let the older
     // response repaint the newer form.
     let listSeq = 0;
@@ -133,7 +154,7 @@ export function render(root, ctx) {
     });
     const keyInput = keyField.querySelector("input");
     const keyRequirement = h("p.sub", { id: "ai-key-hint" });
-    const keyState = h("div.row", { id: "ai-key-state" });
+    const keyState = h("div.chips.chips--picker", { id: "ai-key-state" });
 
     const toggleDefs = [
       ["send-remote", "Send bus data to a remote model", config.send_bus_data_to_remote],
@@ -202,6 +223,7 @@ export function render(root, ctx) {
       h("p.sub", { text: "Reads are cache-first; live reads need the setting above, an idle bus and a per-turn cap. The assistant's tools are read-only." }));
 
     on(providerControl, "change", () => {
+      pending = null;
       applyPreset(true);
       invalidateTest();
       loadModels();
@@ -253,28 +275,98 @@ export function render(root, ctx) {
     }
 
     /* --- banner + provider change --------------------------------------- */
+    // The server sends an explicit `state`; when the form is showing another
+    // provider than the saved one, derive the state from the form + stored keys
+    // so the banner never claims "ready" for a provider with no key.
+    function setupState() {
+      const id = providerControl.value;
+      if (id === (config.provider || "") && config.state) return config.state;
+      const row = byId.get(id) || null;
+      if (!id) return savedProviders(config).length ? "key_without_provider" : "unconfigured";
+      if (row && row.requires_key && !(config.keys || {})[id]?.configured) {
+        return "provider_without_key";
+      }
+      return "ready";
+    }
+
     function updateBanner() {
       clear(statusBanner);
+      const state = setupState();
       const row = byId.get(providerControl.value) || null;
       const effectiveBase = baseInput.value.trim() || (row ? row.default_base_url : "");
       const local = isLocal(effectiveBase, row);
-      let kind = "info";
-      let text;
-      if (!providerControl.value) {
-        kind = "warn";
-        text = "No provider configured. Pick a provider and paste a key, or point Base URL at a local model.";
-      } else if (local) {
-        text = "Local model: vehicle data does not leave this machine.";
-      } else if (flag("local-only")) {
-        kind = "warn";
-        text = "Local models only is on: this remote provider will be refused. Turn that setting off or choose a local provider.";
-      } else if (!flag("send-remote")) {
-        kind = "warn";
-        text = "Remote model: enable 'Send bus data to a remote model' before a task can attach vehicle data.";
+      if (state === "key_without_provider") {
+        // The owner's trap: a key exists, but no provider was ever selected, so
+        // "no provider configured" was technically true and completely useless.
+        const id = config.suggested_provider || savedProviders(config)[0];
+        const label = shortLabel(config, id);
+        statusBanner.appendChild(banner(
+          `${article(label)} ${label} key is saved, but no provider is selected.`, "warn",
+          h("button.btn.btn--sm", { type: "button", text: `Use ${label}`,
+            onClick: () => chooseProvider(id) })));
+      } else if (state === "provider_without_key") {
+        const label = shortLabel(config, providerControl.value || config.provider);
+        statusBanner.appendChild(banner(
+          `${label} is selected but has no key — paste one below and press Save key.`, "warn"));
+      } else if (state === "invalid") {
+        statusBanner.appendChild(banner(
+          `The saved AI configuration is incomplete — ${config.state_reason || "check the provider, model and base URL"}.`,
+          "warn"));
       } else {
-        text = `Remote model: bus data will be sent to ${effectiveBase || "the configured endpoint"}.`;
+        let kind = "info";
+        let text;
+        if (state === "unconfigured") {
+          kind = "warn";
+          text = "No provider configured. Pick a provider and paste a key, or point Base URL at a local model.";
+        } else if (local) {
+          text = "Local model: vehicle data does not leave this machine.";
+        } else if (flag("local-only")) {
+          kind = "warn";
+          text = "Local models only is on: this remote provider will be refused. Turn that setting off or choose a local provider.";
+        } else if (!flag("send-remote")) {
+          kind = "warn";
+          text = "Remote model: enable 'Send bus data to a remote model' before a task can attach vehicle data.";
+        } else {
+          text = `Remote model: bus data will be sent to ${effectiveBase || "the configured endpoint"}.`;
+        }
+        statusBanner.appendChild(banner(text, kind));
       }
-      statusBanner.appendChild(banner(text, kind));
+      // A key just saved for a *different* provider: offer the switch explicitly
+      // instead of pretending the save changed the configured provider. (With no
+      // provider configured the state banner above already offers the switch.)
+      if (pending && config.provider && pending !== config.provider) {
+        const label = shortLabel(config, pending);
+        const current = shortLabel(config, config.provider);
+        statusBanner.appendChild(banner(
+          `${label} key saved, but ${current} is still selected.`, "warn",
+          h("button.btn.btn--sm", { type: "button", text: `Use ${label} instead`,
+            onClick: () => chooseProvider(pending) })));
+      }
+    }
+
+    // Select a provider explicitly via the server endpoint: it fills only empty
+    // preset defaults and preserves any model or base URL already saved, so no
+    // display value is written back and a custom value is never clobbered.
+    async function chooseProvider(id) {
+      if (providerControl.value !== id) {
+        providerControl.value = id;
+        applyPreset(true);
+      }
+      try {
+        const updated = await api.aiSelectProvider(id);
+        const label = shortLabel(config, id);
+        // An environment override can keep another provider effective; name it
+        // rather than claiming the selection took effect.
+        if (updated && updated.provider && updated.provider !== id) {
+          toast(`Saved ${label}; ${shortLabel(updated, updated.provider)} is set by the environment`, "warn", 0);
+        } else {
+          toast(`${label} selected`);
+        }
+        await loadAI();
+      } catch (error) {
+        toast(`${error.code || "error"}: ${error.message}`, "err", 0);
+        if (/model|base URL/i.test(String(error?.message || ""))) modelInput.focus();
+      }
     }
 
     function applyPreset(reset) {
@@ -337,10 +429,19 @@ export function render(root, ctx) {
       for (const name of ids) {
         const info = keys[name] || {};
         const selected = name === providerControl.value;
+        const label = shortLabel(config, name);
         const text = info.configured
-          ? `${name}: configured ${info.hint || "…"}${info.source ? ` (${info.source})` : ""}`
-          : `${name}: no key`;
-        keyState.appendChild(tonePill(text, info.configured && selected ? "ok" : "idle"));
+          ? `${label}: configured ${info.hint || "…"}${info.source ? ` (${info.source})` : ""}`
+          : `${label}: no key`;
+        // A provider pill is also the selection control: choosing a provider and
+        // saving its key are one flow, not two independent saves.
+        keyState.appendChild(h("button.chip", {
+          type: "button",
+          "aria-pressed": selected ? "true" : "false",
+          title: info.configured
+            ? `Select ${label} (a key is saved)` : `Select ${label}`,
+          onClick: () => chooseProvider(name),
+        }, h("span.chip__label", { text })));
       }
     }
 
@@ -652,18 +753,43 @@ export function render(root, ctx) {
       const value = keyInput.value;
       if (!id) { toast("Choose a provider before saving a key", "warn"); return; }
       if (!value) { toast("Paste a key first", "warn"); keyInput.focus(); return; }
+      const label = shortLabel(config, id);
+      // Values typed but not yet saved: a key save reloads the card, so carry a
+      // non-empty model/base URL over instead of silently discarding the draft.
+      const draftModel = modelInput.value.trim();
+      const draftBase = baseInput.value.trim() || null;
       try {
         const result = await api.aiSetKey({ provider: id, key: value });
         keyInput.value = "";
         const hint = result.key?.hint || "hidden";
-        // A newer backend may select the saved provider (when none was chosen)
-        // and reports why it could not; surface that instead of claiming a switch.
-        if (result.selected === false && result.reason) {
-          toast(`Key saved (${hint}) — ${result.reason}`, "warn", 0);
+        // The backend selects the saved provider when none was configured, and
+        // reports why it did not switch an existing one. The unselected case
+        // reloads with `pending`, which renders an actionable "Use X instead".
+        if (result.selected === false) {
+          toast(`Key saved (${hint}) — ${result.reason || "not selected"}`, "warn", 0);
+          // Nothing was selected before, so this draft *is* the user configuring
+          // this provider (a custom endpoint with no preset defaults, say):
+          // persist it so the reload does not discard what they typed. When
+          // another provider is configured the draft belongs to the key's
+          // provider and must not overwrite the configured one.
+          if (!config.provider && (draftModel || draftBase)) {
+            try { await api.aiSetConfig({ provider: id, model: draftModel, base_url: draftBase }); }
+            catch (error) { toast(`Settings not saved: ${error.message}`, "warn", 0); }
+          }
+        } else if (result.selected === true) {
+          const patch = {};
+          if (draftModel && draftModel !== (config.model || "")) patch.model = draftModel;
+          if (draftBase && draftBase !== (config.base_url || null)) patch.base_url = draftBase;
+          if (Object.keys(patch).length) {
+            try { await api.aiSetConfig(patch); }
+            catch (error) { toast(`Settings not saved: ${error.message}`, "warn", 0); }
+          }
+          toast(`Key saved (${hint}) — ${label} selected`);
         } else {
+          // An older server does not report `selected`: never claim a switch.
           toast(`Key saved (${hint})`);
         }
-        await loadAI();
+        await loadAI(result.selected === false ? id : null);
       } catch (error) {
         toast(`${error.code || "error"}: ${error.message}`, "err", 0);
       }
