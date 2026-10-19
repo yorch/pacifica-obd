@@ -155,6 +155,40 @@ def test_guard_transmits_only_after_a_positive_authorisation():
     assert result["request"] == "2702E0E2DC58"
 
 
+def test_reserve_stops_an_older_seed_inheriting_the_newest_epoch():
+    """The race: preview A reads seed A, another read bumps, A then issues.
+
+    Issuing used to bump the epoch itself, so the stale seed A got the newest epoch
+    and passed both consume() and authorize(). Reserving *before* the read stamps
+    the lease with the epoch of its own read instead.
+    """
+    store = policy.SecurityLeaseStore(clock=Clock())
+    # preview A reserves, then reads seed A
+    epoch_a = store.reserve(MODULE, LEVEL, BUS)
+    lease_a = store.issue(MODULE, LEVEL, "A1B2C3D4", bus=BUS, generation=GEN,
+                          key_hex="E0E2DC58", epoch=epoch_a, created=1000.0)
+    # another seed request for the same target arrives and completes
+    store.reserve(MODULE, LEVEL, BUS)
+    # A's lease is now superseded, even though it was issued after that read began
+    decision = store.consume(lease_a.token, module=MODULE, level=LEVEL, bus=BUS,
+                             generation=GEN)
+    assert decision.send is False
+    assert decision.status == "superseded", decision
+
+
+def test_the_ttl_starts_when_the_seed_was_acquired():
+    """A slow multi-frame read must not extend the lease by the read's duration."""
+    clock = Clock()
+    store = policy.SecurityLeaseStore(clock=clock)
+    epoch = store.reserve(MODULE, LEVEL, BUS)
+    lease = store.issue(MODULE, LEVEL, "A1B2C3D4", bus=BUS, generation=GEN,
+                        epoch=epoch, created=960.0)   # acquired 40 s ago
+    assert lease.expired(clock.now) is True
+    decision = store.authorize(lease.token, module=MODULE, level=LEVEL, bus=BUS,
+                               generation=GEN)
+    assert decision.send is False and decision.status == "expired", decision
+
+
 if __name__ == "__main__":
     for name, func in sorted(globals().items()):
         if name.startswith("test_") and callable(func):

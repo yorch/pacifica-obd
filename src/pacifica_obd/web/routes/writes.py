@@ -172,12 +172,13 @@ async def write_did_confirm(request: Request, body: WriteConfirmRequest):
                           "error": str(exc)[:200]})
             ctx.close_session(session_id, "error")
             raise
-        audit.record(ctx.store, session_id, "write-send", result.get("request") or entry.request,
-                     {"module": params["module"], "bus": params["bus"], "service": "2E",
-                      "request": result.get("request"), "did": params["did"],
-                      "data": params["data"], "sent": bool(result.get("sent")),
-                      "outcome": result.get("status"),
-                      "current": result.get("current")})
+        result["audit"] = audit.record(
+            ctx.store, session_id, "write-send", result.get("request") or entry.request,
+            {"module": params["module"], "bus": params["bus"], "service": "2E",
+             "request": result.get("request"), "did": params["did"],
+             "data": params["data"], "sent": bool(result.get("sent")),
+             "outcome": result.get("status"),
+             "current": result.get("current")})
         if result.get("status") == "confirm_stale":
             ctx.close_session(session_id, "confirm_stale")
             raise errors.ApiError("confirm_stale", "confirm",
@@ -285,12 +286,13 @@ async def routine_confirm(request: Request, body: WriteConfirmRequest):
                           "error": str(exc)[:200]})
             ctx.close_session(session_id, "error")
             raise
-        audit.record(ctx.store, session_id, "write-send", result.get("request"),
-                     {"module": params["module"], "bus": params["bus"], "service": "31",
-                      "request": result.get("request"), "rid": params["rid"],
-                      "sub": params["sub"], "data": params.get("data", ""),
-                      "sent": bool(result.get("sent")),
-                      "outcome": result.get("status")})
+        result["audit"] = audit.record(
+            ctx.store, session_id, "write-send", result.get("request"),
+            {"module": params["module"], "bus": params["bus"], "service": "31",
+             "request": result.get("request"), "rid": params["rid"],
+             "sub": params["sub"], "data": params.get("data", ""),
+             "sent": bool(result.get("sent")),
+             "outcome": result.get("status")})
         ctx.close_session(session_id, result.get("status") or "ok")
         return result
 

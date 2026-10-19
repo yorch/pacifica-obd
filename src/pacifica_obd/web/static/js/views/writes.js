@@ -172,11 +172,17 @@ export function render(root, ctx) {
   }
 
   function resultCard(result) {
+    const audit = result.audit || {};
+    // Only claim the trail exists when the server said it was stored; auditing is
+    // best-effort and a write must not be reported as recorded when it was not.
+    const auditNote = audit.stored
+      ? "The outcome was written to the local audit log."
+      : "The local audit log did not record this outcome — note it down.";
     return h("div", null,
       pill(result.status, result.status === "ok" ? "ok" : "crit"),
       keyValues([["Module", result.module], ["Bus", result.bus],
         ["Request", result.request], ["Raw", result.raw]]),
-      h("p.sub", { text: "The outcome was written to the local audit log." }));
+      h("p.sub", { text: auditNote }));
   }
 
   function fail(holder, error) {

@@ -20,6 +20,7 @@ sent.
 from __future__ import annotations
 
 import asyncio
+import time
 
 from fastapi import APIRouter, Request
 
@@ -123,16 +124,23 @@ async def preview(request: Request, body: SecurityPreviewRequest):
 
     # A new challenge supersedes any earlier preview for this target, even if
     # this read later fails.
-    _leases(request).invalidate(body.module, body.level, body.bus)
+    lease_store = _leases(request)
 
     def job(ctx):
         adapter = ctx.uds()
+        # Reserve the challenge epoch *before* reading the seed. Stamping the lease
+        # at issue time (after the read) let a racing seed request promote an older
+        # seed to the newest epoch, so both consume() and authorize() accepted it.
+        epoch = lease_store.reserve(body.module, body.level, body.bus)
         result = service.preview_security_key(
             adapter, bus=body.bus, module=body.module, level=body.level,
             device_id=body.device_id, variant_id=body.variant_id,
             supplier=body.supplier, timeout_ms=timeout_ms, cancel=ctx.cancel,
         )
         result["generation"] = str(getattr(ctx.worker.backend, "generation", 0))
+        result["epoch"] = epoch
+        # The TTL starts when the seed was acquired, not when the lease was issued.
+        result["acquired"] = time.monotonic()
         session_id = ctx.open_session("security-preview", body.model_dump(exclude={"timeout_ms"}))
         audit.record(ctx.store, session_id, "security-preview",
                      f"{result.get('module')} 27{body.level:02X}",
@@ -147,7 +155,6 @@ async def preview(request: Request, body: SecurityPreviewRequest):
         return result
 
     result = await deps.run_job(worker, "security-preview", job, exclusive=True, timeout_s=30.0)
-    lease_store = _leases(request)
     if result.get("status") == "preview" and result.get("key") and result.get("seed"):
         generation = str(result.get("generation")
                          or getattr(worker.backend, "generation", 0))
@@ -157,6 +164,7 @@ async def preview(request: Request, body: SecurityPreviewRequest):
             key_hex=result["key"], algorithm=result.get("algorithm"),
             params={"device_id": body.device_id, "variant_id": body.variant_id,
                     "supplier": body.supplier},
+            epoch=result.get("epoch"), created=result.get("acquired"),
         )
         result["confirm_token"] = lease.token
         result["expires_in_s"] = lease.ttl_s

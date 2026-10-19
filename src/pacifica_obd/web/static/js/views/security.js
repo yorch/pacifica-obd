@@ -19,7 +19,7 @@ export function render(root, ctx) {
 
   const hold = {
     explain: h("p.sub", { text: "Offline: picks the algorithm for this target from the bundled selector table. Reads nothing from the vehicle." }),
-    seed: h("p.sub", { text: "Reads the seed only (0x27 <level>). Nothing is sent to the module." }),
+    seed: h("p.sub", { text: "Reads the seed (0x27 <level>): a session request and the seed request go to the module. No key is sent." }),
     preview: h("p.sub", { text: "Reads the seed, computes the key and shows the exact wire bytes. Still nothing sent." }),
     result: h("p.sub", { text: "The reviewed key is sent here, after a typed confirmation." }),
   };
@@ -36,7 +36,7 @@ export function render(root, ctx) {
 
   const head = h("div.view__head", null,
     h("div", null, h("h1", { text: "Security access 0x27" }),
-      h("div.sub", { text: "One seed, held under a short lease; a key is computed and shown before anything is sent. A wrong key can lock a module." })));
+      h("div.sub", { text: "One seed, held under a short lease; a key is computed and shown before it is sent. A wrong key can lock a module." })));
 
   mount(root, head,
     banner(writesEnabled
@@ -45,7 +45,7 @@ export function render(root, ctx) {
     card({ eyebrow: "Target", title: "Explain the algorithm choice (offline)", actions:
       h("button.btn.btn--sm", { type: "button", text: "Explain", onClick: explain }),
       body: h("div.stack", null, form(Object.values(fields)), hold.explain) }),
-    card({ eyebrow: "Read", title: "Read the seed (nothing is sent)", actions:
+    card({ eyebrow: "Read", title: "Read the seed (no key is sent)", actions:
       h("button.btn.btn--sm", { type: "button", text: "Read seed", onClick: readSeed }),
       body: hold.seed }),
     card({ eyebrow: "Review", title: "Compute the key and show the wire bytes", actions:
@@ -124,7 +124,7 @@ export function render(root, ctx) {
 
   /* ---------------------------------------------------------------- seed */
   async function readSeed() {
-    note(hold.seed, loadingState("Reading the seed (nothing is sent)…"));
+    note(hold.seed, loadingState("Reading the seed (no key is sent)…"));
     try {
       const result = await api.securitySeed(target());
       note(hold.seed, resultCard(result));
@@ -166,7 +166,9 @@ export function render(root, ctx) {
       request: result.request,
       module: result.module,
       warning: "A wrong key can lock the ECU. The Security Gateway usually blocks writes on 2018+ vehicles.",
-      hint: `Type ${result.module} to send the key that was previewed. If the seed changed, nothing is sent.`,
+      hint: result.strict
+        ? `Type ${result.module} to send the key that was previewed. The seed is re-read first; if it changed, nothing is sent.`
+        : `Type ${result.module} to send the key that was previewed. The held seed is not re-read — a wrong key can lock a module.`,
       onConfirm: (close) => { close(); send(result); },
     });
   }

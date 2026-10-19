@@ -308,8 +308,15 @@ class AIConfig:
 
         try:
             raw = read_json_file(path)
-        except Exception:  # noqa: BLE001
-            raw = {}
+        except Exception as exc:  # noqa: BLE001
+            # Refuse rather than overwrite: an unreadable file may still hold the
+            # user's keys, and silently replacing it with this class's fields would
+            # destroy them (the cache store already refuses; this is the other half).
+            from pacifica_obd.web.ai.keys import KeyStoreError
+
+            raise KeyStoreError(
+                "the AI configuration could not be read, so it was not overwritten "
+                f"(it may still hold your keys): {exc}") from exc
         # Start from what is already on disk and overlay the fields this class
         # owns: the file also holds the model-list cache, which must survive a
         # config save (an earlier version dropped it on every Save AI settings).

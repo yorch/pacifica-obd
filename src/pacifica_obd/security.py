@@ -173,10 +173,25 @@ class SecurityLeaseStore:
         return self.peek(token)
 
     # -- lifecycle ---------------------------------------------------------
+    def reserve(self, module, level: int, bus: str | None = None) -> int:
+        """Bump and return the challenge epoch for a target, *before* reading a seed.
+
+        Reserving before the read is what makes a racing preview safe: the lease is
+        then stamped with the epoch of the read that produced its seed, so a newer
+        seed request supersedes it instead of an older seed inheriting the newest
+        epoch and passing every check (adversarial review finding).
+        """
+        key = self._key(module, level, bus)
+        with self._lock:
+            epoch = self._epochs.get(key, 0) + 1
+            self._epochs[key] = epoch
+            return epoch
+
     def issue(self, module, level: int, seed, *, bus: str | None = None,
               generation: str = "", ttl_s: float | None = None,
               key_hex: str | None = None, algorithm: str | None = None,
-              params: dict | None = None) -> SecurityLease:
+              params: dict | None = None, epoch: int | None = None,
+              created: float | None = None) -> SecurityLease:
         """Hold a seed for a short window and return its unguessable lease."""
         level = int(level)
         if level % 2 == 0 or not 0x01 <= level <= 0x7D:
@@ -184,8 +199,9 @@ class SecurityLeaseStore:
         key = self._key(module, level, bus)
         with self._lock:
             self._purge_locked()
-            epoch = self._epochs.get(key, 0) + 1
-            self._epochs[key] = epoch
+            if epoch is None:
+                epoch = self._epochs.get(key, 0) + 1
+                self._epochs[key] = epoch
         lease = SecurityLease(
             token=secrets.token_urlsafe(32),
             module=normalize_module(module),
@@ -193,7 +209,7 @@ class SecurityLeaseStore:
             bus=(str(bus) if bus else None),
             seed=normalize_seed(seed),
             generation=str(generation or ""),
-            created=self._clock(),
+            created=(self._clock() if created is None else float(created)),
             ttl_s=float(self.ttl_s if ttl_s is None else ttl_s),
             epoch=epoch,
             key_hex=(normalize_seed(key_hex) if key_hex else None),

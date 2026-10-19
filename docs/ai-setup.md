@@ -98,8 +98,11 @@ The payload also carries the ids needed to act on that state without guessing:
 
 `reason` is a fixed phrase (for example `another provider is configured` or
 `a model id is required before this provider can be used`) — never a value from
-the request or the file, so a key can never come back through it. The key value
-is never returned either — only the masked hint.
+the request or the file, so a key can never come back through it. No endpoint
+returns the key value — only a masked hint (`…f3a2`) — and every response and SSE
+payload is scrubbed for the configured literals before it is written, because an
+absolute "never returns the key" claim was false on one URL-echoing path before
+that path was fixed.
 
 `POST /api/ai/select` takes only `{"provider": "anthropic"}`. Selecting the
 provider that is already configured, or the first selection when none was
@@ -205,8 +208,9 @@ also honoured:
 `~/.config/pacifica-obd`), written atomically with mode `0600` and a `0700`
 parent. A file readable by other users is **refused**, not silently used.
 
-The key is never logged, never returned by the API, never written to a report or
-the diagnostic store, and never emitted on the SSE stream: a logging filter
-rewrites key-shaped text (and any configured literal) before it reaches a
-handler, and the chat engine scrubs every outbound token, tool payload and error
-before serialising it.
+The key is not logged, not written to a report or the diagnostic store, and not
+emitted on the SSE stream: a logging filter rewrites key-shaped text (and any
+configured literal, exception text included) before it reaches a handler, and the
+chat engine scrubs every outbound token, tool payload and error — the structured
+value before it is serialised, not the JSON string after. No endpoint returns the
+key value; responses carry a masked hint.
