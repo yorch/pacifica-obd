@@ -19,10 +19,14 @@ import inspect
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Protocol, runtime_checkable
 
+from pacifica_obd.web.ai import presets as _presets
+
 __all__ = [
     "ModelInfo", "Message", "ToolSpec", "ChatRequest",
     "Token", "ToolCall", "ToolResult", "Usage", "Done", "ProviderError", "Event",
     "Provider", "PROVIDERS", "build_provider", "map_http_error", "estimate_tokens",
+    "effective_model", "config_base_url", "iter_sse_data", "retry_backoff",
+    "read_capped", "MAX_MODELS",
 ]
 
 
@@ -183,21 +187,137 @@ def estimate_tokens(text: str) -> int:
     return max(1, (len(text) + 3) // 4)
 
 
+#: Codes a transport may retry when nothing has been emitted yet.
+RETRYABLE_CODES = frozenset({"timeout", "network", "unavailable", "rate_limit"})
+MAX_BACKOFF_S = 2.0
+
+#: Hard caps so a hostile or broken endpoint cannot exhaust memory. A chat turn
+#: that legitimately exceeds these is pathological; failing closed is safer.
+MAX_SSE_BYTES = 16 * 1024 * 1024
+MAX_SSE_LINE_BYTES = 2 * 1024 * 1024
+MAX_ERROR_BODY_BYTES = 64 * 1024
+MAX_MODELS = 2000
+
+
+async def iter_sse_data(response, *, max_bytes: int = MAX_SSE_BYTES,
+                        max_line: int = MAX_SSE_LINE_BYTES):
+    """Yield the concatenated ``data:`` payload of each SSE event on ``response``.
+
+    Parsed from raw **bytes** so the byte budget is enforced *before* a line is
+    buffered: ``response.aiter_lines()`` would itself accumulate an unterminated
+    line without limit, so this splits lines from bounded chunks instead. Per the
+    SSE spec several ``data:`` lines in one event join with a newline; blank lines
+    delimit events; ``:`` comment lines are ignored.
+    """
+    data_lines: list[str] = []
+    buffer = b""
+    total = 0
+
+    def feed(line: bytes):
+        text = line.decode("utf-8", "replace").rstrip("\r")
+        if text == "":
+            return "\n".join(data_lines) if data_lines else None
+        if text.startswith(":"):
+            return None
+        field, _, value = text.partition(":")
+        if field == "data":
+            data_lines.append(value[1:] if value.startswith(" ") else value)
+        return None
+
+    async for chunk in response.aiter_bytes():
+        total += len(chunk)
+        if total > max_bytes:
+            raise ProviderError("unavailable", "the provider sent an oversized stream")
+        buffer += chunk
+        while True:
+            newline = buffer.find(b"\n")
+            if newline == -1:
+                break
+            line, buffer = buffer[:newline], buffer[newline + 1:]
+            if len(line) > max_line:
+                raise ProviderError("unavailable",
+                                    "the provider sent an oversized stream")
+            event = feed(line)
+            if event is not None:
+                data_lines = []
+                yield event
+        if len(buffer) > max_line:
+            raise ProviderError("unavailable", "the provider sent an oversized stream")
+    if buffer:
+        event = feed(buffer)
+        if event is not None:
+            yield event
+    if data_lines:
+        yield "\n".join(data_lines)
+
+
+async def read_capped(response, limit: int = MAX_ERROR_BODY_BYTES) -> bytes:
+    """Read at most ``limit`` bytes of a response (never buffer an unbounded body).
+
+    Used for HTTP error bodies: the body is only inspected to classify the error
+    and is never returned to a client, so truncating it is safe.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in response.aiter_bytes():
+        remaining = limit - total
+        if remaining <= 0:
+            break
+        chunks.append(chunk[:remaining])
+        total += len(chunk)
+        if total >= limit:
+            break
+    return b"".join(chunks)
+
+
+def retry_backoff(error: "ProviderError", attempt: int) -> float:
+    """Seconds to wait before retry number ``attempt`` (1-based), capped."""
+    if getattr(error, "retry_after_s", None):
+        return float(min(max(int(error.retry_after_s), 0), MAX_BACKOFF_S))
+    return min(0.5 * (2 ** (max(1, attempt) - 1)), MAX_BACKOFF_S)
+
+
 # --------------------------------------------------------------------------- #
 # registry
 # --------------------------------------------------------------------------- #
-#: provider id -> factory. Labels are intentionally vendor-neutral: the shipped
-#: UI never names a vendor (design §9 / task constraint).
-PROVIDERS: dict[str, str] = {
-    "openai_compat": "Compatible chat API (hosted or local)",
-    "anthropic": "Native messages API",
-    "fake": "Deterministic offline provider (testing)",
-}
+#: preset id -> label. The set of provider ids the API accepts is exactly the
+#: preset registry (see :mod:`pacifica_obd.web.ai.presets`).
+PROVIDERS: dict[str, str] = {pid: p.label for pid, p in _presets.PRESETS.items()}
 
-DEFAULT_BASE_URLS = {
-    "openai_compat": "https://api.example.invalid/v1",
-    "anthropic": "https://api.example.invalid",
-}
+#: Kept for backwards compatibility; the live defaults live in the preset rows.
+DEFAULT_BASE_URLS = {pid: p.default_base_url for pid, p in _presets.PRESETS.items()}
+
+
+def effective_model(config) -> str:
+    """The model the adapters should send for ``config`` (config wins, then preset)."""
+    getter = getattr(config, "effective_model", None)
+    if callable(getter):
+        return getter()
+    model = (getattr(config, "model", "") or "").strip()
+    if model:
+        return model
+    found = _presets.preset(getattr(config, "provider", None))
+    return found.default_model if found else ""
+
+
+def config_base_url(config, fallback: str = "") -> str:
+    """The base URL a config points at, or the preset default, or ``fallback``.
+
+    Prefers an explicit ``config.url()`` (which knows the preset) but tolerates a
+    plain object that only carries ``base_url`` — the adapters are constructed
+    with the latter in a couple of unit tests.
+    """
+    url = getattr(config, "base_url", None)
+    if not url:
+        getter = getattr(config, "url", None)
+        if callable(getter):
+            try:
+                url = getter()
+            except Exception:  # noqa: BLE001 - never let a bad config crash a build
+                url = None
+    if not url:
+        url = _presets.default_base_url(getattr(config, "provider", None)) or fallback
+    return str(url or "").rstrip("/")
 
 
 def build_provider(config, key: str | None = None, *, transport=None):
@@ -209,17 +329,18 @@ def build_provider(config, key: str | None = None, *, transport=None):
     provider_id = (getattr(config, "provider", None) or "").strip()
     if not provider_id:
         raise ProviderError("bad_request", "no provider is configured")
-    if provider_id not in PROVIDERS:
+    found = _presets.preset(provider_id)
+    if found is None:
         raise ProviderError("bad_request", f"unknown provider: {provider_id!r}")
-    if provider_id == "fake":
+    if found.format == _presets.FAKE_FORMAT:
         from pacifica_obd.web.ai.fake import FakeProvider
 
-        return FakeProvider(model=getattr(config, "model", "") or "fake-1")
-    if provider_id == "openai_compat":
+        return FakeProvider(model=effective_model(config) or "fake-1")
+    if found.format == _presets.OPENAI_COMPAT_FORMAT:
         from pacifica_obd.web.ai.openai_compat import OpenAICompatProvider
 
         return OpenAICompatProvider(config, key=key, transport=transport)
-    if provider_id == "anthropic":
+    if found.format == _presets.ANTHROPIC_FORMAT:
         from pacifica_obd.web.ai.anthropic import AnthropicProvider
 
         return AnthropicProvider(config, key=key, transport=transport)

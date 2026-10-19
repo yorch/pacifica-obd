@@ -25,17 +25,33 @@ from pacifica_obd.web import deps, errors
 from pacifica_obd.web.ai import backend as ai_backend
 from pacifica_obd.web.ai import config as ai_config
 from pacifica_obd.web.ai import keys as ai_keys
+from pacifica_obd.web.ai import presets as ai_presets
 from pacifica_obd.web.ai import prompts as ai_prompts
 from pacifica_obd.web.ai import tools as ai_tools
 from pacifica_obd.web.ai.chat import ChatEngine, RateLimiter
 from pacifica_obd.web.ai.keys import redact_text
-from pacifica_obd.web.ai.providers import Message, ProviderError, build_provider
+from pacifica_obd.web.ai.providers import (
+    Message,
+    ProviderError,
+    build_provider,
+    effective_model,
+)
 from pacifica_obd.web.ai.redact import redact_vin_text
-from pacifica_obd.web.schemas import AIChatRequest, AIConfigPatch, AIKeyRequest, AITaskRequest
+from pacifica_obd.web.schemas import (
+    AIChatRequest,
+    AIConfigPatch,
+    AIKeyRequest,
+    AITaskRequest,
+    AITestRequest,
+)
 
 router = APIRouter()
 
 TASKS = ("explain", "diagnose", "report", "compare", "pretrip")
+
+#: How long the connection test may take, and how many models it will name.
+TEST_TIMEOUT_S = 8.0
+TEST_MODEL_LIMIT = 50
 
 
 # --------------------------------------------------------------------------- #
@@ -70,11 +86,17 @@ def _provider_or_400(config, store: ai_keys.KeyStore):
         raise errors.ApiError("no_provider", "validation",
                               "no AI provider is configured; open Settings → AI",
                               http_status=400)
+    found = ai_presets.preset(config.provider)
     key = store.get(config.provider)
-    if config.provider != "fake" and not config.is_local() and not key:
-        raise errors.ApiError("no_key", "validation",
-                              "no key is configured for this provider", http_status=400,
-                              detail={"hint": "POST /api/ai/keys"})
+    # A key is only mandatory for a preset that declares one (the hosted
+    # vendors). A local server or a custom proxy may legitimately accept none;
+    # in that case a 401 from the server becomes an actionable `auth` error.
+    if found is not None and found.requires_key and not key:
+        raise errors.ApiError(
+            "no_key", "validation",
+            f"no API key is configured for {found.label}",
+            http_status=400,
+            detail={"hint": "POST /api/ai/keys", "provider": config.provider})
     try:
         provider = build_provider(config, key=key)
     except ProviderError as exc:
@@ -84,12 +106,22 @@ def _provider_or_400(config, store: ai_keys.KeyStore):
 
 
 def _public_config(config, store: ai_keys.KeyStore) -> dict:
+    redact = store.redactor()
     data = config.to_dict(include_keys=False)
-    data["base_url"] = config.base_url
-    data["url"] = config.url()
+    # A URL can carry a query-string credential; scrub the configured literals
+    # before echoing any of it back to the browser. The raw `model` is scrubbed
+    # too: a user can paste a key into any free-text field.
+    data["model"] = redact(config.model) if config.model else config.model
+    data["base_url"] = redact(config.base_url) if config.base_url else config.base_url
+    data["url"] = redact(config.url()) if config.url() else config.url()
     data["is_local"] = config.is_local()
-    data["keys"] = {name: store.masked(name) for name in ai_config.PROVIDER_LABELS}
-    data["provider_labels"] = dict(ai_config.PROVIDER_LABELS)
+    data["effective_model"] = redact(config.effective_model())
+    data["effective_base_url"] = redact(config.url()) if config.url() else None
+    data["format"] = config.format()
+    data["requires_key"] = config.requires_key()
+    data["preset"] = config.preset().as_dict() if config.preset() else None
+    data["keys"] = {name: store.masked(name) for name in ai_presets.PRESETS}
+    data["provider_labels"] = dict(ai_presets.PROVIDER_LABELS)
     data["defaults"] = {"base_urls": dict(ai_config.DEFAULT_BASE_URLS)}
     data["cost_table_date"] = ai_config.COST_TABLE_DATE
     data["local_base_hosts"] = sorted(ai_config.LOCAL_BASE_HOSTS)
@@ -112,25 +144,23 @@ def _runner(request: Request):
 # --------------------------------------------------------------------------- #
 # config + keys
 # --------------------------------------------------------------------------- #
-@router.get("/ai/providers", summary="Provider registry (no network, no keys)")
+@router.get("/ai/providers", summary="Provider registry with presets (no network, no keys)")
 async def providers():
     store = _keystore()
     config = _load_config()
     rows = []
-    for provider_id, label in ai_config.PROVIDER_LABELS.items():
+    for provider_id, found in ai_presets.PRESETS.items():
+        masked = store.masked(provider_id)
         selected = provider_id == config.provider
-        local = provider_id == "fake" or (selected and config.is_local())
-        entry = {
-            "id": provider_id,
-            "label": label,
-            "requires_key": provider_id != "fake",
-            "local": local,
-            "available": provider_id == "fake" or local or bool(store.get(provider_id)),
-            "hint": store.masked(provider_id).get("hint"),
+        rows.append({
+            **found.as_dict(),
             "selected": selected,
-        }
-        rows.append(entry)
-    return {"providers": rows, "cost_table_date": ai_config.COST_TABLE_DATE}
+            "key": masked,
+            "available": bool(masked["configured"]) or found.format == "fake"
+                         or (selected and config.is_local()) or not found.requires_key,
+        })
+    return {"providers": rows, "cost_table_date": ai_config.COST_TABLE_DATE,
+            "configured_provider": config.provider}
 
 
 @router.get("/ai/config", summary="Current AI configuration (never a key)")
@@ -143,10 +173,15 @@ async def get_config():
 async def put_config(request: Request, body: AIConfigPatch):
     store = _keystore()
     config = _load_config()
-    patch = {key: value for key, value in body.model_dump().items() if value is not None}
+    # `exclude_unset` distinguishes "field omitted" from "explicit null": a null
+    # on provider/model/base_url clears the field (so a reset is possible).
+    patch = body.model_dump(exclude_unset=True)
+    clearable = {"provider", "model", "base_url"}
+    patch = {key: value for key, value in patch.items()
+             if value is not None or key in clearable}
     try:
         updated = config.patch(patch).validate()
-    except ValueError as exc:
+    except (ValueError, TypeError) as exc:
         raise errors.validation(str(exc)) from exc
     try:
         updated.save()
@@ -158,11 +193,14 @@ async def put_config(request: Request, body: AIConfigPatch):
 @router.post("/ai/keys", summary="Set a provider key (write-only; returns a hint)")
 async def set_key(body: AIKeyRequest):
     provider = body.provider.strip()
-    if provider not in ai_config.PROVIDER_LABELS:
+    if provider not in ai_presets.PRESETS:
         raise errors.validation(f"unknown provider: {provider!r}")
     store = _keystore()
     try:
         store.set(provider, body.key)
+        # A fresh key must be masked by the log filter immediately, not at the
+        # next restart.
+        store.refresh_logging_literals()
     except ai_keys.KeyStoreError as exc:
         raise errors.ApiError("key_store", "validation", str(exc), http_status=400) from exc
     # Never echo the key back; a masked hint only.
@@ -171,11 +209,164 @@ async def set_key(body: AIKeyRequest):
 
 @router.delete("/ai/keys/{provider}", summary="Remove a provider key")
 async def delete_key(provider: str):
-    if provider not in ai_config.PROVIDER_LABELS:
+    if provider not in ai_presets.PRESETS:
         raise errors.validation(f"unknown provider: {provider!r}")
     store = _keystore()
     removed = store.delete(provider)
+    try:
+        store.refresh_logging_literals()
+    except Exception:  # noqa: BLE001 - logging is best-effort
+        pass
     return {"provider": provider, "removed": removed}
+
+
+@router.post("/ai/test", summary="Validate a configuration without starting a chat")
+async def test_connection(body: AITestRequest):
+    """Check the (possibly unsaved) configuration, and optionally probe it.
+
+    Never returns a provider's response body, never logs the key, and never
+    spends more than a handful of tokens: the probe lists models, or — when the
+    endpoint has no model list — sends a single ``max_tokens=1`` ping.
+    """
+    base = _load_config()
+    overrides = body.model_dump(exclude_unset=True, exclude={"probe"})
+    overrides = {key: value for key, value in overrides.items()
+                 if value is not None or key in ("provider", "model", "base_url")}
+    checks: list[dict] = []
+
+    def check(name: str, ok: bool, detail: str = "", **extra) -> bool:
+        checks.append({"name": name, "ok": bool(ok), "detail": detail, **extra})
+        return bool(ok)
+
+    try:
+        config = base.patch(overrides).validate()
+    except (ValueError, TypeError) as exc:
+        return {"ok": False, "checks": checks, "models": [],
+                "error": {"code": "validation", "message": str(exc)}}
+
+    found = config.preset()
+    store = _keystore()
+    redact = store.redactor()
+    key = store.get(config.provider) if config.provider else None
+    result = {
+        "ok": True,
+        "provider": config.provider,
+        "label": found.label if found else None,
+        "format": config.format(),
+        "local": config.is_local(),
+        "model": redact(effective_model(config)),
+        "base_url": redact(config.url()) if config.url() else None,
+        "requires_key": config.requires_key(),
+        "key": store.masked(config.provider) if config.provider else None,
+        "probed": bool(body.probe),
+        "checks": checks,
+        "models": [],
+        "error": None,
+    }
+
+    if not config.provider:
+        check("configuration", False, "no provider is selected")
+        result["ok"] = False
+        return result
+    check("configuration", True,
+          f"{found.label} · {config.format()} · {'local' if config.is_local() else 'remote'}")
+
+    if config.requires_key() and not key:
+        check("key", False, f"no API key is configured for {found.label}")
+        result["ok"] = False
+        return result
+    if key:
+        masked = store.masked(config.provider)
+        check("key", True, f"configured ({masked.get('source')}, {masked.get('hint')})")
+    else:
+        check("key", True, "not required for this provider")
+
+    if not body.probe:
+        return result
+
+    def fail(check_name: str, code: str, message: str) -> None:
+        check(check_name, False, message, code=code)
+        result["ok"] = False
+        result["error"] = {"code": code, "message": message}
+
+    try:
+        provider = build_provider(config, key=key)
+    except ProviderError as exc:
+        fail("provider", exc.code, exc.message)
+        return result
+
+    # One overall budget for the whole probe, so discovery + ping cannot sum to
+    # double the advertised timeout.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + TEST_TIMEOUT_S
+
+    async def bounded(coro):
+        remaining = max(0.1, deadline - loop.time())
+        return await asyncio.wait_for(coro, remaining)
+
+    model = effective_model(config)
+
+    def redact_models(models) -> list[str]:
+        return [redact(info.id) for info in models][:TEST_MODEL_LIMIT]
+
+    try:
+        if getattr(provider, "supports_model_discovery", True):
+            models = await bounded(provider.list_models())
+            result["models"] = redact_models(models)
+            check("endpoint", True, f"reachable; {len(models)} model(s)")
+        else:
+            # No model-discovery API (e.g. Anthropic): a 1-token ping is the only
+            # honest proof of reachability.
+            await bounded(_ping(provider, model))
+            check("endpoint", True, "reachable (no model list; a 1-token ping succeeded)")
+    except ProviderError as exc:
+        if exc.code == "bad_request" and getattr(provider, "supports_model_discovery", True):
+            # The server may simply have no /models route; a 1-token ping proves
+            # the chat path instead.
+            try:
+                await bounded(_ping(provider, model))
+                check("endpoint", True,
+                      "reachable (no model list; a 1-token ping succeeded)")
+            except ProviderError as ping_exc:
+                fail("endpoint", ping_exc.code, ping_exc.message)
+            except asyncio.TimeoutError:
+                fail("endpoint", "timeout", "the provider did not answer in time")
+            except Exception:  # noqa: BLE001 - never echo a fragment of the response
+                fail("endpoint", "internal", "the provider test failed")
+        else:
+            fail("endpoint", exc.code, exc.message)
+    except asyncio.TimeoutError:
+        fail("endpoint", "timeout", "the provider did not answer in time")
+    except Exception:  # noqa: BLE001 - never leak a raw traceback or a body fragment
+        fail("endpoint", "internal", "the provider test failed")
+    finally:
+        try:
+            await provider.aclose()
+        except Exception:  # noqa: BLE001
+            pass
+    return result
+
+
+async def _ping(provider, model: str) -> None:
+    """One cheap request that proves the chat path works (bounded by the caller).
+
+    Consumes the stream to a terminal event: a provider that yields one token and
+    then errors must not be reported as reachable.
+    """
+    from pacifica_obd.web.ai.providers import ChatRequest, Done
+
+    request = ChatRequest(model=model, system="Reply with a single character.",
+                          messages=[Message(role="user", content="ping")],
+                          temperature=0.0, max_output_tokens=1)
+    async for event in provider.stream(request):
+        if isinstance(event, ProviderError):
+            raise event
+        if isinstance(event, Done):
+            if event.reason in ("error", "cancelled", "budget", "rate_limit"):
+                raise ProviderError("unavailable",
+                                    "the provider did not complete the probe")
+            return
+    raise ProviderError("bad_request", "the provider did not complete a stream")
 
 
 @router.get("/ai/conversations", summary="Stored conversations (opt-in)")
@@ -216,12 +407,13 @@ async def conversation(conversation_id: str):
 # --------------------------------------------------------------------------- #
 def _preview(config, message: str) -> dict:
     redacted, _ = _prepare_user_message(config, message, None)
+    redact = ai_keys.KeyStore().redactor()
     system = ai_prompts.SYSTEM_PROMPT
     return {
         "provider": config.provider,
-        "provider_label": ai_config.PROVIDER_LABELS.get(config.provider or "", None),
-        "model": config.model,
-        "base_url": config.url() if not config.is_local() else None,
+        "provider_label": ai_presets.preset_label(config.provider),
+        "model": redact(effective_model(config)),
+        "base_url": redact(config.url()) if config.url() and not config.is_local() else None,
         "local": config.is_local(),
         "redact_vin": config.redact_vin,
         "send_bus_data_to_remote": config.send_bus_data_to_remote,
@@ -270,12 +462,21 @@ async def delete_conversations():
 # chat + tasks (SSE)
 # --------------------------------------------------------------------------- #
 def _prepare_user_message(config, message: str, vin: str | None):
-    redacted = redact_vin_text(message, enabled=bool(config.redact_vin))
+    from pacifica_obd.web.ai.keys import KeyStore
+
+    redactor = KeyStore().redactor()
+    redacted = redactor(redact_vin_text(message, enabled=bool(config.redact_vin)))
     return redacted, vin
 
 
-def _gather_context(cache, task: str | None, body, nonce: str | None = None) -> tuple[str, list[str], dict]:
-    """Gather a deterministic evidence pack (code, not model)."""
+def _gather_context(cache, task: str | None, body,
+                    nonce: str | None = None) -> tuple[str, list[str], dict]:
+    """Gather a deterministic evidence pack (code, not model).
+
+    Every stored read is scoped to **one** session so unrelated historical scans
+    (or another vehicle) cannot be presented as facts about the car in question.
+    The scope defaults to the most recent session; a task may name one.
+    """
     items: list[dict] = []
     meta: dict = {}
 
@@ -284,38 +485,62 @@ def _gather_context(cache, task: str | None, body, nonce: str | None = None) -> 
         items.append({"id": eid, "label": label, "tool": tool, "data": data,
                       "source": source or (spec.source if spec else "local-db")})
 
+    sessions = cache.call("list_sessions", {"limit": 1})
+    rows = list(sessions.get("sessions") or [])
+    requested = getattr(body, "session_id", None)
+    scope_id = requested or (rows[0].get("id") if rows else None)
+    scope = {"session_id": int(scope_id)} if scope_id else {}
+    meta["session_id"] = scope.get("session_id")
+    # Pin the cache backend to this session so every tool it serves (including
+    # vehicle context and discovery) stays in scope.
+    cache.session_id = scope.get("session_id")
+
     add("E1", "Adapter/connection status", "get_adapter_status",
         cache.call("get_adapter_status", {}))
     add("E2", "Vehicle context", "get_vehicle_context",
         cache.call("get_vehicle_context", {}))
+    if scope_id:
+        known = next((row for row in rows if row.get("id") == scope_id), None)
+        payload = {"session_id": int(scope_id),
+                   "note": "the stored reads below are scoped to this session only"}
+        if known is not None:
+            payload["row"] = known
+        else:
+            payload["requested"] = True
+        add("E3", "Evidence scope (one stored session)", "list_sessions", payload)
+    else:
+        add("E3", "Evidence scope", "list_sessions",
+            {"note": "no stored session found; vehicle reads below are absent"})
 
     context = getattr(body, "context", None) or {}
     selected = context.get("selection") if isinstance(context, dict) else None
     if selected:
-        add("E3", "User-selected item", "explain_selection", selected, source="local-db")
+        add("E4", "User-selected item", "explain_selection", selected, source="local-db")
 
     needs_vehicle = task in ("diagnose", "report", "pretrip", "compare", None)
     dtcs: list[dict] = []
     if needs_vehicle or task == "explain":
-        generic = cache.call("read_generic_dtcs", {})
+        generic = cache.call("read_generic_dtcs", dict(scope))
         dtcs = list(generic.get("dtcs") or [])
-        add("E4", "Generic DTCs (stored)", "read_generic_dtcs", generic)
+        add("E5", "Generic DTCs (scoped)", "read_generic_dtcs", generic)
 
     if task in ("diagnose", "pretrip"):
-        add("E5", "Per-module DTCs (stored)", "read_module_dtcs",
-            cache.call("read_module_dtcs", {}))
-        add("E6", "Readiness (stored, may be absent)", "read_readiness",
+        add("E6", "Per-module DTCs (scoped)", "read_module_dtcs",
+            cache.call("read_module_dtcs", dict(scope)))
+        add("E7", "Readiness (stored, may be absent)", "read_readiness",
             cache.call("read_readiness", {}))
 
     if task == "report" and getattr(body, "session_id", None):
-        add("E7", "Session", "get_session",
+        add("E8", "Session", "get_session",
             cache.call("get_session", {"session_id": int(body.session_id)}))
     if task == "compare" and getattr(body, "a", None) and getattr(body, "b", None):
-        add("E5", "Session diff", "compare_sessions",
+        add("E6", "Session diff", "compare_sessions",
             cache.call("compare_sessions", {"a": int(body.a), "b": int(body.b)}))
 
     if task == "pretrip":
-        verdict = _pretrip_verdict(dtcs)
+        coverage = cache.session_coverage(scope.get("session_id"))
+        meta["coverage"] = coverage
+        verdict = _pretrip_verdict(dtcs, coverage=coverage)
         meta["verdict"] = verdict
         add("E9", "Deterministic pre-trip verdict", "pretrip_verdict", verdict,
             source="local-db")
@@ -323,7 +548,7 @@ def _gather_context(cache, task: str | None, body, nonce: str | None = None) -> 
     flags = ai_prompts.safety_flags(dtcs)
     meta["safety_flags"] = flags
     if flags:
-        add("E8", "Deterministic safety flags", "safety_flags", {"flags": flags},
+        add("E10", "Deterministic safety flags", "safety_flags", {"flags": flags},
             source="local-db")
 
     text, ids = ai_prompts.render_evidence(items, nonce=nonce)
@@ -333,11 +558,21 @@ def _gather_context(cache, task: str | None, body, nonce: str | None = None) -> 
     return text, ids, meta
 
 
-def _pretrip_verdict(dtcs) -> dict:
+def _pretrip_verdict(dtcs, *, coverage: dict | None = None) -> dict:
     flags = ai_prompts.safety_flags(dtcs)
     codes = [str(dtc.get("code") or "") for dtc in dtcs or []]
     hard = [flag for flag in flags if flag.startswith(("High-voltage", "Fault in the hybrid"))
             or ": restraint" in flag or ": brake" in flag]
+    # A session id alone is not a scan: the session has to have recorded some
+    # diagnostic data (DTCs, discovery or DID/identification reads) before a
+    # "READY" is honest. A bare command session (e.g. `ports`) is not coverage.
+    has_scan = bool(coverage and coverage.get("diagnostic"))
+    if not has_scan:
+        return {"verdict": "INSUFFICIENT DATA", "dtc_count": len(codes), "codes": codes,
+                "reasons": ["no diagnostic read is recorded in the scoped session; "
+                            "run a scan before a pre-trip check"],
+                "coverage": coverage or {},
+                "computed_by": "deterministic rule table"}
     if hard:
         verdict = "DO NOT DRIVE"
     elif codes:
@@ -346,7 +581,8 @@ def _pretrip_verdict(dtcs) -> dict:
         verdict = "READY"
     return {"verdict": verdict, "dtc_count": len(codes), "codes": codes,
             "reasons": hard or ([f"{len(codes)} stored code(s)"] if codes
-                                else ["no stored codes in the evidence pack"]),
+                                else ["no stored codes in the scoped evidence pack"]),
+            "coverage": coverage or {},
             "computed_by": "deterministic rule table"}
 
 
@@ -403,7 +639,7 @@ async def _chat_stream(request: Request, *, message, tools, task, context,
     limiter = _rate_limiter(request, config)
     worker, run = _runner(request)
 
-    user_text = redact_vin_text(message, enabled=bool(config.redact_vin))
+    user_text = redactor(redact_vin_text(message, enabled=bool(config.redact_vin)))
     messages = [Message(role="user", content=user_text)]
     cancel = asyncio.Event()
     conversation = conversation_id or uuid.uuid4().hex
@@ -412,20 +648,25 @@ async def _chat_stream(request: Request, *, message, tools, task, context,
     async def turn():
         pack, ids = None, []
         try:
+            scope_id = None
             if allow_bus:
                 cache = ai_backend.CacheToolBackend(config, worker=worker)
                 envelope = _Envelope(context, session_id, a, b)
                 pack, ids, _meta = await asyncio.to_thread(
                     _gather_context, cache, task, envelope, engine_nonce())
+                scope_id = _meta.get("session_id")
             # The tool backend is only wired when bus data is allowed; with consent
-            # off it is None, so the engine cannot dispatch even if asked.
-            backend = ai_backend.WebToolBackend(worker, config, runner=run) if allow_bus else None
+            # off it is None, so the engine cannot dispatch even if asked. It is
+            # pinned to the task's session so a tool call cannot widen the scope.
+            backend = (ai_backend.WebToolBackend(worker, config, runner=run,
+                                                 session_id=scope_id)
+                       if allow_bus else None)
             engine = ChatEngine(provider, config=config, backend=backend,
                                 tools_enabled=bool(tools) and allow_bus,
                                 rate_limiter=limiter,
                                 live_reads=config.max_live_reads_per_turn,
                                 prior_tokens=prior_tokens)
-            yield "meta", {"provider": provider.id, "model": config.model,
+            yield "meta", {"provider": provider.id, "model": redactor(effective_model(config)),
                            "local": config.is_local(),
                            "context": "included" if pack else "withheld",
                            "tools": bool(tools) and allow_bus,
@@ -449,8 +690,8 @@ async def _chat_stream(request: Request, *, message, tools, task, context,
             request.app.state.ai_tokens = getattr(request.app.state, "ai_tokens", {})
             request.app.state.ai_tokens[conversation] = snapshot["total_tokens"]
             await asyncio.to_thread(_record, config, provider.id, snapshot, conversation,
-                                    user_text, redact_vin_text(
-                                        "".join(answer), enabled=bool(config.redact_vin)))
+                                    user_text, redactor("".join(answer)),
+                                    redactor(effective_model(config)))
         except asyncio.CancelledError:
             cancel.set()
             raise
@@ -489,8 +730,12 @@ def engine_nonce() -> str:
 
 
 def _record(config, provider_id: str, usage: dict, conversation_id: str,
-            user_text: str, answer: str) -> None:
-    """Best-effort usage + opt-in conversation persistence; never raises."""
+            user_text: str, answer: str, model: str | None = None) -> None:
+    """Best-effort usage + opt-in conversation persistence; never raises.
+
+    ``model`` is pre-redacted by the caller so a credential pasted into the model
+    field is never written to the diagnostic store.
+    """
     try:
         store = Store()
     except Exception:  # noqa: BLE001
@@ -498,7 +743,8 @@ def _record(config, provider_id: str, usage: dict, conversation_id: str,
     try:
         if not store.available:
             return
-        store.ai_record_usage(provider_id, config.model, usage.get("input_tokens", 0),
+        store.ai_record_usage(provider_id, model if model is not None else config.model,
+                              usage.get("input_tokens", 0),
                               usage.get("output_tokens", 0),
                               usage.get("usd_estimate", 0.0))
         if config.persist_conversations:

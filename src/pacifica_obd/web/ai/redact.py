@@ -32,6 +32,7 @@ __all__ = [
     "looks_like_injection",
     "redact_secrets",
     "scrub",
+    "scrub_obj",
     "StreamRedactor",
 ]
 
@@ -167,21 +168,76 @@ def scrub(text, *, keys: Iterable[str] = (), vin: str | None = None,
     return value
 
 
+def scrub_obj(value, *, keys: Iterable[str] = (), vin: str | None = None,
+              enabled: bool = True, _depth: int = 0):
+    """Recursively scrub every string in a JSON-shaped value (dict/list/str).
+
+    A tool event's ``args`` are model-controlled and can nest a key several
+    levels deep, so a top-level-only scrub is not enough. Both the values **and**
+    the string keys are rewritten (a key can be used as a payload slot). Recursion
+    is depth-bounded: past the limit the whole sub-value is serialised and scrubbed
+    as one string, so a pathological structure cannot raise ``RecursionError``.
+    """
+    if isinstance(value, str):
+        return scrub(value, keys=keys, vin=vin, enabled=enabled)
+    if isinstance(value, dict):
+        if _depth >= 8:
+            # Never serialise an over-depth subtree: JSON escaping (`\"`, `\n`)
+            # would break literal matching and re-expose the secret.
+            return "[redacted nested value]"
+        return {scrub(str(key), keys=keys, vin=vin, enabled=enabled):
+                scrub_obj(item, keys=keys, vin=vin, enabled=enabled, _depth=_depth + 1)
+                for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        if _depth >= 8:
+            return "[redacted nested value]"
+        return [scrub_obj(item, keys=keys, vin=vin, enabled=enabled, _depth=_depth + 1)
+                for item in value]
+    return value
+
+
 class StreamRedactor:
     """Redact a token stream without ever emitting half a secret.
 
     A provider can split a VIN or a key across two SSE chunks, so releasing each
     chunk as it arrives would leak it. Simply holding back the last N characters
     is not enough (a secret that does not end at the buffer edge can still be cut).
-    Instead this holds back the tail *up to the last whitespace*, and a VIN or a
-    key never contains whitespace, so a release can never split one.
+    This holds back the tail *up to the last whitespace*, and — crucially — never
+    releases a cut that falls inside a configured literal (a passphrase can contain
+    whitespace, so a whitespace boundary alone is not sufficient).
     """
 
-    def __init__(self, scrubber, hold: int = 24, hard_limit: int = 8192):
+    def __init__(self, scrubber, hold: int = 24, hard_limit: int = 8192,
+                 literals: Iterable[str] = ()):
         self._scrub = scrubber
-        self._hold = max(0, int(hold))
+        self._literals = tuple(sorted({str(v) for v in literals if v},
+                                      key=len, reverse=True))
+        longest = max((len(v) for v in self._literals), default=0)
+        self._hold = max(0, int(hold), longest)
         self._hard_limit = max(self._hold + 1, int(hard_limit))
         self._buffer = ""
+
+    def _safe_cut(self, end: int) -> int:
+        """Pull ``end`` back until it is not strictly inside any literal.
+
+        Adjusting for one literal can move the cut inside another (overlapping or
+        repeating literals), so this repeats until no literal straddles the cut.
+        Every adjustment strictly decreases ``end``, so it terminates.
+        """
+        moved = True
+        while moved:
+            moved = False
+            for literal in self._literals:
+                start = self._buffer.find(literal)
+                while start != -1:
+                    if start < end < start + len(literal):
+                        end = start
+                        moved = True
+                        break
+                    start = self._buffer.find(literal, start + 1)
+                if moved:
+                    break
+        return end
 
     def feed(self, chunk: str) -> str:
         self._buffer += chunk or ""
@@ -193,7 +249,10 @@ class StreamRedactor:
             if len(self._buffer) < self._hard_limit:
                 return ""          # a single long token: keep buffering
             boundary = limit - 1   # safety valve: unbounded input, release anyway
-        release, self._buffer = self._buffer[:boundary + 1], self._buffer[boundary + 1:]
+        end = self._safe_cut(boundary + 1)
+        if end <= 0:
+            return ""
+        release, self._buffer = self._buffer[:end], self._buffer[end:]
         return self._scrub(release)
 
     def flush(self) -> str:

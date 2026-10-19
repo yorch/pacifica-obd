@@ -22,6 +22,8 @@ import stat
 import tempfile
 from pathlib import Path
 
+from pacifica_obd.web.ai import presets as _presets
+
 __all__ = [
     "KeyStoreError",
     "KeyStore",
@@ -31,6 +33,7 @@ __all__ = [
     "write_json_file",
     "redact_text",
     "install_logging_filter",
+    "set_logging_literals",
     "MASK",
 ]
 
@@ -44,11 +47,21 @@ _KEY_PATTERNS = (
     re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._\-]{8,}"),
 )
 
-_ENV_KEYS = {
-    "openai_compat": ("PACIFICA_OBD_AI_KEY_OPENAI_COMPAT", "PACIFICA_OBD_AI_KEY_OPENAI"),
-    "anthropic": ("PACIFICA_OBD_AI_KEY_ANTHROPIC",),
-    "fake": ("PACIFICA_OBD_AI_KEY_FAKE",),
+_ENV_KEYS: dict[str, tuple[str, ...]] = {
+    pid: _presets.preset_key_env(pid) for pid in _presets.PRESETS
 }
+#: A couple of historical aliases kept working (the pre-preset ids).
+_ENV_KEYS.setdefault("openai_compat",
+                     ("PACIFICA_OBD_AI_KEY_OPENAI_COMPAT", "PACIFICA_OBD_AI_KEY_OPENAI"))
+for _alias, _target in (("openai_compat", "PACIFICA_OBD_AI_KEY_OPENAI"),
+                        ("anthropic", "ANTHROPIC_API_KEY"),
+                        ("openai", "OPENAI_API_KEY"),
+                        ("gemini", "GEMINI_API_KEY")):
+    _names = list(_ENV_KEYS.get(_alias, ()))
+    if _target not in _names:
+        _names.append(_target)
+    _ENV_KEYS[_alias] = tuple(_names)
+del _alias, _target, _names
 
 
 class KeyStoreError(RuntimeError):
@@ -141,14 +154,19 @@ def redact_text(text, extra_keys=()) -> str:
 _LITERALS: tuple[str, ...] = ()
 
 
-def set_logging_literals(values) -> None:
-    """Register the configured key values so the log filter masks them too.
+def set_logging_literals(values, *, merge: bool = True) -> None:
+    """Register configured key values so the log filter masks them too.
 
     A key with an unusual shape (a passphrase, a proxy token) does not match the
-    key-shape patterns, so only the literal value can catch it.
+    key-shape patterns, so only the literal value can catch it. Values are merged
+    with whatever was registered before so a **retired** key (rotated or deleted
+    while a request is still in flight) stays masked.
     """
     global _LITERALS
-    _LITERALS = tuple(sorted({str(v) for v in values if v}, key=len, reverse=True))
+    incoming = {str(v) for v in values if v}
+    if merge:
+        incoming |= set(_LITERALS)
+    _LITERALS = tuple(sorted(incoming, key=len, reverse=True))
 
 
 def _scrub(value: str) -> str:
@@ -161,18 +179,32 @@ def _scrub(value: str) -> str:
         return redact_text(value, _LITERALS)
 
 
+def _scrub_obj(value):
+    """Recursively mask every string (and dict key) in a log payload."""
+    try:
+        from pacifica_obd.web.ai import redact
+
+        return redact.scrub_obj(value, keys=_LITERALS)
+    except Exception:  # noqa: BLE001 - logging must never raise
+        return value
+
+
 class _RedactingFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         try:
             if isinstance(record.msg, str):
                 record.msg = _scrub(record.msg)
+            elif isinstance(record.msg, (dict, list, tuple)):
+                record.msg = _scrub_obj(record.msg)
             if record.args:
-                if isinstance(record.args, dict):
-                    record.args = {k: _scrub(v) if isinstance(v, str) else v
-                                   for k, v in record.args.items()}
+                # Dict/list args nest, so scratch the whole structure, not just
+                # the top-level strings (a credential one level down would leak).
+                # A positional tuple must stay a tuple: logging formats it by
+                # position and a list breaks `%`-formatting.
+                if isinstance(record.args, tuple):
+                    record.args = tuple(_scrub_obj(a) for a in record.args)
                 else:
-                    record.args = tuple(_scrub(a) if isinstance(a, str) else a
-                                        for a in record.args)
+                    record.args = _scrub_obj(record.args)
             # An exception's text is formatted separately from msg/args: the
             # traceback comes from exc_info, which no formatter scrubs. Format it
             # here, scrub it, and hand the clean text on (exc_text wins over
@@ -281,6 +313,16 @@ class KeyStore:
                     values.append(value)
         # longest first, so a key that contains another is masked whole
         return tuple(sorted(set(values), key=len, reverse=True))
+
+    def refresh_logging_literals(self) -> None:
+        """Make a freshly set/rotated/removed key take effect in the log filter.
+
+        Called after a key change: the startup snapshot would otherwise keep
+        masking a retired key and fail to mask a brand-new one. It also re-attaches
+        the filter to any handler created since startup. Previously registered
+        literals are kept so an in-flight request's old key stays masked.
+        """
+        install_logging_filter(self)
 
     def redactor(self):
         """A ``str -> str`` that also masks this store's literal keys."""

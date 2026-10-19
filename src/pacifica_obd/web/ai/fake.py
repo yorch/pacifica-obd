@@ -38,6 +38,7 @@ class FakeProvider:
     requires_key = False
     local = True
     supports_tools = True
+    supports_model_discovery = True
 
     def __init__(self, model: str = "fake-1", *, script: list[Event] | None = None,
                  error: ProviderError | None = None, huge_usage: bool = False,

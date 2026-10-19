@@ -33,6 +33,29 @@ _KIND_STATUS = {
 }
 
 
+def _redact_value(value, redact, _depth: int = 0):
+    """Redact every string in a JSON-shaped detail, at any depth (keys included).
+
+    A validation error's ``detail`` can nest the submitted body (which may carry
+    a key or a password), and a dict key can itself be the secret, so a
+    top-level-only string redaction is not enough. Depth is bounded.
+    """
+    if redact is None:
+        return value
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, dict):
+        if _depth >= 8:
+            return "[redacted]"
+        return {redact(str(key)): _redact_value(item, redact, _depth + 1)
+                for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        if _depth >= 8:
+            return "[redacted]"
+        return [_redact_value(item, redact, _depth + 1) for item in value]
+    return value
+
+
 class ApiError(Exception):
     """An error that maps to a documented HTTP status + envelope."""
 
@@ -49,15 +72,13 @@ class ApiError(Exception):
 
     def envelope(self, redact=None) -> dict:
         message = redact(self.message) if redact else self.message
-        detail = {key: (redact(value) if isinstance(value, str) else value)
-                  for key, value in self.detail.items()}
         return {
             "error": {
                 "code": self.code,
                 "kind": self.kind,
                 "message": message,
                 "status": self.status,
-                "detail": detail,
+                "detail": _redact_value(self.detail, redact),
             }
         }
 

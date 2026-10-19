@@ -99,6 +99,7 @@ NAV: list[dict[str, Any]] = [
     {
         "title": "Deep dives",
         "items": [
+            ("AI assistant setup", "docs/ai-setup.md"),
             ("Chrysler Security Gateway", "docs/chrysler-sgw.md"),
             ("Enhanced (manufacturer-aware) diagnostics", "docs/enhanced-diagnostics.md"),
             ("FCA modules", "docs/fca-modules.md"),

@@ -73,6 +73,54 @@ class _BaseBackend:
         finally:
             store.close()
 
+    def _default_session_id(self) -> int | None:
+        """The most recent stored session (the scope a bare tool call inherits).
+
+        Deliberately the newest *session*, not the newest session that happens to
+        have rows in one table: scoping to "the newest session" is what keeps a
+        clean scan from silently falling back to an older, faultier one.
+        """
+        rows = self._store_rows("SELECT MAX(id) AS sid FROM sessions")
+        try:
+            sid = rows[0].get("sid") if rows else None
+            return int(sid) if sid is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def session_coverage(self, session_id: int | None) -> dict:
+        """How much of a *diagnostic* check a session actually recorded.
+
+        A session id is not a scan: a `ports` command or a VIN/identification
+        read leaves rows but never checked DTCs. ``diagnostic`` is true only when
+        the session recorded a DTC/scan command (or DTC rows), so a pre-trip
+        verdict cannot claim READY from unrelated data.
+        """
+        if session_id is None:
+            return {"session_id": None, "dtcs": 0, "modules": 0, "readings": 0,
+                    "command": "", "status": "", "diagnostic": False}
+        counts = {}
+        for table in ("dtcs", "modules", "readings"):
+            rows = self._store_rows(
+                f"SELECT COUNT(*) AS n FROM {table} WHERE session_id = ?", (int(session_id),))
+            counts[table] = int((rows[0].get("n") if rows else 0) or 0)
+        session_rows = self._store_rows(
+            "SELECT command, status FROM sessions WHERE id = ?", (int(session_id),))
+        session_row = session_rows[0] if session_rows else {}
+        command = str(session_row.get("command") or "").lower()
+        status = str(session_row.get("status") or "").lower()
+        succeeded = status not in ("error", "failed", "cancelled")
+        event_rows = self._store_rows(
+            "SELECT name FROM events WHERE session_id = ? LIMIT 200", (int(session_id),))
+        dtc_events = sum(1 for row in event_rows
+                         if "dtc" in str(row.get("name") or "").lower())
+        # Only a *successful* DTC/scan read counts as coverage: a session that
+        # failed, or that merely ran some other command, must not yield READY.
+        dtc_check = succeeded and (counts["dtcs"] > 0 or "dtc" in command
+                                   or "scan" in command or dtc_events > 0)
+        return {"session_id": int(session_id), "dtcs": counts["dtcs"],
+                "modules": counts["modules"], "readings": counts["readings"],
+                "command": command, "status": status, "diagnostic": dtc_check}
+
     def _sessions(self, args: dict) -> list[dict]:
         limit = max(1, min(int(args.get("limit") or 20), 200))
         if args.get("vin"):
@@ -105,20 +153,35 @@ class _BaseBackend:
         return db_routes._series(args)
 
     def _vehicle_context(self) -> dict:
-        rows = self._store_rows("SELECT * FROM vehicles ORDER BY last_seen DESC LIMIT 5")
+        sid = self.session_id or self._default_session_id()
+        vin = None
+        if sid is not None:
+            rows = self._store_rows("SELECT vin FROM sessions WHERE id = ?", (int(sid),))
+            vin = (rows[0].get("vin") if rows else None)
+        if vin:
+            rows = self._store_rows("SELECT * FROM vehicles WHERE vin = ? LIMIT 1", (vin,))
+            modules = [row.get("request_id") for row in self._store_rows(
+                "SELECT DISTINCT request_id FROM modules WHERE session_id = ? LIMIT 200",
+                (int(sid),))]
+        else:
+            rows = self._store_rows("SELECT * FROM vehicles ORDER BY last_seen DESC LIMIT 5")
+            modules = [row.get("request_id") for row in
+                       self._store_rows("SELECT DISTINCT request_id FROM modules LIMIT 200")]
         vehicles = [{
             "vin": self._redact_vin(row.get("vin")),
             "make": row.get("make"), "model": row.get("model"), "year": row.get("year"),
             "powertrain": row.get("powertrain"), "last_seen": row.get("last_seen"),
         } for row in rows]
-        modules = [row.get("request_id") for row in
-                   self._store_rows("SELECT DISTINCT request_id FROM modules LIMIT 200")]
         return {
             "source": "stored sessions",
+            "scope_session": sid,
             "vehicles": vehicles,
+            "primary_vin": vehicles[0]["vin"] if vehicles else None,
+            "note": ("identity and module evidence come from one session (or the "
+                     "most recent vehicle); they are not a claim about any other vehicle"),
             "powertrain_detected": detect_powertrain([m for m in modules if m]),
             "detection_basis": "HCP (7E2) / BPCM (7E7) answering means PHEV",
-            "year_from_vin": year_from_vin((rows[0] or {}).get("vin")) if rows else None,
+            "year_from_vin": year_from_vin(vin) if vin else None,
         }
 
     def _self_test(self, name: str) -> dict:
@@ -136,9 +199,21 @@ class _BaseBackend:
 class CacheToolBackend(_BaseBackend):
     """Store/dataset reads only; never opens the adapter."""
 
-    def __init__(self, config=None, *, worker=None):
+    def __init__(self, config=None, *, worker=None, session_id=None):
         super().__init__(config)
         self.worker = worker
+        #: The task's session, injected out-of-band so the tool loop cannot widen
+        #: its scope (the tool schemas do not expose `session_id`).
+        self.session_id = int(session_id) if session_id else None
+
+    def _scope(self, args: dict) -> int | None:
+        explicit = args.get("session_id", self.session_id)
+        if explicit is not None:
+            try:
+                return int(explicit)
+            except (TypeError, ValueError):
+                return None
+        return self._default_session_id()
 
     # -- adapter status ----------------------------------------------------
     def _tool_get_adapter_status(self, args):
@@ -164,9 +239,16 @@ class CacheToolBackend(_BaseBackend):
                 "source": "stored", "redacted": bool(self.config and self.config.redact_vin)}
 
     def _tool_read_generic_dtcs(self, args):
+        sid = self._scope(args)
+        clauses, values = [], []
+        if sid is not None:
+            clauses.append("session_id = ?")
+            values.append(int(sid))
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         rows = self._store_rows(
-            "SELECT code, status, flags, module, bus, ts FROM dtcs ORDER BY id DESC LIMIT 100")
-        return {"dtcs": rows, "source": "stored", "total": len(rows)}
+            "SELECT session_id, code, status, flags, module, bus, ts FROM dtcs"
+            f"{where} ORDER BY id DESC LIMIT 100", tuple(values))
+        return {"dtcs": rows, "source": "stored", "total": len(rows), "session_id": sid}
 
     def _tool_read_readiness(self, args):
         return self._self_test("readiness")
@@ -178,28 +260,79 @@ class CacheToolBackend(_BaseBackend):
         return self._self_test("live PID read")
 
     def _tool_discover_modules(self, args):
+        sid = self._scope(args)
+        clauses, values = [], []
+        if sid is not None:
+            clauses.append("session_id = ?")
+            values.append(int(sid))
+        if args.get("bus"):
+            clauses.append("bus = ?")
+            values.append(str(args["bus"]))
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         rows = self._store_rows(
-            "SELECT DISTINCT request_id, response_id, bus, kind FROM modules LIMIT 200")
-        return {"modules": rows, "source": "stored", "count": len(rows),
+            "SELECT DISTINCT session_id, request_id, response_id, bus, kind FROM modules"
+            f"{where} LIMIT 200", tuple(values))
+        return {"modules": rows, "source": "stored", "count": len(rows), "session_id": sid,
                 "note": "stored discovery; a live scan needs source=live"}
 
     def _tool_read_module_dtcs(self, args):
+        sid = self._scope(args)
+        clauses, values = [], []
+        if sid is not None:
+            clauses.append("session_id = ?")
+            values.append(int(sid))
+        if args.get("module"):
+            clauses.append("module = ?")
+            values.append(str(args["module"]))
+        if args.get("bus"):
+            clauses.append("bus = ?")
+            values.append(str(args["bus"]))
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         rows = self._store_rows(
-            "SELECT module, bus, code, status, flags, ts FROM dtcs ORDER BY id DESC LIMIT 200")
-        return {"dtcs": rows, "source": "stored"}
+            "SELECT session_id, module, bus, code, status, flags, ts FROM dtcs"
+            f"{where} ORDER BY id DESC LIMIT 200", tuple(values))
+        return {"dtcs": rows, "source": "stored", "session_id": sid}
 
     def _tool_read_did(self, args):
-        limit = 100
+        sid = self._scope(args)
+        clauses, values = ["category = 'did'"], []
+        if sid is not None:
+            clauses.append("session_id = ?")
+            values.append(int(sid))
+        if args.get("module"):
+            clauses.append("module = ?")
+            values.append(str(args["module"]))
+        if args.get("bus"):
+            clauses.append("bus = ?")
+            values.append(str(args["bus"]))
+        dids = [str(did) for did in (args.get("dids") or []) if did]
+        if dids:
+            placeholders = ", ".join("?" for _ in dids)
+            clauses.append(f"did IN ({placeholders})")
+            values.extend(dids)
+        where = " WHERE " + " AND ".join(clauses)
         rows = self._store_rows(
-            "SELECT module, bus, did, name, value_hex, value_ascii, status, ts FROM readings"
-            " WHERE category = 'did' ORDER BY id DESC LIMIT ?", (limit,))
-        return {"readings": rows, "source": "stored"}
+            "SELECT session_id, module, bus, did, name, value_hex, value_ascii, status, ts"
+            f" FROM readings{where} ORDER BY id DESC LIMIT 100", tuple(values))
+        return {"readings": rows, "source": "stored", "session_id": sid}
 
     def _tool_get_module_identification(self, args):
+        sid = self._scope(args)
+        clauses, values = ["category = 'module-info'"], []
+        if sid is not None:
+            clauses.append("session_id = ?")
+            values.append(int(sid))
+        if args.get("module"):
+            clauses.append("module = ?")
+            values.append(str(args["module"]))
+        if args.get("bus"):
+            clauses.append("bus = ?")
+            values.append(str(args["bus"]))
+        where = " WHERE " + " AND ".join(clauses)
         rows = self._store_rows(
-            "SELECT module, bus, did, name, value_ascii, value_hex, status FROM readings"
-            " WHERE category = 'module-info' ORDER BY id DESC LIMIT 100")
-        return {"identification": rows, "source": "stored"}
+            "SELECT session_id, module, bus, did, name, value_ascii, value_hex, status"
+            f" FROM readings{where} ORDER BY id DESC LIMIT 100", tuple(values))
+        return {"identification": rows, "source": "stored", "session_id": sid}
 
     def _tool_get_module_map(self, args):
         data = {"bundled": {}}
@@ -343,10 +476,11 @@ class LiveToolBackend(_BaseBackend):
 class WebToolBackend:
     """Async facade: cache reads on a thread, live reads on the bus worker."""
 
-    def __init__(self, worker, config, *, runner):
+    def __init__(self, worker, config, *, runner, session_id=None):
         self.worker = worker
         self.config = config
         self._runner = runner  # async (name, fn) -> result
+        self.session_id = int(session_id) if session_id else None
 
     async def dispatch(self, name: str, args: dict) -> dict:
         spec = tool_registry.TOOLS.get(name)
@@ -354,8 +488,9 @@ class WebToolBackend:
             return {"error": f"unknown tool: {name}", "source": "registry"}
 
         def cache_call():
-            return tool_registry.dispatch(name, args, CacheToolBackend(self.config,
-                                                                       worker=self.worker))
+            return tool_registry.dispatch(
+                name, args, CacheToolBackend(self.config, worker=self.worker,
+                                             session_id=self.session_id))
 
         try:
             if spec.source != "vehicle-bus" or args.get("source") != "live":

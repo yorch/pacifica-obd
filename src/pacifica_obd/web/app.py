@@ -46,7 +46,7 @@ READ_ONLY = True
 # Routes that can change a module or a stored secret, or spend money. They require
 # the custom header as well as a JSON body and a same-origin Origin (design §4.5).
 _WRITE_PREFIXES = ("/api/writes/", "/api/security/unlock", "/api/ai/keys/",
-                   "/api/ai/chat", "/api/ai/tasks/", "/api/raw")
+                   "/api/ai/chat", "/api/ai/test", "/api/ai/tasks/", "/api/raw")
 _WRITE_EXACT = ("/api/ai/keys", "/api/ai/config", "/api/ai/conversations")
 
 _CSP = (
@@ -111,7 +111,7 @@ def _ai_redactor():
             from pacifica_obd.web.ai.keys import KeyStore, redact_text
 
             store = KeyStore()
-            return redact_text(text, tuple(store._keys.values()))
+            return redact_text(text, store.literals())
         except Exception:  # noqa: BLE001 - redaction must never raise
             return text
 
@@ -243,9 +243,15 @@ def create_app(settings: Settings | None = None, *, worker: BusWorker | None = N
 
     @app.exception_handler(RequestValidationError)
     async def _validation_error(request: Request, exc: RequestValidationError):
+        # Pydantic's raw errors embed the submitted `input` (which may be a key or
+        # a password), so only the safe loc/msg/type fields are surfaced.
+        safe = [{"loc": [str(part) for part in error.get("loc", ())],
+                 "msg": str(error.get("msg", "")),
+                 "type": str(error.get("type", ""))}
+                for error in exc.errors()[:8]]
         api = errors.ApiError(
             "bad_request", "validation", "request did not match the expected shape",
-            status="rejected", detail={"errors": exc.errors()[:8]},
+            status="rejected", detail={"errors": safe},
         )
         return _envelope(api, redact)
 

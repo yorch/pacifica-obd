@@ -228,6 +228,20 @@ class AIKeyRequest(BaseModel):
     key: str = Field(min_length=1, max_length=4096)
 
 
+class AITestRequest(BaseModel):
+    """Test a configuration without starting a chat.
+
+    The three optional fields are transient overrides (so the form can test an
+    unsaved provider/model/base URL). ``probe=False`` validates the settings
+    only and never opens a socket.
+    """
+
+    provider: str | None = None
+    model: str | None = None
+    base_url: str | None = None
+    probe: bool = True
+
+
 class AIChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=16000)
     conversation_id: str | None = None
