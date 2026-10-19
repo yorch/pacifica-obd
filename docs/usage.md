@@ -83,6 +83,7 @@ partial result (`3`) from a complete one (`0`).
 | [`module-map`](#module-map) | — | Known module addresses (built-in, plus an optional external ECU database if one is given). |
 | [`dtc-all`](#dtc-all) | UDS | Read DTCs (`19 02`) from every responding module. |
 | [`read-did`](#read-did) | UDS | Read DIDs (`22`) from one module. |
+| [`did-sweep`](#did-sweep) | UDS | Sweep a DID range on one module and classify the replies (reads only). |
 | [`module-info`](#module-info) | UDS | Identification block (`F186`–`F191`) per module. |
 | [`capture`](#capture) | UDS | Full snapshot (modules + DTCs + DIDs), stored locally. |
 | [`monitor`](#monitor) | UDS | Poll UDS DIDs on modules and store every sample. |
@@ -324,6 +325,34 @@ ECU software number, `F189` software version, `F18A` system supplier identifier,
 `F18C` ECU serial number, `F190` VIN, `F191` ECU hardware number, `F194`
 supplier ECU software number, `F132` FCA identification (non-standard, observed
 on these ECUs).
+
+## did-sweep
+
+Sweep a *range* of Data Identifiers on one module and guess what each reply is
+(read-only: `10 03` then `22 <DID>`, nothing else). The plan is bounded — 512
+reads by default, 4096 maximum — and each payload is classified by
+`pacifica_obd.didsweep` against conservative shapes (`cell_voltages`,
+`pack_voltage`, `soc`, `temperature`, `identification`); a payload that fits more
+than one is reported `ambiguous` rather than guessed. `--save-preset` writes a
+battery preset JSON from the best candidates (still unverified — confirm a DID
+in the Raw console with `22 <DID>` before trusting a read).
+
+```sh
+uv run pacifica-obd did-sweep --module 7E7 --start F200 --end F2FF
+uv run pacifica-obd did-sweep --module 7E7 --start F100 --end F1FF --json
+uv run pacifica-obd did-sweep --module 7E7 --start F200 --end F2FF --save-preset ~/pack.json
+uv run pacifica-obd did-sweep --module 7E7 --start F200 --end F2FF --step 4 --max-reads 256
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--module ID` | **required** | Request ID of the module to sweep (e.g. `7E7`). |
+| `--bus can-c\|can-ihs` | `can-c` | Bus to address the module on. |
+| `--start DID` / `--end DID` | `F100` / `F1FF` | Inclusive DID range (4-hex). |
+| `--step N` | `1` | Stride between DIDs. |
+| `--max-reads N` | `512` | Cap on the number of reads (absolute maximum 4096). |
+| `--timeout-ms N` | `100` | Per-request adapter timeout. |
+| `--save-preset PATH` | — | Write a battery preset JSON from the best candidates. |
 
 ## module-info
 

@@ -105,6 +105,32 @@ def test_scan_and_dump_counts_exclude_non_reads():
             assert not text.startswith("01"), (command.name, text)
 
 
+def test_watch_refuses_a_non_read_pid():
+    """`watch --pids CLEAR_DTC` used to reach mode 04 (clear DTCs)."""
+    import argparse
+    from unittest import mock
+
+    conn = FakeConn()
+    args = argparse.Namespace(json=True, port=None, baud=115200, timeout=1.0,
+                              check_voltage=False, pids="CLEAR_DTC,RPM",
+                              interval=0.01, csv=None)
+
+    def stop_after_one_round(*_args):
+        # the loop is `while True`, so the only way out is the interrupt it handles
+        raise KeyboardInterrupt
+
+    with mock.patch.object(cli, "connect", return_value=conn), \
+            mock.patch.object(cli, "jdump"), \
+            mock.patch.object(cli.time, "sleep", stop_after_one_round):
+        try:
+            cli.cmd_watch(args)
+        except SystemExit:  # acceptable: it may exit rather than return
+            pass
+    assert conn.queried, "watch should still poll the mode-01 PID"
+    assert all(q.startswith("01") for q in conn.queried), conn.queried
+    assert "04" not in conn.queried, "watch sent mode 04 (clear DTCs)"
+
+
 if __name__ == "__main__":
     for name, func in sorted(globals().items()):
         if name.startswith("test_") and callable(func):

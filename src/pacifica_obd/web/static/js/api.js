@@ -162,6 +162,7 @@ export const api = {
   batterySchema: () => get("/api/battery/schema"),
   batteryRead: (body) => post("/api/battery/read", body),
   batteryPreset: (body) => post("/api/battery/preset", body),
+  batterySweep: (body) => post("/api/battery/sweep", body),
 
   aiProviders: () => get("/api/ai/providers"),
   aiConfig: () => get("/api/ai/config"),

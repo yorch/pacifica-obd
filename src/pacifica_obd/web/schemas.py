@@ -141,6 +141,23 @@ class BatteryReadRequest(BaseModel):
     store: bool = False
 
 
+class BatterySweepRequest(BaseModel):
+    """A bounded DID sweep on one module (reads only: 10 03 + 22 <DID>).
+
+    Domain rules (DID hex, range/step/max_reads bounds, CAN id) are enforced by
+    ``routes/battery.py`` and ``pacifica_obd.didsweep.plan`` so the web and the
+    CLI reject the same strings with the same messages.
+    """
+
+    module: str | int = "7E7"
+    bus: Literal["can-c", "can-ihs"] = "can-c"
+    start: str | int = "F100"
+    end: str | int = "F1FF"
+    step: int = 1
+    max_reads: int | None = None
+    timeout_ms: int = 100
+
+
 # -- guarded surfaces ------------------------------------------------------ #
 class SecurityTargetRequest(BaseModel):
     module: str | int

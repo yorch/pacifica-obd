@@ -505,10 +505,24 @@ def cmd_live(args: argparse.Namespace) -> None:
 def cmd_watch(args: argparse.Namespace) -> None:
     conn = connect(args)
     names = [n.strip() for n in args.pids.split(",")] if args.pids else DEFAULT_WATCH
-    cmds = [getattr(obd.commands, n) for n in names if hasattr(obd.commands, n)]
+    requested = [n for n in names if hasattr(obd.commands, n)]
+    # Only mode 01 is a read. `obd.commands` also holds CLEAR_DTC (mode 04) and the
+    # mode 03/06/09 requests, so `watch --pids CLEAR_DTC` would erase the codes this
+    # command exists to watch (see pacifica_obd.obd_guard). Same rule as `live`.
+    cmds = [getattr(obd.commands, n) for n in requested
+            if is_read_only_command(getattr(obd.commands, n))]
+    refused = [n for n in requested if n not in {c.name for c in cmds}]
+    if refused:
+        diag(args).print(
+            f"[red]Not a read-only PID: {', '.join(sorted(set(refused)))}[/red] — "
+            "only mode 01 (current data) can be polled."
+        )
     if not cmds:
         diag(args).print("[red]None of those PIDs are known.[/red]")
         sys.exit(2)
+    if refused and args.json:
+        # keep the JSON stream machine-readable: a refusal must not look like data
+        diag(args).print(f"[dim]Skipping {len(set(refused))} non-read PID(s).[/dim]")
 
     csv_file = None
     writer = None
@@ -1089,6 +1103,108 @@ def cmd_read_did(args: argparse.Namespace) -> None:
     for record in results:
         table.add_row(record["did"], record.get("name") or "", _did_value(record), _did_ascii(record))
     console.print(table)
+
+
+def cmd_did_sweep(args: argparse.Namespace) -> None:
+    """Sweep a DID range on one module and classify each reply (reads only).
+
+    Sends ``10 03`` to open the session and ``22 <DID>`` per identifier — nothing
+    else. The plan is bounded by :mod:`pacifica_obd.didsweep` and every command
+    is checked against the Raw console's read/confirm/deny guard before the port
+    is opened, so a non-read service is refused rather than sent. All the logic
+    lives in ``didsweep`` and the shared service layer; this handler only wires
+    argparse and renders.
+    """
+    from pacifica_obd import didsweep
+    from pacifica_obd.web import service
+
+    try:
+        sweep = didsweep.plan(args.start, args.end, step=args.step, max_reads=args.max_reads)
+        didsweep.assert_read_only(didsweep.session_commands(sweep))
+    except ValueError as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        sys.exit(2)
+
+    rid = "%03X" % args.module
+    diag(args).print(
+        f"[dim]Sweeping {len(sweep.dids)} DID(s) on {rid} ({args.bus}) "
+        f"{args.start:04X}-{args.end:04X} step {args.step}…[/dim]"
+    )
+    elm = open_elm(args)
+    try:
+        result = service.sweep_dids(
+            elm, bus=args.bus, module=args.module, start=args.start, end=args.end,
+            step=args.step, max_reads=args.max_reads, timeout_ms=args.timeout_ms,
+        )
+    except (AdapterError, Elm327Error, ValueError) as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        sys.exit(2)
+    finally:
+        elm.close()
+
+    saved = None
+    if getattr(args, "save_preset", None):
+        saved = _save_sweep_preset(args, result)
+
+    if args.json:
+        payload = dict(result)
+        if saved is not None:
+            payload["saved_preset"] = saved
+        jdump(payload)
+        return
+
+    table = Table(title=f"DID sweep on {result['module']} ({result['bus']}, read-only)")
+    for column in ("DID", "Status", "Hex", "Inferred"):
+        table.add_column(column)
+    for entry in result["dids"]:
+        verdict = entry.get("verdict") or {}
+        inferred = verdict.get("kind") or ""
+        if verdict.get("confidence") and verdict["kind"] != "unknown":
+            inferred = f"{inferred} · {verdict['confidence']}"
+        table.add_row(entry["did"], entry["status"] or "",
+                      entry.get("hex") or "", inferred)
+    console.print(table)
+    console.print(f"[dim]{result['answered']} of {result['plan']['count']} DID(s) answered.[/dim]")
+
+    best = (result.get("candidates") or {}).get("best") or {}
+    if best:
+        summary = Table(title="Best candidates")
+        for column in ("Role", "DID", "Confidence", "Scale", "Count", "Why"):
+            summary.add_column(column)
+        for role in ("cell_voltages", "pack_voltage", "soc", "temperature"):
+            candidate = best.get(role)
+            if not candidate:
+                continue
+            summary.add_row(role, candidate["did"], candidate["confidence"],
+                            "" if candidate["scale"] is None else str(candidate["scale"]),
+                            "" if candidate["count"] is None else str(candidate["count"]),
+                            candidate["reason"])
+        console.print(summary)
+    else:
+        console.print("[yellow]Nothing was classified — no candidate shape was found.[/yellow]")
+
+    suggestion = result.get("preset") or {}
+    for note in suggestion.get("notes", []):
+        console.print(f"[dim]note: {note}[/dim]")
+    console.print("[dim]Reads only: 10 03 then 22 <DID>; nothing was written to the bus.[/dim]")
+
+
+def _save_sweep_preset(args: argparse.Namespace, result: dict) -> str | None:
+    """Write a battery preset JSON from the sweep's best candidates (or refuse)."""
+    suggestion = result.get("preset") or {}
+    if not suggestion.get("available") or not suggestion.get("preset"):
+        console.print("[yellow]Not saving a preset: nothing was confidently classified.[/yellow]")
+        return None
+    path = os.path.expanduser(args.save_preset)
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(suggestion["preset"], handle, indent=2, sort_keys=True)
+            handle.write("\n")
+    except OSError as exc:
+        console.print(f"[red]Could not write {path}: {exc}[/red]")
+        return None
+    console.print(f"[green]wrote[/green] {path}")
+    return path
 
 
 def cmd_module_info(args: argparse.Namespace) -> None:
@@ -2160,6 +2276,22 @@ def build_parser() -> argparse.ArgumentParser:
                             help="per-request timeout in ms (STPTO, default 100)")
     p_read_did.add_argument("--vin", help="attach stored data to this VIN")
     p_read_did.set_defaults(func=cmd_read_did)
+
+    p_sweep = sub.add_parser("did-sweep",
+                             help="sweep a DID range on a module and classify replies (reads only)")
+    p_sweep.add_argument("--module", type=_can_id, required=True, help="request ID, e.g. 7E7")
+    p_sweep.add_argument("--bus", choices=["can-c", "can-ihs"], default="can-c")
+    p_sweep.add_argument("--start", type=_did, default=0xF100, help="first DID (default F100)")
+    p_sweep.add_argument("--end", type=_did, default=0xF1FF, help="last DID (default F1FF)")
+    p_sweep.add_argument("--step", type=int, default=1, help="stride between DIDs (default 1)")
+    p_sweep.add_argument("--max-reads", type=int, default=None,
+                         help="cap on the number of reads (default 512, absolute max 4096)")
+    p_sweep.add_argument("--timeout-ms", type=_timeout_ms, default=100,
+                         help="per-request timeout in ms (STPTO, default 100)")
+    p_sweep.add_argument("--save-preset", metavar="PATH", default=None,
+                         help="write a battery preset JSON from the best candidates")
+    p_sweep.add_argument("--vin", help="attach stored data to this VIN")
+    p_sweep.set_defaults(func=cmd_did_sweep)
 
     p_module_info = sub.add_parser(
         "module-info", help="read a module's identification block (F186..F191)"

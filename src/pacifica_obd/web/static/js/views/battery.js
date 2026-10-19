@@ -13,12 +13,14 @@ import { h, clear, mount, on } from "../dom.js";
 import { api } from "../api.js";
 import {
   card, kpi, emptyState, errorState, toast, banner, field, checkbox, loadingState,
-  verdict, tonePill,
+  verdict, tonePill, dataTable, progressBar,
 } from "../components.js";
 import { escapeControls, numberText, timeOf } from "../format.js";
 
 export function render(root, ctx) {
-  const state = { schema: null, preset: null, snapshot: null, busy: false, record: false, readAt: null };
+  const timers = [];
+  const state = { schema: null, preset: null, snapshot: null, busy: false, record: false,
+                  readAt: null, sweep: null, sweeping: false };
 
   const head = h("div.view__head", null,
     h("div", null, h("h1", { text: "HV battery" }),
@@ -31,14 +33,18 @@ export function render(root, ctx) {
   const heroHolder = h("div");
   const chartHolder = h("div");
   const controlsHolder = h("div");
+  const sweepHolder = h("div");
+  const sweepResults = h("div");
+  const sweepProgress = progressBar();
+  let sweepUseButton = null;
 
-  mount(root, head, noticeHolder, heroHolder, chartHolder, controlsHolder);
+  mount(root, head, noticeHolder, heroHolder, chartHolder, controlsHolder, sweepHolder);
 
   const readButton = head.querySelector(".btn--primary");
 
   load();
 
-  return {};
+  return { dispose() { for (const timer of timers) clearInterval(timer); }, resize() {} };
 
   /* -------------------------------------------------------------- schema */
 
@@ -49,6 +55,7 @@ export function render(root, ctx) {
       state.preset = { ...schema.preset };
       renderNotice();
       renderControls();
+      renderSweep();
       renderEmpty();
       const auto = ctx.params?.get("auto");
       if (auto === "1" || auto === "true") read();
@@ -56,6 +63,12 @@ export function render(root, ctx) {
         state.record = true;
         const box = document.getElementById("batt-record");
         if (box) box.checked = true;
+      }
+      // Deep link for the sweep: `?sweep=1` runs it, `?sweep=apply` also fills
+      // the preset editor from the best candidates.
+      const sweepParam = ctx.params?.get("sweep");
+      if (sweepParam === "1" || sweepParam === "true" || sweepParam === "apply") {
+        discover().then(() => { if (sweepParam === "apply") applyProposedPreset(); });
       }
     } catch (error) {
       mount(heroHolder, card({ eyebrow: "HV battery", title: "Could not load the DID map", body: errorState(error, { onRetry: load }) }));
@@ -161,6 +174,189 @@ export function render(root, ctx) {
     } catch (error) {
       toast(error.message, "err", 0);
     }
+  }
+
+  /* ------------------------------------------------------------- DID sweep */
+
+  // "Discover DIDs": a bounded, read-only sweep of one module (`10 03` then
+  // `22 <DID>`), run as a normal serialized worker job so it queues behind other
+  // bus work and cancels like every other long operation. The server classifies
+  // each reply; here we group the results by inferred kind and offer to prefill
+  // the preset above from the best candidates (never automatically).
+  function renderSweep() {
+    const module = state.preset?.module || state.schema?.module?.bpcm || "7E7";
+    const moduleField = field({ id: "batt-sweep-module", label: "Module", mono: true, value: module });
+    const startField = field({ id: "batt-sweep-start", label: "Start DID", mono: true, value: "F200" });
+    const endField = field({ id: "batt-sweep-end", label: "End DID", mono: true, value: "F2FF" });
+    const stepField = field({ id: "batt-sweep-step", label: "Step", mono: true, type: "number", value: "1", min: 1 });
+    const timeoutField = field({ id: "batt-sweep-timeout", label: "Timeout (ms)", mono: true, type: "number", value: "100" });
+    sweepUseButton = h("button.btn", { type: "button", text: "Use as battery preset",
+      disabled: !(state.sweep?.preset?.available), onClick: () => applyProposedPreset() });
+    const runButton = h("button.btn.btn--primary", { type: "button", text: "Discover DIDs", onClick: () => discover() });
+    const cancelButton = h("button.btn.btn--danger.btn--sm", { type: "button", text: "Cancel", disabled: !state.sweeping, onClick: cancelSweep });
+
+    mount(sweepHolder, card({
+      eyebrow: "DID discovery", title: "Sweep a DID range",
+      actions: h("div.row", null, sweepUseButton),
+      body: h("div.stack", null,
+        banner("Read-only sweep: opens the session with 10 03 and reads 22 <DID> per identifier. "
+          + "No write service is ever sent. A reply is named only when its bytes fit a conservative "
+          + "shape; anything else is left unknown.", "info"),
+        h("div.row", null, moduleField, startField, endField, stepField, timeoutField),
+        h("div.row.row--spaced", runButton, cancelButton),
+        h("div.row--spaced", sweepProgress),
+        sweepResults),
+    }));
+    renderSweepResults();
+  }
+
+  function didValue(id, fallback) {
+    const text = (document.getElementById(id)?.value || "").trim();
+    return text || fallback;
+  }
+
+  async function discover() {
+    if (state.sweeping) { toast("a sweep is already running", "warn"); return; }
+    state.sweeping = true;
+    sweepUseButton.disabled = true;
+    sweepProgress.update(0);
+    const stop = pollSweepProgress();
+    mount(sweepResults, loadingState("Sweeping the range with 22 <DID>…"));
+    try {
+      state.sweep = await api.batterySweep({
+        module: didValue("batt-sweep-module", state.preset?.module || "7E7"),
+        bus: state.schema?.module?.bus || "can-c",
+        start: didValue("batt-sweep-start", "F100").toUpperCase().replace(/^0X/, ""),
+        end: didValue("batt-sweep-end", "F1FF").toUpperCase().replace(/^0X/, ""),
+        step: Number(didValue("batt-sweep-step", "1")),
+        timeout_ms: Number(didValue("batt-sweep-timeout", "100")),
+      });
+      renderSweepResults();
+      toast(`sweep finished: ${state.sweep.answered} of ${state.sweep.plan.count} answered`,
+        state.sweep.answered ? "ok" : "warn");
+    } catch (error) {
+      mount(sweepResults, errorState(error, { onRetry: discover }));
+    } finally {
+      stop();
+      state.sweeping = false;
+      sweepProgress.update(1);
+      sweepUseButton.disabled = !(state.sweep?.preset?.available);
+      ctx.refreshStatus();
+    }
+  }
+
+  function pollSweepProgress() {
+    const tick = setInterval(async () => {
+      try {
+        const { jobs } = await api.jobs();
+        for (const job of jobs.filter((j) => j.state === "running")) {
+          const done = Number(job.progress?.index);
+          const total = Number(job.progress?.total);
+          if (done && total) sweepProgress.update(done / total);
+        }
+      } catch { /* progress is best effort */ }
+    }, 500);
+    timers.push(tick);
+    return () => clearInterval(tick);
+  }
+
+  async function cancelSweep() {
+    const id = ctx.status?.status?.job?.holder_id;
+    if (!id) { toast("nothing running", "warn"); return; }
+    try { await api.cancelJob(id); toast("Cancel requested", "warn"); }
+    catch (error) { toast(error.message, "err"); }
+  }
+
+  function renderSweepResults() {
+    clear(sweepResults);
+    const sweep = state.sweep;
+    if (!sweepUseButton) return;
+    sweepUseButton.disabled = !(sweep?.preset?.available);
+    if (!sweep) {
+      sweepResults.appendChild(emptyState({ icon: "layers", title: "No sweep yet",
+        hint: "Discover DIDs reads 22 <DID> across the range and names the replies it can. "
+          + "Unverified DIDs may answer nothing on a real vehicle." }));
+      return;
+    }
+    const suggestion = sweep.preset || {};
+    if (suggestion.available && suggestion.preset) {
+      const preset = suggestion.preset;
+      sweepResults.appendChild(banner(
+        `Proposed preset — cells ${preset.cells_did || "—"} (${preset.count || 0} × ${preset.scale}), `
+        + `pack voltage ${preset.pack_voltage_did || "—"}, SoC ${preset.soc_did || "—"}. `
+        + "Confirm each DID in the Raw console before trusting a read.", "ok"));
+    } else {
+      sweepResults.appendChild(banner(
+        "Nothing was confidently classified, so the saved preset is left alone.", "warn"));
+    }
+    for (const note of suggestion.notes || []) {
+      sweepResults.appendChild(h("p.sub", { text: note }));
+    }
+
+    const groups = new Map();
+    for (const entry of sweep.dids || []) {
+      const kind = entry.verdict && entry.verdict.kind !== "unknown"
+        ? entry.verdict.kind
+        : (entry.status === "ok" ? "unclassified" : "no response");
+      if (!groups.has(kind)) groups.set(kind, []);
+      groups.get(kind).push(entry);
+    }
+    // Answering groups first (most interesting), the silent tail folded away.
+    const ordered = [...groups.entries()].sort(([a], [b]) => {
+      if ((a === "no response") !== (b === "no response")) return a === "no response" ? 1 : -1;
+      return a.localeCompare(b);
+    });
+    for (const [kind, rows] of ordered) {
+      const table = dataTable({
+        columns: [
+          { key: "did", label: "DID", mono: true },
+          { key: "status", label: "Status" },
+          { key: "hex", label: "Reply", mono: true, render: (row) => replyText(row.hex) },
+          { key: "confidence", label: "Confidence", render: (row) => row.verdict?.confidence || "—" },
+          { key: "reason", label: "Why", render: (row) => row.verdict?.reason || "" },
+        ],
+        rows,
+        empty: "none",
+      });
+      const label = `${kind.replace(/_/g, " ")} · ${rows.length} DID${rows.length === 1 ? "" : "s"}`;
+      if (kind === "no response") {
+        sweepResults.appendChild(h("details.sweep-group", null,
+          h("summary", null, h("span", { text: label })),
+          table));
+      } else {
+        sweepResults.appendChild(h("h3", { text: label }));
+        sweepResults.appendChild(table);
+      }
+    }
+  }
+
+  function replyText(hex) {
+    const text = escapeControls(hex || "");
+    if (!text) return "—";
+    return h("span", { title: text, text: text.length > 40 ? `${text.slice(0, 40)}…` : text });
+  }
+
+  function applyProposedPreset() {
+    const preset = state.sweep?.preset?.preset;
+    if (!preset) { toast("no confident candidates to apply", "warn"); return; }
+    const set = (id, value) => {
+      const node = document.getElementById(id);
+      if (node && value !== null && value !== undefined) node.value = String(value);
+    };
+    set("batt-cells-did", preset.cells_did || "");
+    set("batt-count", preset.count || 0);
+    set("batt-scale", preset.scale ?? 1);
+    set("batt-pack-did", preset.pack_voltage_did || "");
+    set("batt-pack-scale", preset.pack_voltage_scale ?? 0.1);
+    set("batt-soc-did", preset.soc_did || "");
+    set("batt-soc-scale", preset.soc_scale ?? 0.5);
+    set("batt-temp-did", preset.temp_did || "");
+    set("batt-temp-scale", preset.temp_scale ?? 1);
+    state.preset = { ...state.preset, ...preset };
+    const ambiguous = Object.values(state.sweep.preset.confidence || {}).includes("ambiguous");
+    toast(ambiguous
+      ? "Preset fields filled from the best candidates — some are ambiguous; confirm before trusting"
+      : "Preset fields filled from the sweep candidates", ambiguous ? "warn" : "ok");
   }
 
   /* ------------------------------------------------------------------ read */

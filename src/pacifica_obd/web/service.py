@@ -65,6 +65,7 @@ __all__ = [
     "read_module_dtcs",
     "read_dids",
     "module_info",
+    "sweep_dids",
     "capture_snapshot",
     "obd_dtcs",
     "obd_live",
@@ -575,6 +576,109 @@ def _vin_from_records(records: list[dict]) -> str | None:
             if looks_like_vin(value):
                 return value
     return None
+
+
+def sweep_dids(
+    adapter,
+    *,
+    bus: str = "can-c",
+    module,
+    start: int,
+    end: int,
+    step: int = 1,
+    max_reads: int | None = None,
+    timeout_ms: int = 100,
+    cancel: Cancel = None,
+    progress: Progress = None,
+) -> dict:
+    """Plan and run a bounded DID sweep (``10 03`` then ``22 <DID>``) on one module.
+
+    Reads only, and structurally so: the plan is validated and every command it
+    will put on the wire is checked against :mod:`pacifica_obd.raw_guard` before
+    the port is addressed, so no write service can be sent however the caller
+    calls this. The plan is built by :func:`pacifica_obd.didsweep.plan` (bounded,
+    deterministic) and each 0x22 reply is classified by
+    :func:`pacifica_obd.didsweep.classify`. Returns plain JSON-able dicts; the
+    caller (CLI or route) renders them.
+    """
+    from pacifica_obd import didsweep
+
+    sweep = didsweep.plan(start, end, step=step, max_reads=max_reads)
+    # Refuse anything that is not a read service *before* touching the adapter.
+    didsweep.assert_read_only(didsweep.session_commands(sweep))
+
+    rid = as_request_id(module)
+
+    def _stopped() -> dict:
+        return {
+            "module": rid, "bus": bus, "plan": sweep.as_dict(), "dids": [],
+            "answered": 0,
+            "candidates": {"best": {}, "all": []},
+            "preset": didsweep.preset_suggestion({"best": {}}, module=rid,
+                                                 soc_module=rid, bus=bus),
+            "cancelled": True,
+        }
+
+    # A job cancelled before it starts must not put *any* command on the bus —
+    # not even the session control.
+    if _cancelled(cancel):
+        return _stopped()
+
+    wait = read_wait(timeout_ms)
+    configure_bus(adapter, bus, timeout_ms)
+    mapped, ok = address_module(adapter, rid)
+    if not ok:
+        raise AdapterError(f"module {rid} did not acknowledge ATSH")
+    if _cancelled(cancel):
+        return _stopped()
+    expect = enter_session(adapter, rid, wait)
+
+    records: list[dict] = []
+    total = sweep.count
+    for index, did in enumerate(sweep.dids):
+        if _cancelled(cancel):
+            break
+        record = read_did(adapter, did, wait, expect_header=expect or mapped)
+        verdict = None
+        if record.get("status") == "ok":
+            # ``hex`` is already the data after ``62 <DID>``; do not ask the
+            # classifier to strip a full reply (it could eat real data bytes).
+            verdict = didsweep.classify(record.get("hex"))
+        entry = {
+            "did": "%04X" % did,
+            "status": record.get("status"),
+            "hex": record.get("hex"),
+            "ascii": record.get("ascii"),
+            "raw": record.get("raw"),
+        }
+        records.append({**entry, "verdict": verdict})
+        _note(progress, {"kind": "did", "did": entry["did"], "index": index + 1,
+                         "total": total, "status": entry["status"],
+                         "inferred": verdict.kind if verdict else None})
+
+    found = didsweep.candidates([{"did": record["did"], "verdict": record["verdict"]}
+                                 for record in records])
+    suggestion = didsweep.preset_suggestion(found, module=rid, soc_module=rid, bus=bus)
+    dids = [
+        {**{key: value for key, value in record.items() if key != "verdict"},
+         "verdict": record["verdict"].as_dict() if record["verdict"] else None}
+        for record in records
+    ]
+    answered = [entry for entry in dids if entry["status"] == "ok"]
+    return {
+        "module": rid,
+        "bus": bus,
+        "plan": sweep.as_dict(),
+        "dids": dids,
+        "answered": len(answered),
+        "candidates": {
+            "best": {role: candidate.as_dict() for role, candidate in found["best"].items()},
+            "all": [candidate.as_dict() for candidate in found["all"]],
+        },
+        "preset": suggestion,
+        "cancelled": _cancelled(cancel),
+    }
+
 
 
 # --------------------------------------------------------------------------- #

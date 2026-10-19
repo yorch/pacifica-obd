@@ -32,13 +32,23 @@ def _demo_battery_dids() -> dict[str, dict[int, str]]:
                0, 2, -1, 1, 0, 1, 2, 0, -1, 1, 0, 2, -2, 1, 0, 1]
     cells = [3800 + offset for offset in offsets]          # mV, one weak cell
     cells_hex = "62F40C" + "".join("%04X" % value for value in cells)
+    # The pack sweep range (F200-F2FF) is a second demo fixture: the same shapes
+    # at a *different* base, so `did-sweep --start F200 --end F2FF` finds a
+    # plausible cell block with no car attached. Still synthetic, still labelled
+    # unverified by the UI.
+    sweep_cells_hex = "62F20C" + "".join("%04X" % value for value in cells)
     return {
         "7E7": {                                            # BPCM: cells, pack, temps
             0xF40C: cells_hex,
             0xF40D: "62F40D0DDF",                            # 3551 × 0.1 = 355.1 V
             0xF40F: "62F40F161B",                            # 22 °C … 27 °C
+            0xF20C: sweep_cells_hex,                         # 32 cells, one weak
+            0xF20D: "62F20D0DDF",                            # 3551 × 0.1 = 355.1 V
+            0xF20E: "62F20E00B0",                            # SoC: 176 × 0.5 = 88.0 %
+            0xF20F: "62F20F0226",                            # 550 × 0.1 = 55.0 °C
         },
-        "7E2": {0xF40E: "62F40E00B0"},                       # HCP SoC: 176 × 0.5 = 88.0 %
+        "7E2": {0xF40E: "62F40E00B0",                        # HCP SoC: 176 × 0.5 = 88.0 %
+                0xF20E: "62F20E00B0"},                       # sweep-range SoC
     }
 
 

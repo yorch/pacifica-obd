@@ -1,9 +1,12 @@
 """HV battery screen routes (design §3.6) — a purpose-built PHEV pack panel.
 
-Three endpoints, all reads of the vehicle plus one local-config write:
+Four endpoints, all reads of the vehicle plus one local-config write:
 
 * ``GET  /api/battery/schema`` — the recovered DID map (each field marked
   *verified* or *unverified* with its source) and the saved-preset shape.
+* ``POST /api/battery/sweep``  — a bounded DID sweep (``10 03`` + ``22 <DID>``)
+  on one module, classified by :mod:`pacifica_obd.didsweep`; proposes a preset
+  from the best candidates. Read-only, serialized as a normal worker job.
 * ``POST /api/battery/read``   — one snapshot: the pack DIDs are read from the
   BPCM (``0x7E7``) and HCP (``0x7E2``) through the shared :mod:`service` layer,
   never the adapter directly. Returns per-cell mV, pack V, temperatures, SoC and
@@ -40,7 +43,7 @@ from fastapi import APIRouter, Request
 
 from pacifica_obd import pacifica_data
 from pacifica_obd.web import deps, errors, service
-from pacifica_obd.web.schemas import BatteryPreset, BatteryReadRequest
+from pacifica_obd.web.schemas import BatteryPreset, BatteryReadRequest, BatterySweepRequest
 
 router = APIRouter()
 
@@ -528,6 +531,44 @@ async def battery_preset(request: Request, body: BatteryPreset):
         "warning": ("Unverified DID map. Nothing here is confirmed for this vehicle; "
                     "an unverified DID may read nothing or the wrong quantity."),
     }
+
+
+@router.post("/battery/sweep", summary="Discover DIDs on a module (bounded, reads only)")
+async def battery_sweep(request: Request, body: BatterySweepRequest):
+    """Plan and run a bounded DID sweep, then classify each reply.
+
+    Read-only and serialized: it runs as a normal :class:`BusWorker` job (so it
+    queues behind other bus work and can be cancelled through
+    ``POST /api/jobs/{id}/cancel``), sends only ``10 03`` + ``22 <DID>``, and
+    never a write service. The range/step/cap are validated by
+    :func:`pacifica_obd.didsweep.plan` *before* the job is submitted, so a bad
+    range is a 400 rather than a long scan that discovers nothing.
+    """
+    from pacifica_obd import didsweep
+
+    worker = deps.get_worker(request)
+    module = deps.parse_can_id(body.module)
+    start = deps.parse_did(body.start)
+    end = deps.parse_did(body.end)
+    timeout_ms = deps.parse_timeout_ms(body.timeout_ms)
+    try:
+        didsweep.plan(start, end, step=body.step, max_reads=body.max_reads)
+    except ValueError as exc:
+        raise errors.validation(str(exc)) from None
+
+    def job(ctx):
+        adapter = ctx.uds()
+        session_id = ctx.open_session("battery-sweep", body.model_dump())
+        try:
+            return service.sweep_dids(
+                adapter, bus=body.bus, module=module, start=start, end=end,
+                step=body.step, max_reads=body.max_reads, timeout_ms=timeout_ms,
+                cancel=ctx.cancel, progress=lambda event: ctx.progress(**event),
+            )
+        finally:
+            ctx.close_session(session_id, "ok")
+
+    return await deps.run_job(worker, "battery-sweep", job, timeout_s=600.0)
 
 
 @router.post("/battery/read", summary="One HV battery snapshot (BPCM pack reads + imbalance)")

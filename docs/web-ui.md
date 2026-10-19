@@ -590,6 +590,23 @@ Two decoding rules keep an unverified read from reading as a healthy pack: the
 preset's count, and the **pack voltage is not inferred** from a partial or
 implausible cell sum.
 
+**Discover DIDs.** Because the pack DIDs were never recovered, the screen also
+offers a *bounded, read-only* sweep (`POST /api/battery/sweep`,
+`pacifica_obd.didsweep`): `10 03` opens the session and `22 <DID>` reads each
+identifier in a range (default `F200–F2FF`, the pack block). Each reply is
+classified against conservative shapes — a run of ≥4 big-endian u16 in
+1000–5500 mV with a spread <500 mV is `cell_voltages`; a u16 at ×0.1 in
+150–500 V is `pack_voltage`; a u8/u16 in 0–100 % is `soc`; i8/u8 in −40…100 °C or
+a u16 at ×0.1 is `temperature`; printable ASCII/VIN is `identification`. A
+payload that fits more than one shape is reported **ambiguous** (with the
+alternatives) rather than guessed, and anything else stays **unknown**. The
+sweep runs as a normal serialized `BusWorker` job (progress + cancel like every
+other long operation) and never sends a write service. **Use as battery preset**
+prefills the editor above from the best candidates — cells DID + count + scale,
+pack voltage, SoC, temperature — and leaves the saved preset alone when nothing
+is confidently classified. A sweep proposes; it never certifies, so `verified`
+stays `false` and each DID still wants a hand check in the Raw console.
+
 ### 3.7 Security (0x27) — `#/security`
 
 - **Purpose:** the seed→key flow, with the **preview + confirm** choreography the
@@ -910,6 +927,7 @@ Legend: **R** = read-only, **W** = write/guarded, **S** = streaming.
 | Method | Path | Wraps | Notes |
 |---|---|---|---|
 | GET | `/api/battery/schema` | — | the recovered DID map (verified/unverified + source) and the saved-preset shape |
+| POST | `/api/battery/sweep` | `service.sweep_dids` | bounded DID sweep (`10 03` + `22 <DID>`), classified per reply; runs as a normal cancellable worker job; read-only |
 | POST | `/api/battery/read` | `service.read_dids` against 7E7/7E2 | one snapshot; per-field failure degrades to a status |
 | POST | `/api/battery/preset` | — | validates (DID hex, count 1..96, finite positive scale) and saves the DID map; no bus access |
 
